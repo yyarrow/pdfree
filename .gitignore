@@ -1,0 +1,10 @@
+/core/target/
+/harness/.venv/
+/harness/corpus/synthetic/
+/harness/corpus/local/
+/harness/work/
+/harness/failures/
+/harness/report.json
+node_modules/
+.next/
+.DS_Store
