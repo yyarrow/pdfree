@@ -30,7 +30,9 @@ BBOX_PAD = 6  # pixels of slack around the reported edit bbox
 
 
 def sh(args):
-    return subprocess.run(args, capture_output=True, text=True)
+    # errors="replace": qpdf/engine stderr can contain raw bytes from
+    # malformed PDFs; never let output decoding kill the harness.
+    return subprocess.run(args, capture_output=True, text=True, errors="replace")
 
 
 def qpdf_status(path):
@@ -45,7 +47,8 @@ class RenderCrash(Exception):
 def render_page(pdf_path, page_index, out_png):
     """Render + extract text via the isolated worker.
 
-    Returns (image, size, text); (None, None, None) for rotated pages.
+    Returns (image, page_box, text) where page_box is (left, bottom, right,
+    top) in PDF user space; (None, None, None) for rotated pages.
     Raises RenderCrash if the worker dies.
     """
     r = sh([
@@ -57,18 +60,22 @@ def render_page(pdf_path, page_index, out_png):
     info = json.loads(r.stdout)
     if info["rotated"]:
         return None, None, None
-    return Image.open(out_png), info["size"], info["text"]
+    return Image.open(out_png), info["box"], info["text"]
 
 
-def pick_edit(runs, rng):
-    """Pick a run and a word inside it to replace. Returns (run, find, with_)."""
+def pick_edits(runs, rng, n=3):
+    """Yield up to n distinct (run, find, with_) candidates, so a font that
+    can't encode one replacement doesn't end the whole case."""
     candidates = [
         r for r in runs
-        if not r["cid"] and r.get("visible", True)
+        if not r["cid"] and r.get("visible", True) and not r.get("type3", False)
         and len(r["text"]) >= 4 and any(c.isalpha() for c in r["text"])
     ]
     rng.shuffle(candidates)
+    picked = 0
     for run in candidates:
+        if picked >= n:
+            return
         words = [w for w in run["text"].split() if len(w) >= 4 and w.isalpha() and w.isascii()]
         if not words:
             continue
@@ -80,18 +87,23 @@ def pick_edit(runs, rng):
             for ch in find
         )
         if repl != find:
-            return run, find, repl
-    return None, None, None
+            picked += 1
+            yield run, find, repl
 
 
-def bbox_to_pixels(bbox, page_size):
-    """PDF user space (y up) -> pixel rect (y down), padded."""
-    _, page_h = page_size
+def bbox_to_pixels(bbox, page_box):
+    """PDF user space (y up) -> pixel rect (y down), padded.
+
+    page_box is the rendered region's (left, bottom, right, top): cropped
+    pages don't start at the user-space origin.
+    """
+    import math
+    left, _, _, top = page_box
     x0, y0, x1, y1 = bbox
-    px0 = int(x0 * SCALE) - BBOX_PAD
-    px1 = int(x1 * SCALE) + BBOX_PAD
-    py0 = int((page_h - y1) * SCALE) - BBOX_PAD
-    py1 = int((page_h - y0) * SCALE) + BBOX_PAD
+    px0 = math.floor((x0 - left) * SCALE) - BBOX_PAD
+    px1 = math.ceil((x1 - left) * SCALE) + BBOX_PAD
+    py0 = math.floor((top - y1) * SCALE) - BBOX_PAD
+    py1 = math.ceil((top - y0) * SCALE) + BBOX_PAD
     return px0, py0, px1, py1
 
 
@@ -116,6 +128,13 @@ def judge(case, in_pdf, out_pdf, page_no, report, find, repl, work):
     if before.size != after.size:
         return "fail_page_size_changed", None
 
+    # Edits to text positioned outside the visible page can't be judged
+    # visually (fuzzer files place text at negative coordinates).
+    left, bottom, right, top = size_b
+    x0, y0, x1, y1 = report["bbox"]
+    if x1 < left or y1 < bottom or x0 > right or y0 > top:
+        return "skip_offpage", None
+
     diff = ImageChops.difference(before, after)
     diff_bbox = diff.getbbox()  # None if identical
     if diff_bbox is None:
@@ -126,8 +145,9 @@ def judge(case, in_pdf, out_pdf, page_no, report, find, repl, work):
     if dx0 < px0 or dy0 < py0 or dx1 > px1 + 1 or dy1 > py1 + 1:
         return "fail_leak_outside_bbox", diff
 
-    # 4. semantics
-    if repl not in text:
+    # 4. semantics — whitespace-insensitive: pdfium reinserts line breaks
+    # at visual wrap points, which can split the replacement word.
+    if repl not in "".join(text.split()):
         return "fail_text_semantics", diff
 
     return "pass", None
@@ -150,17 +170,28 @@ def run_case(pdf_path: Path, work: Path):
             return pdf_path.name, "skip_invalid_input", None
         return pdf_path.name, "fail_engine_extract", r.stderr.strip()[:200]
     runs = json.loads(r.stdout)["runs"]
-    run, find, repl = pick_edit(runs, rng)
-    if run is None:
-        return pdf_path.name, "skip_no_candidate", None
-
     out_pdf = work / f"{case}_out.pdf"
-    r = sh([
-        str(ENGINE), "replace", str(pdf_path), str(out_pdf),
-        "--page", str(run["page"]), "--find", find, "--with", repl,
-    ])
-    if r.returncode != 0:
-        return pdf_path.name, "fail_engine_replace", r.stderr.strip()[:200]
+    run = find = repl = None
+    last_err = None
+    tried = 0
+    for run_, find_, repl_ in pick_edits(runs, rng):
+        tried += 1
+        r = sh([
+            str(ENGINE), "replace", str(pdf_path), str(out_pdf),
+            "--page", str(run_["page"]), "--find", find_, "--with", repl_,
+        ])
+        if r.returncode == 0:
+            run, find, repl = run_, find_, repl_
+            break
+        last_err = r.stderr.strip()[:200]
+    if run is None:
+        if tried == 0:
+            return pdf_path.name, "skip_no_candidate", None
+        # engine refusing every candidate is a capability gap (usually a
+        # font that can't encode the replacement), not silent corruption
+        if last_err and "cannot represent" in last_err:
+            return pdf_path.name, "fail_unencodable", last_err
+        return pdf_path.name, "fail_engine_replace", last_err
     report = json.loads(r.stdout)
 
     try:

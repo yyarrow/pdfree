@@ -26,11 +26,15 @@ pub struct Seg {
     pub cid: bool,
     /// False for invisible text (render mode 3, e.g. OCR layers).
     pub visible: bool,
+    /// True for Type3 fonts, whose glyphs are inline drawing procedures;
+    /// editing them safely needs CharProcs verification we don't do yet.
+    pub type3: bool,
 }
 
 pub struct FontInfo<'a> {
     pub dict: &'a Dictionary,
     pub cid: bool,
+    pub type3: bool,
     /// Per-byte-code advance widths (simple fonts only), in 1000ths of em.
     pub widths: Option<(i64, Vec<f32>)>, // (FirstChar, widths)
     /// Standard-14 metrics used when the font dict carries no Widths.
@@ -97,6 +101,19 @@ impl<'a> FontInfo<'a> {
         total
     }
 
+    /// Whether byte code `b` maps to a glyph this font can actually render.
+    /// Conservative: no verifiable metrics means we can't guarantee it.
+    pub fn glyph_available(&self, b: u8) -> bool {
+        if let Some((first, ws)) = &self.widths {
+            let idx = b as i64 - first;
+            return idx >= 0 && (idx as usize) < ws.len() && ws[idx as usize] > 0.0;
+        }
+        if let Some(ws) = self.std_widths {
+            return ws[b as usize] > 0.0;
+        }
+        false
+    }
+
     pub fn decode(&self, doc: &Document, bytes: &[u8]) -> String {
         match self.dict.get_font_encoding(doc) {
             Ok(enc) => Document::decode_text(&enc, bytes).unwrap_or_default(),
@@ -117,6 +134,7 @@ pub fn load_fonts<'a>(doc: &'a Document, page_id: lopdf::ObjectId) -> BTreeMap<V
             .map(|n| n.to_vec())
             .unwrap_or_default();
         let cid = subtype == b"Type0";
+        let type3 = subtype == b"Type3";
         let widths = (|| {
             let first = doc.dereference(dict.get(b"FirstChar").ok()?).ok()?.1.as_i64().ok()?;
             let arr = doc.dereference(dict.get(b"Widths").ok()?).ok()?.1.as_array().ok()?.clone();
@@ -139,6 +157,7 @@ pub fn load_fonts<'a>(doc: &'a Document, page_id: lopdf::ObjectId) -> BTreeMap<V
             FontInfo {
                 dict,
                 cid,
+                type3,
                 widths,
                 std_widths,
                 default_width: 500.0,
@@ -162,7 +181,6 @@ pub fn walk_page(doc: &Document, page_id: lopdf::ObjectId, page_no: u32) -> lopd
     let mut segs = Vec::new();
 
     let mut ctm = Mat::identity();
-    let mut ctm_stack: Vec<Mat> = Vec::new();
     let mut tm = Mat::identity(); // text matrix
     let mut tlm = Mat::identity(); // text line matrix
     let mut font_key: Vec<u8> = Vec::new();
@@ -172,14 +190,20 @@ pub fn walk_page(doc: &Document, page_id: lopdf::ObjectId, page_no: u32) -> lopd
     let mut word_spacing: f32 = 0.0;
     let mut h_scale: f32 = 1.0;
     let mut render_mode: i64 = 0;
+    // q/Q save and restore the whole graphics state, which includes the
+    // text state set by Tf/TL/Tc/Tw/Tz/Tr — not just the CTM.
+    #[allow(clippy::type_complexity)]
+    let mut gs_stack: Vec<(Mat, Vec<u8>, f32, f32, f32, f32, f32, i64)> = Vec::new();
 
     for (op_idx, op) in content.operations.iter().enumerate() {
         let ops = &op.operands;
         match op.operator.as_str() {
-            "q" => ctm_stack.push(ctm),
+            "q" => gs_stack.push((
+                ctm, font_key.clone(), font_size, leading, char_spacing, word_spacing, h_scale, render_mode,
+            )),
             "Q" => {
-                if let Some(m) = ctm_stack.pop() {
-                    ctm = m;
+                if let Some(s) = gs_stack.pop() {
+                    (ctm, font_key, font_size, leading, char_spacing, word_spacing, h_scale, render_mode) = s;
                 }
             }
             "cm" if ops.len() == 6 => {
@@ -300,13 +324,13 @@ fn show_string(
     segs: &mut Vec<Seg>,
 ) {
     let font = fonts.get(font_key);
-    let (text, cid, advance_em) = match font {
+    let (text, cid, type3, advance_em) = match font {
         Some(f) => {
             let text = f.decode(doc, bytes);
             let adv = f.advance(bytes, text.chars().count());
-            (text, f.cid, adv)
+            (text, f.cid, f.type3, adv)
         }
-        None => (String::new(), false, bytes.len() as f32 * 500.0),
+        None => (String::new(), false, false, bytes.len() as f32 * 500.0),
     };
 
     let n_units = if cid { text.chars().count() } else { bytes.len() };
@@ -316,8 +340,9 @@ fn show_string(
         + n_spaces as f32 * word_spacing * h_scale;
 
     let trm = tm.mul(ctm);
-    let (x0, y0) = trm.apply(0.0, -0.25 * font_size);
-    let (x1a, y1a) = trm.apply(width_text_space, font_size);
+    // Generous ascent/descent estimates: some fonts descend past 0.25em.
+    let (x0, y0) = trm.apply(0.0, -0.35 * font_size);
+    let (x1a, y1a) = trm.apply(width_text_space, 1.05 * font_size);
     let bbox = [x0.min(x1a), y0.min(y1a), x0.max(x1a), y0.max(y1a)];
 
     if !text.trim().is_empty() {
@@ -332,6 +357,7 @@ fn show_string(
             bbox,
             cid,
             visible: render_mode != 3,
+            type3,
         });
     }
 

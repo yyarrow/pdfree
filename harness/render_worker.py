@@ -21,9 +21,11 @@ def main():
         return
     bitmap = page.render(scale=scale)
     bitmap.to_pil().convert("L").save(out_png)
-    w, h = page.get_size()
+    # The rendered region's corners in PDF user space (left, bottom, right,
+    # top) — pages cropped away from the origin need this for pixel mapping.
+    box = page.get_bbox()
     text = page.get_textpage().get_text_bounded()
-    print(json.dumps({"rotated": False, "size": [w, h], "text": text}))
+    print(json.dumps({"rotated": False, "box": list(box), "text": text}))
 
 
 if __name__ == "__main__":

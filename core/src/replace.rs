@@ -24,6 +24,8 @@ pub enum ReplaceError {
     TextNotFound(usize),
     #[error("font encoding cannot represent the replacement text")]
     Unencodable,
+    #[error("font subset cannot represent the replacement text (missing glyph)")]
+    MissingGlyph,
     #[error("unsupported show operator {0}")]
     UnsupportedOperator(String),
 }
@@ -62,6 +64,17 @@ pub fn replace_text(
         let roundtrip = Document::decode_text(&enc, &bytes).map_err(|_| ReplaceError::Unencodable)?;
         if roundtrip != new_text || bytes.is_empty() {
             return Err(ReplaceError::Unencodable);
+        }
+        // The encoding roundtrip proves the code points exist in the encoding,
+        // not that the (often subsetted) font has glyphs for them. Require
+        // verifiable metrics for every byte we introduce; bytes already
+        // present in the original string obviously render.
+        if !font.cid {
+            for &b in &bytes {
+                if !seg.bytes.contains(&b) && !font.glyph_available(b) {
+                    return Err(ReplaceError::MissingGlyph);
+                }
+            }
         }
         let old_adv = font.advance(&seg.bytes, seg.text.chars().count());
         let new_adv = font.advance(&bytes, new_text.chars().count());

@@ -6,10 +6,12 @@
 
 mod matrix;
 pub mod replace;
+pub mod salvage;
 mod std14;
 pub mod walk;
 
 pub use replace::{replace_text, ReplaceError, ReplaceReport};
+pub use salvage::load_with_salvage;
 pub use walk::Seg;
 
 use lopdf::Document;

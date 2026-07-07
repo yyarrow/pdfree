@@ -44,11 +44,18 @@ core/target/debug/pdfree replace doc.pdf out.pdf --page 1 --find "old" --with "n
 ## Status
 
 - [x] Extract text runs with positions (simple + Type0 fonts, ToUnicode CMaps)
-- [x] Same-length-ish text replacement through the original font encoding
+- [x] Same-length-ish replacement with TJ width compensation (text after the
+      edit stays pixel-identical)
 - [x] Standard-14 font metrics (Helvetica/Times/Courier + Arial/TimesNewRoman aliases)
-- [x] Oracle loop at 100% on the starter corpus (129 files)
-- [ ] Scale corpus to 10k+ real-world PDFs
-- [ ] CJK replacement (embedded subset fonts, fallback fonts)
+- [x] Glyph-availability check: refuses edits a subset font can't render
+      instead of silently corrupting output
+- [x] Xref salvage loader: recovers files with broken/missing cross-reference
+      tables (all 27 such files in the pdf.js corpus load)
+- [x] Corpus: 1100 files incl. the Mozilla pdf.js torture suite; 80.1% pass,
+      94.7% of attempted edits correct (the rest are honest refusals)
+- [ ] Fallback font embedding for out-of-subset replacements (kills the
+      biggest remaining failure bucket, 55 cases)
+- [ ] Scale corpus to 10k+ real-world PDFs; CJK corpus + replacement
 - [ ] Cross-segment matches, reflow for longer replacements
 - [ ] WASM build + web UI (edit / merge / split / compress)
 

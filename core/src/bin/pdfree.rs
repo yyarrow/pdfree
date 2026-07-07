@@ -1,5 +1,4 @@
 use clap::{Parser, Subcommand};
-use lopdf::Document;
 
 #[derive(Parser)]
 #[command(name = "pdfree", about = "pdfree PDF engine CLI")]
@@ -39,7 +38,7 @@ fn main() {
 fn run(cli: Cli) -> Result<String, Box<dyn std::error::Error>> {
     match cli.cmd {
         Cmd::Extract { input } => {
-            let doc = Document::load(&input)?;
+            let doc = pdfree_core::load_with_salvage(std::path::Path::new(&input))?;
             let runs = pdfree_core::extract_runs(&doc)?;
             let pages = doc.get_pages().len();
             Ok(serde_json::to_string(&serde_json::json!({
@@ -54,7 +53,7 @@ fn run(cli: Cli) -> Result<String, Box<dyn std::error::Error>> {
             find,
             with_text,
         } => {
-            let mut doc = Document::load(&input)?;
+            let mut doc = pdfree_core::load_with_salvage(std::path::Path::new(&input))?;
             let report = pdfree_core::replace_text(&mut doc, page, &find, &with_text)?;
             doc.save(&output)?;
             Ok(serde_json::to_string(&report)?)
