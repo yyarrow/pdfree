@@ -8,3 +8,5 @@
 node_modules/
 .next/
 .DS_Store
+/harness/corpus/pdfjs/
+/harness/corpus/web/

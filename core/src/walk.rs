@@ -24,6 +24,8 @@ pub struct Seg {
     pub bbox: [f32; 4],
     /// True when the font is a Type0/CID font (multi-byte codes).
     pub cid: bool,
+    /// False for invisible text (render mode 3, e.g. OCR layers).
+    pub visible: bool,
 }
 
 pub struct FontInfo<'a> {
@@ -169,6 +171,7 @@ pub fn walk_page(doc: &Document, page_id: lopdf::ObjectId, page_no: u32) -> lopd
     let mut char_spacing: f32 = 0.0;
     let mut word_spacing: f32 = 0.0;
     let mut h_scale: f32 = 1.0;
+    let mut render_mode: i64 = 0;
 
     for (op_idx, op) in content.operations.iter().enumerate() {
         let ops = &op.operands;
@@ -202,6 +205,7 @@ pub fn walk_page(doc: &Document, page_id: lopdf::ObjectId, page_no: u32) -> lopd
             "Tc" if ops.len() == 1 => char_spacing = op_f32(&ops[0]),
             "Tw" if ops.len() == 1 => word_spacing = op_f32(&ops[0]),
             "Tz" if ops.len() == 1 => h_scale = op_f32(&ops[0]) / 100.0,
+            "Tr" if ops.len() == 1 => render_mode = ops[0].as_i64().unwrap_or(0),
             "Td" if ops.len() == 2 => {
                 tlm = Mat::translate(op_f32(&ops[0]), op_f32(&ops[1])).mul(&tlm);
                 tm = tlm;
@@ -245,7 +249,7 @@ pub fn walk_page(doc: &Document, page_id: lopdf::ObjectId, page_no: u32) -> lopd
                     let _ = s_idx;
                     show_string(
                         doc, &fonts, &font_key, font_size, char_spacing, word_spacing, h_scale, &ctm, &mut tm,
-                        bytes, page_no, op_idx, 0, &mut segs,
+                        bytes, page_no, op_idx, 0, render_mode, &mut segs,
                     );
                 }
             }
@@ -257,7 +261,7 @@ pub fn walk_page(doc: &Document, page_id: lopdf::ObjectId, page_no: u32) -> lopd
                             Object::String(bytes, _) => {
                                 show_string(
                                     doc, &fonts, &font_key, font_size, char_spacing, word_spacing, h_scale, &ctm,
-                                    &mut tm, bytes, page_no, op_idx, str_idx, &mut segs,
+                                    &mut tm, bytes, page_no, op_idx, str_idx, render_mode, &mut segs,
                                 );
                                 str_idx += 1;
                             }
@@ -292,6 +296,7 @@ fn show_string(
     page_no: u32,
     op_idx: usize,
     str_idx: usize,
+    render_mode: i64,
     segs: &mut Vec<Seg>,
 ) {
     let font = fonts.get(font_key);
@@ -326,6 +331,7 @@ fn show_string(
             font_size,
             bbox,
             cid,
+            visible: render_mode != 3,
         });
     }
 

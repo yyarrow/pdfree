@@ -20,7 +20,6 @@ import subprocess
 import sys
 from pathlib import Path
 
-import pypdfium2 as pdfium
 from PIL import Image, ImageChops
 
 ROOT = Path(__file__).parent
@@ -39,33 +38,34 @@ def qpdf_status(path):
     return r.returncode
 
 
-def render_page(pdf_path, page_index):
-    doc = pdfium.PdfDocument(str(pdf_path))
-    try:
-        page = doc[page_index]
-        if page.get_rotation() != 0:
-            return None, None
-        bitmap = page.render(scale=SCALE)
-        img = bitmap.to_pil().convert("L")
-        size = page.get_size()
-        return img, size
-    finally:
-        doc.close()
+class RenderCrash(Exception):
+    """pdfium failed or segfaulted in the worker process."""
 
 
-def extract_page_text(pdf_path, page_index):
-    doc = pdfium.PdfDocument(str(pdf_path))
-    try:
-        return doc[page_index].get_textpage().get_text_bounded()
-    finally:
-        doc.close()
+def render_page(pdf_path, page_index, out_png):
+    """Render + extract text via the isolated worker.
+
+    Returns (image, size, text); (None, None, None) for rotated pages.
+    Raises RenderCrash if the worker dies.
+    """
+    r = sh([
+        sys.executable, str(ROOT / "render_worker.py"),
+        str(pdf_path), str(page_index), str(out_png), str(SCALE),
+    ])
+    if r.returncode != 0:
+        raise RenderCrash(f"rc={r.returncode} {r.stderr.strip()[:120]}")
+    info = json.loads(r.stdout)
+    if info["rotated"]:
+        return None, None, None
+    return Image.open(out_png), info["size"], info["text"]
 
 
 def pick_edit(runs, rng):
     """Pick a run and a word inside it to replace. Returns (run, find, with_)."""
     candidates = [
         r for r in runs
-        if not r["cid"] and len(r["text"]) >= 4 and any(c.isalpha() for c in r["text"])
+        if not r["cid"] and r.get("visible", True)
+        and len(r["text"]) >= 4 and any(c.isalpha() for c in r["text"])
     ]
     rng.shuffle(candidates)
     for run in candidates:
@@ -95,7 +95,7 @@ def bbox_to_pixels(bbox, page_size):
     return px0, py0, px1, py1
 
 
-def judge(case, in_pdf, out_pdf, page_no, report, find, repl):
+def judge(case, in_pdf, out_pdf, page_no, report, find, repl, work):
     page_index = page_no - 1
 
     # 1. structure
@@ -103,8 +103,14 @@ def judge(case, in_pdf, out_pdf, page_no, report, find, repl):
         return "fail_structure", None
 
     # 2/3. render diff
-    before, size_b = render_page(in_pdf, page_index)
-    after, size_a = render_page(out_pdf, page_index)
+    try:
+        before, size_b, _ = render_page(in_pdf, page_index, work / f"{case}_before.png")
+    except RenderCrash:
+        return "skip_invalid_input", None
+    try:
+        after, _, text = render_page(out_pdf, page_index, work / f"{case}_after.png")
+    except RenderCrash:
+        return "fail_render_crash", None
     if before is None or after is None:
         return "skip_rotated", None
     if before.size != after.size:
@@ -121,7 +127,6 @@ def judge(case, in_pdf, out_pdf, page_no, report, find, repl):
         return "fail_leak_outside_bbox", diff
 
     # 4. semantics
-    text = extract_page_text(out_pdf, page_index)
     if repl not in text:
         return "fail_text_semantics", diff
 
@@ -132,8 +137,17 @@ def run_case(pdf_path: Path, work: Path):
     case = hashlib.sha1(pdf_path.name.encode()).hexdigest()[:10]
     rng = random.Random(case)
 
+    def input_renderable():
+        try:
+            img, _, _ = render_page(pdf_path, 0, work / f"{case}_probe.png")
+            return img is not None
+        except (RenderCrash, Exception):
+            return False
+
     r = sh([str(ENGINE), "extract", str(pdf_path)])
     if r.returncode != 0:
+        if not input_renderable():
+            return pdf_path.name, "skip_invalid_input", None
         return pdf_path.name, "fail_engine_extract", r.stderr.strip()[:200]
     runs = json.loads(r.stdout)["runs"]
     run, find, repl = pick_edit(runs, rng)
@@ -150,9 +164,9 @@ def run_case(pdf_path: Path, work: Path):
     report = json.loads(r.stdout)
 
     try:
-        verdict, diff = judge(case, pdf_path, out_pdf, run["page"], report, find, repl)
-    except Exception as e:  # renderer blew up on our output
-        return pdf_path.name, "fail_render_crash", str(e)[:200]
+        verdict, diff = judge(case, pdf_path, out_pdf, run["page"], report, find, repl, work)
+    except Exception as e:
+        return pdf_path.name, "fail_harness_error", f"{type(e).__name__}: {e}"[:200]
 
     if verdict.startswith("fail"):
         dest = FAILURES / f"{pdf_path.stem}_{verdict}"
@@ -190,7 +204,10 @@ def main():
     results = []
     counts = {}
     for pdf in pdfs:
-        name, verdict, detail = run_case(pdf, work)
+        try:
+            name, verdict, detail = run_case(pdf, work)
+        except Exception as e:
+            name, verdict, detail = pdf.name, "fail_harness_crash", f"{type(e).__name__}: {e}"[:200]
         counts[verdict] = counts.get(verdict, 0) + 1
         results.append({"file": name, "verdict": verdict, "detail": detail})
         mark = "." if verdict == "pass" else ("s" if verdict.startswith("skip") else "F")

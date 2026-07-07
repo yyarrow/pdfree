@@ -65,8 +65,10 @@ pub fn replace_text(
         }
         let old_adv = font.advance(&seg.bytes, seg.text.chars().count());
         let new_adv = font.advance(&bytes, new_text.chars().count());
-        (bytes, if old_adv > 0.0 { new_adv / old_adv } else { 1.0 })
+        (bytes, (old_adv, new_adv))
     };
+    let (old_adv, new_adv) = width_ratio;
+    let width_ratio = if old_adv > 0.0 { new_adv / old_adv } else { 1.0 };
 
     // Widen the reported bbox horizontally if the replacement renders wider
     // than the original (glyph advance widths, not byte counts).
@@ -75,24 +77,64 @@ pub fn replace_text(
         bbox[2] = bbox[0] + (bbox[2] - bbox[0]) * width_ratio;
     }
 
+    // Width delta in 1000ths of em. A positive TJ number shifts subsequent
+    // text left by n/1000*Tfs, so inserting `delta` after the replaced string
+    // keeps everything that follows in exactly its original position.
+    let delta = new_adv - old_adv;
+    let needs_comp = delta.abs() > 0.01;
+
     let op = &mut content.operations[seg.op_idx];
-    let target: &mut Object = match op.operator.as_str() {
-        "Tj" | "'" => op.operands.get_mut(0).ok_or_else(|| ReplaceError::UnsupportedOperator(op.operator.clone()))?,
-        "\"" => op.operands.get_mut(2).ok_or_else(|| ReplaceError::UnsupportedOperator(op.operator.clone()))?,
+    let old_text = seg.text.clone();
+    match op.operator.as_str() {
+        // Tj repositions nothing afterwards by itself, but a following show op
+        // without an intervening Td/Tm continues from the current pen, so we
+        // rewrite Tj into a compensated TJ to be safe.
+        "Tj" => {
+            let mut arr = vec![Object::String(new_bytes, lopdf::StringFormat::Literal)];
+            if needs_comp {
+                arr.push(Object::Real(delta));
+            }
+            op.operator = "TJ".into();
+            op.operands = vec![Object::Array(arr)];
+        }
+        // ' and " have line-advance side effects we can't fold into TJ; the
+        // pen drift after them is accepted for now (rare in practice).
+        "'" | "\"" => {
+            let idx = if op.operator == "\"" { 2 } else { 0 };
+            let target = op
+                .operands
+                .get_mut(idx)
+                .ok_or_else(|| ReplaceError::UnsupportedOperator(op.operator.clone()))?;
+            if let Object::String(bytes, _) = target {
+                *bytes = new_bytes;
+            }
+        }
         "TJ" => {
-            let arr = op.operands[0]
-                .as_array_mut()
-                .map_err(ReplaceError::Pdf)?;
-            arr.iter_mut()
-                .filter(|o| matches!(o, Object::String(..)))
+            let arr = op.operands[0].as_array_mut().map_err(ReplaceError::Pdf)?;
+            let pos = arr
+                .iter()
+                .enumerate()
+                .filter(|(_, o)| matches!(o, Object::String(..)))
+                .map(|(i, _)| i)
                 .nth(seg.str_idx)
-                .ok_or_else(|| ReplaceError::UnsupportedOperator("TJ".into()))?
+                .ok_or_else(|| ReplaceError::UnsupportedOperator("TJ".into()))?;
+            if let Object::String(bytes, _) = &mut arr[pos] {
+                *bytes = new_bytes;
+            }
+            if needs_comp {
+                // Fold into an existing kerning number if one follows.
+                if let Some(next) = arr.get_mut(pos + 1) {
+                    if let Ok(v) = next.as_float() {
+                        *next = Object::Real(v + delta);
+                    } else {
+                        arr.insert(pos + 1, Object::Real(delta));
+                    }
+                } else {
+                    arr.push(Object::Real(delta));
+                }
+            }
         }
         other => return Err(ReplaceError::UnsupportedOperator(other.to_string())),
-    };
-    let old_text = seg.text.clone();
-    if let Object::String(bytes, _) = target {
-        *bytes = new_bytes;
     }
 
     let encoded = content.encode()?;
