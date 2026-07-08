@@ -13,3 +13,5 @@ node_modules/
 /wasm/target/
 /web/.vercel/
 .env*.local
+/.worktree/
+/harness/corpus/skia/

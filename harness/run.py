@@ -68,7 +68,7 @@ def pick_edits(runs, rng, n=3):
     can't encode one replacement doesn't end the whole case."""
     candidates = [
         r for r in runs
-        if not r["cid"] and r.get("visible", True) and not r.get("type3", False)
+        if not r["cid"] and r.get("visible", True)
         and len(r["text"]) >= 4 and any(c.isalpha() for c in r["text"])
     ]
     rng.shuffle(candidates)

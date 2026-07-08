@@ -50,24 +50,14 @@ pub fn replace_text(
 
     let new_text = seg.text.replacen(find, with, 1);
 
-    // Re-encode through the same font's encoding and verify the roundtrip:
-    // if decoding the new bytes doesn't give back the new text, the font's
-    // encoding (or its embedded subset) can't express the replacement.
+    // Re-encode through the same font (ToUnicode-first, roundtrip-verified).
     let (new_bytes, width_ratio) = {
         let fonts = load_fonts(doc, page_id);
         let font = fonts.get(seg.font.as_bytes()).ok_or(ReplaceError::Unencodable)?;
-        let enc = font
-            .dict
-            .get_font_encoding(doc)
-            .map_err(|_| ReplaceError::Unencodable)?;
-        let bytes = Document::encode_text(&enc, &new_text);
-        let roundtrip = Document::decode_text(&enc, &bytes).map_err(|_| ReplaceError::Unencodable)?;
-        if roundtrip != new_text || bytes.is_empty() {
-            return Err(ReplaceError::Unencodable);
-        }
-        // The encoding roundtrip proves the code points exist in the encoding,
-        // not that the (often subsetted) font has glyphs for them. Require
-        // verifiable metrics for every byte we introduce; bytes already
+        let bytes = font.encode(doc, &new_text).ok_or(ReplaceError::Unencodable)?;
+        // Encoding proves the code points exist in the encoding, not that the
+        // (often subsetted) font has glyphs for them. Require verifiable
+        // metrics/procedures for every byte we introduce; bytes already
         // present in the original string obviously render.
         if !font.cid {
             for &b in &bytes {

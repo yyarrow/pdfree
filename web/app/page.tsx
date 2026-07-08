@@ -189,10 +189,6 @@ export default function Home() {
         showToast("中文/CJK 文本编辑正在开发中，敬请期待", true);
         return;
       }
-      if (r.run.type3) {
-        showToast("这段文字使用 Type3 字体，暂不支持编辑", true);
-        return;
-      }
       setPopover({ run: r.run, x: r.l, y: r.t + r.h + 6, value: r.run.text });
     },
     [showToast],
@@ -338,7 +334,7 @@ export default function Home() {
               {rects.map((r, i) => (
                 <div
                   key={i}
-                  className={`run${r.run.cid || r.run.type3 ? " disabled" : ""}`}
+                  className={`run${r.run.cid ? " disabled" : ""}`}
                   style={{ left: r.l, top: r.t, width: r.w, height: r.h }}
                   title={r.run.cid ? "中文编辑开发中" : "点击编辑这段文字"}
                   onClick={(e) => {

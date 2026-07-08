@@ -39,6 +39,16 @@ pub struct FontInfo<'a> {
     pub widths: Option<(i64, Vec<f32>)>, // (FirstChar, widths)
     /// Standard-14 metrics used when the font dict carries no Widths.
     pub std_widths: Option<&'static [f32; 256]>,
+    /// Converts Widths entries to 1000ths of em. 1.0 for simple fonts;
+    /// Type3 widths are in glyph space and need FontMatrix[0] * 1000.
+    pub width_scale: f32,
+    /// Type3 only: glyph names that actually have a CharProcs procedure.
+    pub charprocs: Option<std::collections::HashSet<Vec<u8>>>,
+    /// Type3 only: Encoding /Differences map from byte code to glyph name.
+    pub differences: Option<std::collections::HashMap<u8, Vec<u8>>>,
+    /// Parsed ToUnicode CMap — the authoritative text meaning of byte codes
+    /// (ISO 32000 9.10.3); /Encoding glyph names can be meaningless (Skia).
+    pub tounicode: Option<crate::tounicode::ToUnicodeMap>,
     pub default_width: f32,
 }
 
@@ -94,6 +104,7 @@ impl<'a> FontInfo<'a> {
                 .as_ref()
                 .and_then(|(first, ws)| ws.get((b as i64 - first).max(0) as usize).copied())
                 .filter(|w| *w > 0.0)
+                .map(|w| w * self.width_scale)
                 .or_else(|| self.std_widths.map(|ws| ws[b as usize]).filter(|w| *w > 0.0))
                 .unwrap_or(self.default_width);
             total += w;
@@ -104,6 +115,14 @@ impl<'a> FontInfo<'a> {
     /// Whether byte code `b` maps to a glyph this font can actually render.
     /// Conservative: no verifiable metrics means we can't guarantee it.
     pub fn glyph_available(&self, b: u8) -> bool {
+        if self.type3 {
+            // A Type3 glyph exists iff its code maps to a name that has an
+            // actual drawing procedure (width may legitimately be anything).
+            return match (&self.differences, &self.charprocs) {
+                (Some(diffs), Some(procs)) => diffs.get(&b).is_some_and(|name| procs.contains(name)),
+                _ => false,
+            };
+        }
         if let Some((first, ws)) = &self.widths {
             let idx = b as i64 - first;
             return idx >= 0 && (idx as usize) < ws.len() && ws[idx as usize] > 0.0;
@@ -115,9 +134,31 @@ impl<'a> FontInfo<'a> {
     }
 
     pub fn decode(&self, doc: &Document, bytes: &[u8]) -> String {
+        if let Some(tu) = &self.tounicode {
+            if let Some(text) = tu.decode(bytes) {
+                return text;
+            }
+        }
         match self.dict.get_font_encoding(doc) {
             Ok(enc) => Document::decode_text(&enc, bytes).unwrap_or_default(),
             Err(_) => String::new(),
+        }
+    }
+
+    /// Encode replacement text to byte codes, verifying the roundtrip: the
+    /// bytes must decode back to exactly the requested text. None when the
+    /// font's encoding can't express it.
+    pub fn encode(&self, doc: &Document, text: &str) -> Option<Vec<u8>> {
+        if let Some(tu) = &self.tounicode {
+            return tu.encode(text).filter(|b| !b.is_empty());
+        }
+        let enc = self.dict.get_font_encoding(doc).ok()?;
+        let bytes = Document::encode_text(&enc, text);
+        let roundtrip = Document::decode_text(&enc, &bytes).ok()?;
+        if roundtrip == text && !bytes.is_empty() {
+            Some(bytes)
+        } else {
+            None
         }
     }
 }
@@ -144,13 +185,54 @@ pub fn load_fonts<'a>(doc: &'a Document, page_id: lopdf::ObjectId) -> BTreeMap<V
                 .collect();
             Some((first, ws))
         })();
-        let std_widths = if cid {
+        let std_widths = if cid || type3 {
             None
         } else {
             dict.get(b"BaseFont")
                 .and_then(|o| o.as_name())
                 .ok()
                 .and_then(std14_lookup)
+        };
+        let (width_scale, charprocs, differences) = if type3 {
+            let scale = (|| {
+                let fm = doc.dereference(dict.get(b"FontMatrix").ok()?).ok()?.1.as_array().ok()?;
+                Some(fm.first()?.as_float().ok()?.abs() * 1000.0)
+            })()
+            .unwrap_or(1.0);
+            let procs = (|| {
+                let cp = doc.dereference(dict.get(b"CharProcs").ok()?).ok()?.1.as_dict().ok()?;
+                Some(cp.iter().map(|(k, _)| k.to_vec()).collect::<std::collections::HashSet<_>>())
+            })();
+            let diffs = (|| {
+                let enc = doc.dereference(dict.get(b"Encoding").ok()?).ok()?.1.as_dict().ok()?;
+                let arr = doc.dereference(enc.get(b"Differences").ok()?).ok()?.1.as_array().ok()?;
+                let mut map = std::collections::HashMap::new();
+                let mut code: i64 = 0;
+                for el in arr {
+                    match el {
+                        Object::Integer(n) => code = *n,
+                        Object::Name(n) => {
+                            if (0..=255).contains(&code) {
+                                map.insert(code as u8, n.clone());
+                            }
+                            code += 1;
+                        }
+                        _ => {}
+                    }
+                }
+                Some(map)
+            })();
+            (scale, procs, diffs)
+        } else {
+            (1.0, None, None)
+        };
+        let tounicode = if cid {
+            None // CID text keeps lopdf's multi-byte path for now
+        } else {
+            (|| {
+                let stream = doc.dereference(dict.get(b"ToUnicode").ok()?).ok()?.1.as_stream().ok()?;
+                crate::tounicode::ToUnicodeMap::parse(&stream.decompressed_content().ok()?)
+            })()
         };
         out.insert(
             name,
@@ -160,6 +242,10 @@ pub fn load_fonts<'a>(doc: &'a Document, page_id: lopdf::ObjectId) -> BTreeMap<V
                 type3,
                 widths,
                 std_widths,
+                width_scale,
+                charprocs,
+                differences,
+                tounicode,
                 default_width: 500.0,
             },
         );

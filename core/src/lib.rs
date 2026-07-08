@@ -8,6 +8,7 @@ mod matrix;
 pub mod replace;
 pub mod salvage;
 mod std14;
+mod tounicode;
 pub mod walk;
 
 pub use replace::{replace_text, ReplaceError, ReplaceReport};
