@@ -11,7 +11,7 @@ mod std14;
 pub mod walk;
 
 pub use replace::{replace_text, ReplaceError, ReplaceReport};
-pub use salvage::load_with_salvage;
+pub use salvage::{load_with_salvage, load_with_salvage_bytes};
 pub use walk::Seg;
 
 use lopdf::Document;

@@ -10,3 +10,6 @@ node_modules/
 .DS_Store
 /harness/corpus/pdfjs/
 /harness/corpus/web/
+/wasm/target/
+/web/.vercel/
+.env*.local

@@ -32,12 +32,24 @@ pub fn load_with_salvage(path: &Path) -> lopdf::Result<lopdf::Document> {
         Ok(d) => d,
         Err(_) => return Err(original_err),
     };
+    salvage_after_failure(&data, original_err)
+}
 
+/// In-memory variant for callers without a filesystem (the WASM build).
+pub fn load_with_salvage_bytes(data: &[u8]) -> lopdf::Result<lopdf::Document> {
+    let original_err = match lopdf::Document::load_mem(data) {
+        Ok(doc) => return Ok(doc),
+        Err(e) => e,
+    };
+    salvage_after_failure(data, original_err)
+}
+
+fn salvage_after_failure(data: &[u8], original_err: lopdf::Error) -> lopdf::Result<lopdf::Document> {
     // lopdf's own reader locates "%PDF-" anywhere in the buffer and treats
     // everything before it as not part of the document, rebasing all offsets
     // to that point. Do the same before computing our own offsets, or they'd
     // be off by the length of whatever junk precedes the header.
-    let header_pos = find_first(&data, b"%PDF-").unwrap_or(0);
+    let header_pos = find_first(data, b"%PDF-").unwrap_or(0);
     let data = &data[header_pos..];
 
     match rebuild(data) {
