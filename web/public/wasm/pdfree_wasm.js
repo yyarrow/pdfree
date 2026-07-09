@@ -73,20 +73,24 @@ export function extract(data) {
 
 /**
  * Replace the first occurrence of `find` on 1-based page `page`.
+ * `fallback_font`: optional TTF bytes supplying glyphs the document lacks.
  * @param {Uint8Array} data
  * @param {number} page
  * @param {string} find
  * @param {string} with_text
+ * @param {Uint8Array | null} [fallback_font]
  * @returns {ReplaceResult}
  */
-export function replace(data, page, find, with_text) {
+export function replace(data, page, find, with_text, fallback_font) {
     const ptr0 = passArray8ToWasm0(data, wasm.__wbindgen_malloc);
     const len0 = WASM_VECTOR_LEN;
     const ptr1 = passStringToWasm0(find, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
     const len1 = WASM_VECTOR_LEN;
     const ptr2 = passStringToWasm0(with_text, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
     const len2 = WASM_VECTOR_LEN;
-    const ret = wasm.replace(ptr0, len0, page, ptr1, len1, ptr2, len2);
+    var ptr3 = isLikeNone(fallback_font) ? 0 : passArray8ToWasm0(fallback_font, wasm.__wbindgen_malloc);
+    var len3 = WASM_VECTOR_LEN;
+    const ret = wasm.replace(ptr0, len0, page, ptr1, len1, ptr2, len2, ptr3, len3);
     if (ret[2]) {
         throw takeFromExternrefTable0(ret[1]);
     }
@@ -155,6 +159,10 @@ function handleError(f, args) {
         const idx = addToExternrefTable0(e);
         wasm.__wbindgen_exn_store(idx);
     }
+}
+
+function isLikeNone(x) {
+    return x === undefined || x === null;
 }
 
 function passArray8ToWasm0(arg, malloc) {

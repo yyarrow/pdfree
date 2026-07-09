@@ -9,10 +9,13 @@ pub mod replace;
 pub mod salvage;
 mod std14;
 mod tounicode;
+pub mod ttf;
+pub mod type3gen;
 pub mod walk;
 
 pub use replace::{replace_text, ReplaceError, ReplaceReport};
 pub use salvage::{load_with_salvage, load_with_salvage_bytes};
+pub use ttf::TtfFont;
 pub use walk::Seg;
 
 use lopdf::Document;

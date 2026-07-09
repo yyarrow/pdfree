@@ -34,10 +34,23 @@ impl ReplaceResult {
 }
 
 /// Replace the first occurrence of `find` on 1-based page `page`.
+/// `fallback_font`: optional TTF bytes supplying glyphs the document lacks.
 #[wasm_bindgen]
-pub fn replace(data: &[u8], page: u32, find: &str, with_text: &str) -> Result<ReplaceResult, JsError> {
+pub fn replace(
+    data: &[u8],
+    page: u32,
+    find: &str,
+    with_text: &str,
+    fallback_font: Option<Vec<u8>>,
+) -> Result<ReplaceResult, JsError> {
+    let ttf = match fallback_font {
+        Some(bytes) => Some(
+            pdfree_core::TtfFont::parse(bytes).ok_or_else(|| JsError::new("bad fallback font"))?,
+        ),
+        None => None,
+    };
     let mut doc = pdfree_core::load_with_salvage_bytes(data).map_err(|e| JsError::new(&e.to_string()))?;
-    let report = pdfree_core::replace_text(&mut doc, page, find, with_text)
+    let report = pdfree_core::replace_text(&mut doc, page, find, with_text, ttf.as_ref())
         .map_err(|e| JsError::new(&e.to_string()))?;
     let mut out = Vec::new();
     doc.save_to(&mut out).map_err(|e| JsError::new(&e.to_string()))?;

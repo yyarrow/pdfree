@@ -24,8 +24,14 @@
 - 坑：pdf.js v6 没有 convertToViewportRectangle（用 convertToViewportPoint×2）；渲染要传 `intent:"print"`（display 路径走 rAF，隐藏标签页会冻死）；标准字体/CMap 必须给 standardFontDataUrl/cMapUrl
 - `wasm/target/` 427MB 构建产物，已 gitignore，千万别提交
 
+## 兜底字体（已上线 v1）
+
+- 链路：原字体表达不了 → `ttf.rs`（只读 TTF 解析，glyf/cmap4+12/复合字形）取思源黑体轮廓 → `type3gen.rs` 现场合成 Type3 字体（轮廓转 PDF 路径 + ToUnicode）→ 注入页面资源，整段改写、TJ 拆三段保排版
+- 字形源：`assets/NotoSansSC.ttf`（google/fonts 的 glyf 版变量字体 17.8MB，**拉丁子集切片没有中文**，别下错）；web 端在 `web/public/fonts/` 懒加载
+- v1 限制：整段替换（find 必须等于整个 seg 文本）；全段换兜底字体（混排拆分待做）；字重取变量字体默认值（bold 匹配待做）
+
 ## 下一步（按优先级）
 
-1. 兜底字体嵌入（55 例 fail_unencodable，也是中文编辑的地基）
-2. 扩语料到万级（Common Crawl / govdocs1），中文语料单独收
-3. 合并/拆分/压缩功能补进 web 端
+1. Skia/Chrome 导出件的多段匹配编辑（单字形一条指令 → 跨段 find/replace），做完解锁 40 份 skia 语料 + 中文词级编辑
+2. 兜底精修：段内拆分（原有字符留原字体）、字重匹配、字体切片（17.8MB → 按需几十 KB）
+3. 扩语料到万级；合并/拆分/压缩补进 web 端

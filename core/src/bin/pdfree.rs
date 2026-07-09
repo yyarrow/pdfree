@@ -21,6 +21,9 @@ enum Cmd {
         find: String,
         #[arg(long = "with")]
         with_text: String,
+        /// TTF font supplying glyphs the document's fonts lack.
+        #[arg(long)]
+        fallback_font: Option<String>,
     },
 }
 
@@ -52,9 +55,17 @@ fn run(cli: Cli) -> Result<String, Box<dyn std::error::Error>> {
             page,
             find,
             with_text,
+            fallback_font,
         } => {
+            let ttf = match fallback_font {
+                Some(path) => Some(
+                    pdfree_core::TtfFont::parse(std::fs::read(path)?)
+                        .ok_or("failed to parse fallback font")?,
+                ),
+                None => None,
+            };
             let mut doc = pdfree_core::load_with_salvage(std::path::Path::new(&input))?;
-            let report = pdfree_core::replace_text(&mut doc, page, &find, &with_text)?;
+            let report = pdfree_core::replace_text(&mut doc, page, &find, &with_text, ttf.as_ref())?;
             doc.save(&output)?;
             Ok(serde_json::to_string(&report)?)
         }

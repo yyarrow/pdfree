@@ -20,8 +20,21 @@ type Engine = {
     page: number,
     find: string,
     with_text: string,
+    fallback_font?: Uint8Array,
   ) => { pdf: Uint8Array; report: string };
 };
+
+// Fallback glyph source (Noto Sans SC, OFL) — fetched only when an edit
+// needs glyphs the document's own fonts lack, then kept for the session.
+let fallbackFontCache: Uint8Array | null = null;
+async function loadFallbackFont(): Promise<Uint8Array> {
+  if (!fallbackFontCache) {
+    const res = await fetch("/fonts/NotoSansSC.ttf");
+    if (!res.ok) throw new Error("fallback font unavailable");
+    fallbackFontCache = new Uint8Array(await res.arrayBuffer());
+  }
+  return fallbackFontCache;
+}
 
 type Popover = { run: Run; x: number; y: number; value: string };
 
@@ -204,7 +217,17 @@ export default function Home() {
     setBusy("正在改写…");
     try {
       const engine = await loadEngine();
-      const result = engine.replace(pdfBytes, run.page, run.text, value);
+      let result;
+      try {
+        result = engine.replace(pdfBytes, run.page, run.text, value);
+      } catch (e) {
+        const msg = e instanceof Error ? e.message : String(e);
+        if (!msg.includes("cannot represent")) throw e;
+        // Original font lacks the glyphs — retry with the fallback font.
+        setBusy("原字体缺字形，正在加载兜底字体…");
+        const font = await loadFallbackFont();
+        result = engine.replace(pdfBytes, run.page, run.text, value, font);
+      }
       setPopover(null);
       await openPdf(result.pdf, fileName);
       setEdited(true);

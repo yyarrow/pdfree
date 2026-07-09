@@ -179,6 +179,7 @@ def run_case(pdf_path: Path, work: Path):
         r = sh([
             str(ENGINE), "replace", str(pdf_path), str(out_pdf),
             "--page", str(run_["page"]), "--find", find_, "--with", repl_,
+            "--fallback-font", str(ROOT.parent / "assets" / "NotoSansSC.ttf"),
         ])
         if r.returncode == 0:
             run, find, repl = run_, find_, repl_
