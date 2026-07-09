@@ -13,6 +13,7 @@ pub mod ttf;
 pub mod type3gen;
 pub mod walk;
 
+pub use lopdf;
 pub use replace::{replace_text, ReplaceError, ReplaceReport};
 pub use salvage::{load_with_salvage, load_with_salvage_bytes};
 pub use ttf::TtfFont;
@@ -30,4 +31,14 @@ pub fn extract_runs(doc: &Document) -> lopdf::Result<Vec<Seg>> {
         }
     }
     Ok(out)
+}
+
+/// Extract text segments for a single page — after an edit only the touched
+/// page needs re-walking, not the whole document.
+pub fn extract_runs_page(doc: &Document, page_no: u32) -> Vec<Seg> {
+    doc.get_pages()
+        .get(&page_no)
+        .and_then(|id| walk::walk_page(doc, *id, page_no).ok())
+        .map(|(_, segs)| segs)
+        .unwrap_or_default()
 }

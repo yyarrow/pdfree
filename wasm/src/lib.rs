@@ -1,61 +1,71 @@
 //! WASM bindings for pdfree-core. Everything runs in the browser; PDF bytes
 //! never leave the user's machine.
+//!
+//! The document lives inside a `DocSession`: parse once, edit many times,
+//! serialize only when the caller actually needs bytes (render refresh or
+//! download). This is what makes edits feel instant — the old free-function
+//! API reparsed and reserialized the whole file on every call.
 
 use wasm_bindgen::prelude::*;
 
-/// Extract text segments with positions. Returns the same JSON shape as the
-/// CLI: {"pages": N, "runs": [{page, text, font, font_size, bbox, ...}]}.
 #[wasm_bindgen]
-pub fn extract(data: &[u8]) -> Result<String, JsError> {
-    let doc = pdfree_core::load_with_salvage_bytes(data).map_err(|e| JsError::new(&e.to_string()))?;
-    let runs = pdfree_core::extract_runs(&doc).map_err(|e| JsError::new(&e.to_string()))?;
-    let pages = doc.get_pages().len();
-    serde_json::to_string(&serde_json::json!({ "pages": pages, "runs": runs }))
+pub struct DocSession {
+    doc: pdfree_core::lopdf::Document,
+    fallback: Option<pdfree_core::TtfFont>,
+}
+
+#[wasm_bindgen]
+impl DocSession {
+    /// Parse a PDF (with xref salvage) and keep it resident.
+    #[wasm_bindgen(constructor)]
+    pub fn new(data: &[u8]) -> Result<DocSession, JsError> {
+        let doc = pdfree_core::load_with_salvage_bytes(data).map_err(|e| JsError::new(&e.to_string()))?;
+        Ok(DocSession { doc, fallback: None })
+    }
+
+    pub fn page_count(&self) -> u32 {
+        self.doc.get_pages().len() as u32
+    }
+
+    /// Provide TTF bytes used to synthesize glyphs the document lacks.
+    /// Fetch lazily and set once per session.
+    pub fn set_fallback_font(&mut self, bytes: Vec<u8>) -> Result<(), JsError> {
+        self.fallback = Some(pdfree_core::TtfFont::parse(bytes).ok_or_else(|| JsError::new("bad fallback font"))?);
+        Ok(())
+    }
+
+    pub fn has_fallback(&self) -> bool {
+        self.fallback.is_some()
+    }
+
+    /// All pages: {"pages": N, "runs": [...]}.
+    pub fn extract_all(&self) -> Result<String, JsError> {
+        let runs = pdfree_core::extract_runs(&self.doc).map_err(|e| JsError::new(&e.to_string()))?;
+        serde_json::to_string(&serde_json::json!({
+            "pages": self.doc.get_pages().len(),
+            "runs": runs,
+        }))
         .map_err(|e| JsError::new(&e.to_string()))
-}
-
-#[wasm_bindgen]
-pub struct ReplaceResult {
-    pdf: Vec<u8>,
-    report: String,
-}
-
-#[wasm_bindgen]
-impl ReplaceResult {
-    #[wasm_bindgen(getter)]
-    pub fn pdf(&self) -> Vec<u8> {
-        self.pdf.clone()
     }
 
-    #[wasm_bindgen(getter)]
-    pub fn report(&self) -> String {
-        self.report.clone()
+    /// One page's runs: {"runs": [...]}.
+    pub fn extract_page(&self, page: u32) -> Result<String, JsError> {
+        let runs = pdfree_core::extract_runs_page(&self.doc, page);
+        serde_json::to_string(&serde_json::json!({ "runs": runs })).map_err(|e| JsError::new(&e.to_string()))
     }
-}
 
-/// Replace the first occurrence of `find` on 1-based page `page`.
-/// `fallback_font`: optional TTF bytes supplying glyphs the document lacks.
-#[wasm_bindgen]
-pub fn replace(
-    data: &[u8],
-    page: u32,
-    find: &str,
-    with_text: &str,
-    fallback_font: Option<Vec<u8>>,
-) -> Result<ReplaceResult, JsError> {
-    let ttf = match fallback_font {
-        Some(bytes) => Some(
-            pdfree_core::TtfFont::parse(bytes).ok_or_else(|| JsError::new("bad fallback font"))?,
-        ),
-        None => None,
-    };
-    let mut doc = pdfree_core::load_with_salvage_bytes(data).map_err(|e| JsError::new(&e.to_string()))?;
-    let report = pdfree_core::replace_text(&mut doc, page, find, with_text, ttf.as_ref())
-        .map_err(|e| JsError::new(&e.to_string()))?;
-    let mut out = Vec::new();
-    doc.save_to(&mut out).map_err(|e| JsError::new(&e.to_string()))?;
-    Ok(ReplaceResult {
-        pdf: out,
-        report: serde_json::to_string(&report).unwrap_or_default(),
-    })
+    /// Replace in place; returns the report JSON. The session keeps the
+    /// mutated document — call `save()` for fresh bytes.
+    pub fn replace(&mut self, page: u32, find: &str, with_text: &str) -> Result<String, JsError> {
+        let report = pdfree_core::replace_text(&mut self.doc, page, find, with_text, self.fallback.as_ref())
+            .map_err(|e| JsError::new(&e.to_string()))?;
+        serde_json::to_string(&report).map_err(|e| JsError::new(&e.to_string()))
+    }
+
+    /// Serialize the current state.
+    pub fn save(&mut self) -> Result<Vec<u8>, JsError> {
+        let mut out = Vec::new();
+        self.doc.save_to(&mut out).map_err(|e| JsError::new(&e.to_string()))?;
+        Ok(out)
+    }
 }

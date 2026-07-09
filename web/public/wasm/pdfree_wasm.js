@@ -1,101 +1,148 @@
 /* @ts-self-types="./pdfree_wasm.d.ts" */
 
-export class ReplaceResult {
-    static __wrap(ptr) {
-        const obj = Object.create(ReplaceResult.prototype);
-        obj.__wbg_ptr = ptr;
-        ReplaceResultFinalization.register(obj, obj.__wbg_ptr, obj);
-        return obj;
-    }
+export class DocSession {
     __destroy_into_raw() {
         const ptr = this.__wbg_ptr;
         this.__wbg_ptr = 0;
-        ReplaceResultFinalization.unregister(this);
+        DocSessionFinalization.unregister(this);
         return ptr;
     }
     free() {
         const ptr = this.__destroy_into_raw();
-        wasm.__wbg_replaceresult_free(ptr, 0);
+        wasm.__wbg_docsession_free(ptr, 0);
     }
     /**
+     * All pages: {"pages": N, "runs": [...]}.
+     * @returns {string}
+     */
+    extract_all() {
+        let deferred2_0;
+        let deferred2_1;
+        try {
+            const ret = wasm.docsession_extract_all(this.__wbg_ptr);
+            var ptr1 = ret[0];
+            var len1 = ret[1];
+            if (ret[3]) {
+                ptr1 = 0; len1 = 0;
+                throw takeFromExternrefTable0(ret[2]);
+            }
+            deferred2_0 = ptr1;
+            deferred2_1 = len1;
+            return getStringFromWasm0(ptr1, len1);
+        } finally {
+            wasm.__wbindgen_free(deferred2_0, deferred2_1, 1);
+        }
+    }
+    /**
+     * One page's runs: {"runs": [...]}.
+     * @param {number} page
+     * @returns {string}
+     */
+    extract_page(page) {
+        let deferred2_0;
+        let deferred2_1;
+        try {
+            const ret = wasm.docsession_extract_page(this.__wbg_ptr, page);
+            var ptr1 = ret[0];
+            var len1 = ret[1];
+            if (ret[3]) {
+                ptr1 = 0; len1 = 0;
+                throw takeFromExternrefTable0(ret[2]);
+            }
+            deferred2_0 = ptr1;
+            deferred2_1 = len1;
+            return getStringFromWasm0(ptr1, len1);
+        } finally {
+            wasm.__wbindgen_free(deferred2_0, deferred2_1, 1);
+        }
+    }
+    /**
+     * @returns {boolean}
+     */
+    has_fallback() {
+        const ret = wasm.docsession_has_fallback(this.__wbg_ptr);
+        return ret !== 0;
+    }
+    /**
+     * Parse a PDF (with xref salvage) and keep it resident.
+     * @param {Uint8Array} data
+     */
+    constructor(data) {
+        const ptr0 = passArray8ToWasm0(data, wasm.__wbindgen_malloc);
+        const len0 = WASM_VECTOR_LEN;
+        const ret = wasm.docsession_new(ptr0, len0);
+        if (ret[2]) {
+            throw takeFromExternrefTable0(ret[1]);
+        }
+        this.__wbg_ptr = ret[0];
+        DocSessionFinalization.register(this, this.__wbg_ptr, this);
+        return this;
+    }
+    /**
+     * @returns {number}
+     */
+    page_count() {
+        const ret = wasm.docsession_page_count(this.__wbg_ptr);
+        return ret >>> 0;
+    }
+    /**
+     * Replace in place; returns the report JSON. The session keeps the
+     * mutated document — call `save()` for fresh bytes.
+     * @param {number} page
+     * @param {string} find
+     * @param {string} with_text
+     * @returns {string}
+     */
+    replace(page, find, with_text) {
+        let deferred4_0;
+        let deferred4_1;
+        try {
+            const ptr0 = passStringToWasm0(find, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+            const len0 = WASM_VECTOR_LEN;
+            const ptr1 = passStringToWasm0(with_text, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+            const len1 = WASM_VECTOR_LEN;
+            const ret = wasm.docsession_replace(this.__wbg_ptr, page, ptr0, len0, ptr1, len1);
+            var ptr3 = ret[0];
+            var len3 = ret[1];
+            if (ret[3]) {
+                ptr3 = 0; len3 = 0;
+                throw takeFromExternrefTable0(ret[2]);
+            }
+            deferred4_0 = ptr3;
+            deferred4_1 = len3;
+            return getStringFromWasm0(ptr3, len3);
+        } finally {
+            wasm.__wbindgen_free(deferred4_0, deferred4_1, 1);
+        }
+    }
+    /**
+     * Serialize the current state.
      * @returns {Uint8Array}
      */
-    get pdf() {
-        const ret = wasm.replaceresult_pdf(this.__wbg_ptr);
+    save() {
+        const ret = wasm.docsession_save(this.__wbg_ptr);
+        if (ret[3]) {
+            throw takeFromExternrefTable0(ret[2]);
+        }
         var v1 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
         wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
         return v1;
     }
     /**
-     * @returns {string}
+     * Provide TTF bytes used to synthesize glyphs the document lacks.
+     * Fetch lazily and set once per session.
+     * @param {Uint8Array} bytes
      */
-    get report() {
-        let deferred1_0;
-        let deferred1_1;
-        try {
-            const ret = wasm.replaceresult_report(this.__wbg_ptr);
-            deferred1_0 = ret[0];
-            deferred1_1 = ret[1];
-            return getStringFromWasm0(ret[0], ret[1]);
-        } finally {
-            wasm.__wbindgen_free(deferred1_0, deferred1_1, 1);
-        }
-    }
-}
-if (Symbol.dispose) ReplaceResult.prototype[Symbol.dispose] = ReplaceResult.prototype.free;
-
-/**
- * Extract text segments with positions. Returns the same JSON shape as the
- * CLI: {"pages": N, "runs": [{page, text, font, font_size, bbox, ...}]}.
- * @param {Uint8Array} data
- * @returns {string}
- */
-export function extract(data) {
-    let deferred3_0;
-    let deferred3_1;
-    try {
-        const ptr0 = passArray8ToWasm0(data, wasm.__wbindgen_malloc);
+    set_fallback_font(bytes) {
+        const ptr0 = passArray8ToWasm0(bytes, wasm.__wbindgen_malloc);
         const len0 = WASM_VECTOR_LEN;
-        const ret = wasm.extract(ptr0, len0);
-        var ptr2 = ret[0];
-        var len2 = ret[1];
-        if (ret[3]) {
-            ptr2 = 0; len2 = 0;
-            throw takeFromExternrefTable0(ret[2]);
+        const ret = wasm.docsession_set_fallback_font(this.__wbg_ptr, ptr0, len0);
+        if (ret[1]) {
+            throw takeFromExternrefTable0(ret[0]);
         }
-        deferred3_0 = ptr2;
-        deferred3_1 = len2;
-        return getStringFromWasm0(ptr2, len2);
-    } finally {
-        wasm.__wbindgen_free(deferred3_0, deferred3_1, 1);
     }
 }
-
-/**
- * Replace the first occurrence of `find` on 1-based page `page`.
- * `fallback_font`: optional TTF bytes supplying glyphs the document lacks.
- * @param {Uint8Array} data
- * @param {number} page
- * @param {string} find
- * @param {string} with_text
- * @param {Uint8Array | null} [fallback_font]
- * @returns {ReplaceResult}
- */
-export function replace(data, page, find, with_text, fallback_font) {
-    const ptr0 = passArray8ToWasm0(data, wasm.__wbindgen_malloc);
-    const len0 = WASM_VECTOR_LEN;
-    const ptr1 = passStringToWasm0(find, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
-    const len1 = WASM_VECTOR_LEN;
-    const ptr2 = passStringToWasm0(with_text, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
-    const len2 = WASM_VECTOR_LEN;
-    var ptr3 = isLikeNone(fallback_font) ? 0 : passArray8ToWasm0(fallback_font, wasm.__wbindgen_malloc);
-    var len3 = WASM_VECTOR_LEN;
-    const ret = wasm.replace(ptr0, len0, page, ptr1, len1, ptr2, len2, ptr3, len3);
-    if (ret[2]) {
-        throw takeFromExternrefTable0(ret[1]);
-    }
-    return ReplaceResult.__wrap(ret[0]);
-}
+if (Symbol.dispose) DocSession.prototype[Symbol.dispose] = DocSession.prototype.free;
 function __wbg_get_imports() {
     const import0 = {
         __proto__: null,
@@ -125,9 +172,9 @@ function __wbg_get_imports() {
     };
 }
 
-const ReplaceResultFinalization = (typeof FinalizationRegistry === 'undefined')
+const DocSessionFinalization = (typeof FinalizationRegistry === 'undefined')
     ? { register: () => {}, unregister: () => {} }
-    : new FinalizationRegistry(ptr => wasm.__wbg_replaceresult_free(ptr, 1));
+    : new FinalizationRegistry(ptr => wasm.__wbg_docsession_free(ptr, 1));
 
 function addToExternrefTable0(obj) {
     const idx = wasm.__externref_table_alloc();
@@ -159,10 +206,6 @@ function handleError(f, args) {
         const idx = addToExternrefTable0(e);
         wasm.__wbindgen_exn_store(idx);
     }
-}
-
-function isLikeNone(x) {
-    return x === undefined || x === null;
 }
 
 function passArray8ToWasm0(arg, malloc) {

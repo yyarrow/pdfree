@@ -13,16 +13,20 @@ type Run = {
   type3: boolean;
 };
 
-type Engine = {
-  extract: (data: Uint8Array) => string;
-  replace: (
-    data: Uint8Array,
-    page: number,
-    find: string,
-    with_text: string,
-    fallback_font?: Uint8Array,
-  ) => { pdf: Uint8Array; report: string };
+// The engine keeps the parsed document resident (parse once, edit many,
+// serialize only when bytes are actually needed).
+type DocSession = {
+  page_count: () => number;
+  set_fallback_font: (bytes: Uint8Array) => void;
+  has_fallback: () => boolean;
+  extract_all: () => string;
+  extract_page: (page: number) => string;
+  replace: (page: number, find: string, with_text: string) => string;
+  save: () => Uint8Array;
+  free: () => void;
 };
+
+type Engine = { DocSession: new (data: Uint8Array) => DocSession };
 
 // Fallback glyph source (Noto Sans SC, OFL) — fetched only when an edit
 // needs glyphs the document's own fonts lack, then kept for the session.
@@ -82,11 +86,16 @@ export default function Home() {
   const [dragOver, setDragOver] = useState(false);
   const [rects, setRects] = useState<{ run: Run; l: number; t: number; w: number; h: number }[]>([]);
   const [edited, setEdited] = useState(false);
+  // Shown instantly at the edit position while the real render catches up.
+  const [optimistic, setOptimistic] = useState<{ l: number; t: number; w: number; h: number; text: string } | null>(
+    null,
+  );
 
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const stageRef = useRef<HTMLDivElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const docRef = useRef<any>(null);
+  const sessionRef = useRef<DocSession | null>(null);
   const toastTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const showToast = useCallback((text: string, err = false) => {
@@ -95,24 +104,32 @@ export default function Home() {
     toastTimer.current = setTimeout(() => setToast(null), err ? 5200 : 2600);
   }, []);
 
+  const loadPdfjsDoc = useCallback(async (bytes: Uint8Array) => {
+    const pdfjs = await loadPdfjs();
+    // pdf.js transfers the buffer to its worker; keep our copy intact.
+    // standardFontDataUrl/cMapUrl are required for non-embedded fonts.
+    const doc = await pdfjs.getDocument({
+      data: bytes.slice(),
+      standardFontDataUrl: "/pdfjs/standard_fonts/",
+      cMapUrl: "/pdfjs/cmaps/",
+      cMapPacked: true,
+    }).promise;
+    docRef.current?.destroy?.();
+    docRef.current = doc;
+    return doc;
+  }, []);
+
   const openPdf = useCallback(
     async (bytes: Uint8Array, name: string) => {
       setBusy("正在解析…");
       setPopover(null);
       try {
         const engine = await loadEngine();
-        const parsed = JSON.parse(engine.extract(bytes));
-        const pdfjs = await loadPdfjs();
-        // pdf.js transfers the buffer to its worker; keep our copy intact.
-        // standardFontDataUrl/cMapUrl are required for non-embedded fonts.
-        const doc = await pdfjs.getDocument({
-          data: bytes.slice(),
-          standardFontDataUrl: "/pdfjs/standard_fonts/",
-          cMapUrl: "/pdfjs/cmaps/",
-          cMapPacked: true,
-        }).promise;
-        docRef.current?.destroy?.();
-        docRef.current = doc;
+        sessionRef.current?.free?.();
+        const session = new engine.DocSession(bytes);
+        sessionRef.current = session;
+        const parsed = JSON.parse(session.extract_all());
+        const doc = await loadPdfjsDoc(bytes);
         setPdfBytes(bytes);
         setFileName(name);
         setRuns(parsed.runs);
@@ -124,7 +141,7 @@ export default function Home() {
         setBusy("");
       }
     },
-    [showToast],
+    [showToast, loadPdfjsDoc],
   );
 
   const onFile = useCallback(
@@ -190,6 +207,7 @@ export default function Home() {
           };
         });
       setRects(pageRects);
+      setOptimistic(null); // real render is on screen now
     })();
     return () => {
       cancelled = true;
@@ -208,37 +226,47 @@ export default function Home() {
   );
 
   const applyEdit = useCallback(async () => {
-    if (!popover || !pdfBytes) return;
+    const session = sessionRef.current;
+    if (!popover || !session) return;
     const { run, value } = popover;
     if (value === run.text) {
       setPopover(null);
       return;
     }
-    setBusy("正在改写…");
+    // Optimistic: paint the new text over the old spot immediately; the
+    // canvas refresh below swaps in the real render and clears it.
+    const rect = rects.find((r) => r.run === run);
+    if (rect) {
+      setOptimistic({ l: rect.l, t: rect.t, w: rect.w, h: rect.h, text: value });
+    }
+    setPopover(null);
     try {
-      const engine = await loadEngine();
-      let result;
       try {
-        result = engine.replace(pdfBytes, run.page, run.text, value);
+        session.replace(run.page, run.text, value);
       } catch (e) {
         const msg = e instanceof Error ? e.message : String(e);
-        if (!msg.includes("cannot represent")) throw e;
-        // Original font lacks the glyphs — retry with the fallback font.
+        if (!msg.includes("cannot represent") || session.has_fallback()) throw e;
+        // Original font lacks the glyphs — load the fallback once and retry.
         setBusy("原字体缺字形，正在加载兜底字体…");
-        const font = await loadFallbackFont();
-        result = engine.replace(pdfBytes, run.page, run.text, value, font);
+        session.set_fallback_font(await loadFallbackFont());
+        setBusy("");
+        session.replace(run.page, run.text, value);
       }
-      setPopover(null);
-      await openPdf(result.pdf, fileName);
+      // Only the edited page gets re-walked; pdf.js still needs full bytes.
+      const pageRuns: Run[] = JSON.parse(session.extract_page(run.page)).runs;
+      const bytes = session.save();
+      setRuns((prev) => prev.filter((r) => r.page !== run.page).concat(pageRuns));
+      setPdfBytes(bytes);
+      await loadPdfjsDoc(bytes);
       setEdited(true);
       setPage(run.page);
-      showToast("改好了，编辑点之外一个像素都没动");
     } catch (e) {
+      setOptimistic(null);
       showToast(friendlyError(e instanceof Error ? e.message : String(e)), true);
     } finally {
       setBusy("");
     }
-  }, [popover, pdfBytes, fileName, openPdf, showToast]);
+  }, [popover, rects, showToast, loadPdfjsDoc]);
 
   const download = useCallback(() => {
     if (!pdfBytes) return;
@@ -322,10 +350,13 @@ export default function Home() {
               onClick={() => {
                 docRef.current?.destroy?.();
                 docRef.current = null;
+                sessionRef.current?.free?.();
+                sessionRef.current = null;
                 setPdfBytes(null);
                 setRuns([]);
                 setRects([]);
                 setPopover(null);
+                setOptimistic(null);
               }}
             >
               ← 换个文件
@@ -366,6 +397,20 @@ export default function Home() {
                   }}
                 />
               ))}
+              {optimistic && (
+                <div
+                  className="optimistic"
+                  style={{
+                    left: optimistic.l,
+                    top: optimistic.t,
+                    minWidth: optimistic.w,
+                    height: optimistic.h,
+                    fontSize: optimistic.h * 0.72,
+                  }}
+                >
+                  {optimistic.text}
+                </div>
+              )}
               {popover && (
                 <div className="popover" style={{ left: popover.x, top: popover.y }} onClick={(e) => e.stopPropagation()}>
                   <label>编辑文字（改完点确认，其余排版保持原样）</label>
@@ -400,7 +445,7 @@ export default function Home() {
         pdfree 是 MIT 开源项目 · 引擎与网站均免费 ·{" "}
         <a href="https://github.com/yyarrow/pdfree">GitHub</a>
         <br />
-        暂不支持：中文编辑、扫描件（图片型 PDF）、加密文件 — 都在路上
+        暂不支持：扫描件（图片型 PDF）、加密文件；中文目前支持单字符替换 — 都在路上
       </footer>
     </div>
   );

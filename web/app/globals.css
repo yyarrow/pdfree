@@ -250,6 +250,20 @@ button {
   background: #8883;
 }
 
+.optimistic {
+  position: absolute;
+  background: #fff;
+  color: var(--ink);
+  display: flex;
+  align-items: center;
+  white-space: nowrap;
+  font-family: ui-sans-serif, -apple-system, "PingFang SC", sans-serif;
+  outline: 1.5px dashed var(--accent);
+  outline-offset: 1px;
+  border-radius: 2px;
+  z-index: 8;
+}
+
 .popover {
   position: absolute;
   z-index: 10;
