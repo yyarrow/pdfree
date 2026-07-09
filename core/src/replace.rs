@@ -85,13 +85,19 @@ pub fn replace_text(
     let (new_bytes, old_adv, new_adv) = match encoded {
         Ok(v) => v,
         Err((e @ (ReplaceError::Unencodable | ReplaceError::MissingGlyph), old_adv)) => {
-            // The document's font can't express the replacement — fall back
-            // to a synthesized Type3 font when the whole segment is edited.
-            let Some(ttf) = fallback else { return Err(e) };
+            // The segment's own font can't express the replacement. Both
+            // rescue paths rewrite the whole segment, so require that.
             if find != seg.text {
                 return Err(e);
             }
             let seg = seg.clone();
+            // First choice: borrow another font already in the document —
+            // its glyphs match the document's typography exactly. Only then
+            // synthesize a Type3 fallback from the bundled font.
+            if let Some((res_name, bytes, new_adv)) = try_borrow(doc, page_id, &segs, &seg, with) {
+                return finish_swap(doc, page_id, page_no, content, seg, with, res_name, bytes, new_adv, old_adv);
+            }
+            let Some(ttf) = fallback else { return Err(e) };
             return replace_with_fallback(doc, page_id, page_no, content, seg, with, old_adv, ttf);
         }
         Err((e, _)) => return Err(e),
@@ -176,19 +182,80 @@ pub fn replace_text(
     })
 }
 
-/// Whole-segment replacement rendered in a synthesized Type3 fallback font:
-/// the original show op becomes Tf(fallback) TJ[(codes) comp] Tf(original),
-/// so following ops keep their pen position exactly.
+/// Find a different font already present on the page that can express the
+/// whole replacement. Fonts seen at the segment's own size are preferred, so
+/// a heading borrows heading-weight glyphs rather than body-weight ones.
+fn try_borrow(
+    doc: &Document,
+    page_id: ObjectId,
+    segs: &[Seg],
+    seg: &Seg,
+    with: &str,
+) -> Option<(String, Vec<u8>, f32)> {
+    let fonts = load_fonts(doc, page_id);
+    let mut candidates: Vec<(i32, String, Vec<u8>, f32)> = Vec::new();
+    for (name, font) in &fonts {
+        if *name == seg.font.as_bytes() || font.cid {
+            continue;
+        }
+        let Some(bytes) = font.encode(doc, with) else { continue };
+        if !bytes.iter().all(|&b| font.glyph_available(b)) {
+            continue;
+        }
+        let same_size = segs
+            .iter()
+            .any(|s| s.font.as_bytes() == *name && (s.font_size - seg.font_size).abs() < 0.01);
+        let new_adv = font.advance(&bytes, with.chars().count());
+        candidates.push((
+            if same_size { 0 } else { 1 },
+            String::from_utf8_lossy(name).into_owned(),
+            bytes,
+            new_adv,
+        ));
+    }
+    candidates.sort_by_key(|(score, name, _, _)| (*score, name.clone()));
+    candidates.into_iter().next().map(|(_, n, b, a)| (n, b, a))
+}
+
+/// Whole-segment replacement rendered in a synthesized Type3 fallback font.
 #[allow(clippy::too_many_arguments)]
 fn replace_with_fallback(
+    doc: &mut Document,
+    page_id: ObjectId,
+    page_no: u32,
+    content: lopdf::content::Content,
+    seg: Seg,
+    with: &str,
+    old_adv: f32,
+    ttf: &TtfFont,
+) -> Result<ReplaceReport, ReplaceError> {
+    let chars: Vec<char> = with.chars().collect();
+    let fb = build_type3_font(doc, ttf, &chars).ok_or(ReplaceError::Unencodable)?;
+    let res_name = add_font_resource(doc, page_id, fb.font_id)?;
+    let codes: Vec<u8> = with.chars().map(|c| fb.codes[&c]).collect();
+    let new_adv: f32 = with
+        .chars()
+        .map(|c| fb.advances[&c] / fb.units_per_em * 1000.0)
+        .sum();
+    finish_swap(doc, page_id, page_no, content, seg, with, res_name, codes, new_adv, old_adv)
+}
+
+/// Rewrite the segment's show op to render `string_bytes` in the font
+/// resource `res_name`: the op becomes [before-TJ] Tf(res) TJ[(bytes) comp]
+/// Tf(original) [after-TJ], so sibling TJ elements keep their font and
+/// everything after the edit keeps its exact pen position.
+#[allow(clippy::too_many_arguments)]
+fn finish_swap(
     doc: &mut Document,
     page_id: ObjectId,
     page_no: u32,
     mut content: lopdf::content::Content,
     seg: Seg,
     with: &str,
+    res_name: String,
+    string_bytes: Vec<u8>,
+    new_adv: f32,
     old_adv: f32,
-    ttf: &TtfFont,
 ) -> Result<ReplaceReport, ReplaceError> {
     let op_kind = content.operations[seg.op_idx].operator.clone();
     // For a multi-string TJ, the untouched sibling elements stay in the
@@ -212,15 +279,6 @@ fn replace_with_fallback(
         other => return Err(ReplaceError::UnsupportedOperator(other.to_string())),
     };
 
-    let chars: Vec<char> = with.chars().collect();
-    let fb = build_type3_font(doc, ttf, &chars).ok_or(ReplaceError::Unencodable)?;
-    let res_name = add_font_resource(doc, page_id, fb.font_id)?;
-
-    let codes: Vec<u8> = with.chars().map(|c| fb.codes[&c]).collect();
-    let new_adv: f32 = with
-        .chars()
-        .map(|c| fb.advances[&c] / fb.units_per_em * 1000.0)
-        .sum();
     let delta = new_adv - old_adv;
 
     let mut ops: Vec<Operation> = Vec::new();
@@ -241,7 +299,7 @@ fn replace_with_fallback(
         "Tf",
         vec![Object::Name(res_name.into_bytes()), Object::Real(seg.font_size)],
     ));
-    let mut arr = vec![Object::String(codes, lopdf::StringFormat::Literal)];
+    let mut arr = vec![Object::String(string_bytes, lopdf::StringFormat::Literal)];
     if delta.abs() > 0.01 {
         arr.push(Object::Real(delta));
     }
