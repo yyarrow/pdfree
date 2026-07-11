@@ -237,7 +237,7 @@ pub fn load_fonts<'a>(doc: &'a Document, page_id: lopdf::ObjectId) -> BTreeMap<V
     // ExtGState dicts can also set the font (ISO 32000 8.4.5, /Font entry);
     // register those under a synthetic "gs:<name>" key so the interpreter
     // and the rescue paths can resolve them like ordinary resources.
-    for (gs_name, font_dict, _) in gs_font_entries(doc, page_id) {
+    for (gs_name, font_dict, _, _) in gs_font_entries(doc, page_id) {
         let mut key = b"gs:".to_vec();
         key.extend_from_slice(&gs_name);
         out.insert(key, build_font_info(doc, font_dict));
@@ -245,10 +245,26 @@ pub fn load_fonts<'a>(doc: &'a Document, page_id: lopdf::ObjectId) -> BTreeMap<V
     out
 }
 
-/// (gs resource name, font dict, size) for every ExtGState with a /Font.
-/// Resource dicts are nearest-first; the FIRST occurrence of a name wins,
-/// so a page-level /GS1 shadows an ancestor's /GS1.
-fn gs_font_entries(doc: &Document, page_id: lopdf::ObjectId) -> Vec<(Vec<u8>, &Dictionary, f32)> {
+/// Map from the synthetic "gs:<name>" font key to the underlying font
+/// object id, for callers that need to reference the font via /Font.
+pub fn gs_font_ids(doc: &Document, page_id: lopdf::ObjectId) -> BTreeMap<String, lopdf::ObjectId> {
+    gs_font_entries(doc, page_id)
+        .into_iter()
+        .filter_map(|(name, _, id, _)| {
+            id.map(|id| (format!("gs:{}", String::from_utf8_lossy(&name)), id))
+        })
+        .collect()
+}
+
+/// (gs resource name, font dict, font object id, size) for every ExtGState
+/// with a /Font. Resource dicts are nearest-first and the FIRST occurrence
+/// of a name wins — including font-less ones, so a page-level /GS1 without
+/// /Font correctly shadows an ancestor's font-bearing /GS1.
+#[allow(clippy::type_complexity)]
+fn gs_font_entries(
+    doc: &Document,
+    page_id: lopdf::ObjectId,
+) -> Vec<(Vec<u8>, &Dictionary, Option<lopdf::ObjectId>, f32)> {
     let mut out = Vec::new();
     let mut seen: std::collections::HashSet<Vec<u8>> = std::collections::HashSet::new();
     let Ok((inline_res, res_ids)) = doc.get_page_resources(page_id) else {
@@ -273,18 +289,18 @@ fn gs_font_entries(doc: &Document, page_id: lopdf::ObjectId) -> Vec<(Vec<u8>, &D
             continue;
         };
         for (gs_name, gs_obj) in egs.iter() {
-            if seen.contains(gs_name) {
-                continue;
+            if !seen.insert(gs_name.clone()) {
+                continue; // a nearer dict already defined this name
             }
             let entry = (|| {
                 let gs = doc.dereference(gs_obj).ok()?.1.as_dict().ok()?;
                 let arr = doc.dereference(gs.get(b"Font").ok()?).ok()?.1.as_array().ok()?;
+                let font_id = arr.first()?.as_reference().ok();
                 let font_dict = doc.dereference(arr.first()?).ok()?.1.as_dict().ok()?;
                 let size = arr.get(1).and_then(|o| o.as_float().ok()).unwrap_or(0.0);
-                Some((gs_name.clone(), font_dict, size))
+                Some((gs_name.clone(), font_dict, font_id, size))
             })();
             if let Some(e) = entry {
-                seen.insert(e.0.clone());
                 out.push(e);
             }
         }
@@ -296,7 +312,7 @@ fn gs_font_entries(doc: &Document, page_id: lopdf::ObjectId) -> Vec<(Vec<u8>, &D
 pub fn load_gs_font_map(doc: &Document, page_id: lopdf::ObjectId) -> BTreeMap<Vec<u8>, (Vec<u8>, f32)> {
     gs_font_entries(doc, page_id)
         .into_iter()
-        .map(|(name, _, size)| {
+        .map(|(name, _, _, size)| {
             let mut key = b"gs:".to_vec();
             key.extend_from_slice(&name);
             (name, (key, size))
