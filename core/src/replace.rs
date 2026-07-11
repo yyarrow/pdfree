@@ -35,6 +35,33 @@ pub enum ReplaceError {
     RunNotFound,
     #[error("replacement length differs from original; line reflow lands in Phase B")]
     NeedsReflow,
+    #[error("encrypted documents are not supported yet (saving would strip the encryption)")]
+    EncryptedUnsupported,
+}
+
+/// Refuse to edit encrypted documents: lopdf's writer drops /Encrypt on
+/// save, which would silently strip the owner's permission settings.
+pub(crate) fn reject_encrypted(doc: &Document) -> Result<(), ReplaceError> {
+    if doc.trailer.get(b"Encrypt").is_ok() {
+        return Err(ReplaceError::EncryptedUnsupported);
+    }
+    Ok(())
+}
+
+/// Point the page's /Contents at a fresh single stream. lopdf's
+/// change_page_content silently no-ops when /Contents is an indirect
+/// reference to an array (common in optimizer output); writing a new
+/// stream object handles every Contents shape.
+pub(crate) fn set_page_content(doc: &mut Document, page_id: ObjectId, content: Vec<u8>) -> Result<(), ReplaceError> {
+    let mut stream = lopdf::Stream::new(lopdf::dictionary! {}, content);
+    let _ = stream.compress();
+    let new_id = doc.add_object(stream);
+    let page = doc
+        .get_object_mut(page_id)
+        .and_then(|o| o.as_dict_mut())
+        .map_err(ReplaceError::Pdf)?;
+    page.set("Contents", Object::Reference(new_id));
+    Ok(())
 }
 
 /// Replace the first occurrence of `find` on page `page_no` (1-based) with
@@ -48,6 +75,7 @@ pub fn replace_text(
     with: &str,
     fallback: Option<&TtfFont>,
 ) -> Result<ReplaceReport, ReplaceError> {
+    reject_encrypted(doc)?;
     let pages = doc.get_pages();
     let page_id = *pages.get(&page_no).ok_or(ReplaceError::PageNotFound(page_no))?;
 
@@ -114,8 +142,9 @@ pub(crate) fn replace_seg_internal(
             // its glyphs match the document's typography exactly. Only then
             // synthesize a Type3 fallback from the bundled font.
             if let Some((res_name, bytes, new_adv)) = try_borrow(doc, page_id, &segs, &seg, &new_text) {
+                let size = seg.font_size;
                 return finish_swap(
-                    doc, page_id, page_no, content, seg, &new_text, res_name, bytes, new_adv, old_adv,
+                    doc, page_id, page_no, content, seg, &new_text, res_name, bytes, new_adv, old_adv, size,
                 );
             }
             let Some(ttf) = fallback else { return Err(e) };
@@ -193,7 +222,7 @@ pub(crate) fn replace_seg_internal(
     }
 
     let encoded = content.encode()?;
-    doc.change_page_content(page_id, encoded)?;
+    set_page_content(doc, page_id, encoded)?;
 
     Ok(ReplaceReport {
         page: page_no,
@@ -250,6 +279,11 @@ fn replace_with_fallback(
     old_adv: f32,
     ttf: &TtfFont,
 ) -> Result<ReplaceReport, ReplaceError> {
+    let orig_type3 = load_fonts(doc, page_id)
+        .get(seg.font.as_bytes())
+        .map(|f| f.type3)
+        .unwrap_or(false);
+
     let chars: Vec<char> = with.chars().collect();
     let fb = build_type3_font(doc, ttf, &chars).ok_or(ReplaceError::Unencodable)?;
     let res_name = add_font_resource(doc, page_id, fb.font_id)?;
@@ -258,7 +292,25 @@ fn replace_with_fallback(
         .chars()
         .map(|c| fb.advances[&c] / fb.units_per_em * 1000.0)
         .sum();
-    finish_swap(doc, page_id, page_no, content, seg, with, res_name, codes, new_adv, old_adv)
+
+    // Type3 originals can use arbitrary glyph-unit conventions (Tf 0.15 with
+    // 48-unit-wide glyphs); our synthesized font is em-normalized, so trusting
+    // Tf would render at the wrong visual size. Calibrate via per-char
+    // advance equivalence when the implied ratio is clearly off.
+    let mut swap_size = seg.font_size;
+    if orig_type3 {
+        let old_per_char = old_adv / seg.text.chars().count().max(1) as f32;
+        let new_per_char = new_adv / chars.len().max(1) as f32;
+        if new_per_char > 0.0 {
+            let ratio = old_per_char / new_per_char;
+            if !(0.5..=2.0).contains(&ratio) && ratio.is_finite() && ratio > 0.0 {
+                swap_size = seg.font_size * ratio;
+            }
+        }
+    }
+    finish_swap(
+        doc, page_id, page_no, content, seg, with, res_name, codes, new_adv, old_adv, swap_size,
+    )
 }
 
 /// Rewrite the segment's show op to render `string_bytes` in the font
@@ -277,6 +329,7 @@ fn finish_swap(
     string_bytes: Vec<u8>,
     new_adv: f32,
     old_adv: f32,
+    swap_size: f32,
 ) -> Result<ReplaceReport, ReplaceError> {
     let op_kind = content.operations[seg.op_idx].operator.clone();
     // For a multi-string TJ, the untouched sibling elements stay in the
@@ -300,7 +353,14 @@ fn finish_swap(
         other => return Err(ReplaceError::UnsupportedOperator(other.to_string())),
     };
 
-    let delta = new_adv - old_adv;
+    // The TJ compensation number acts at the ACTIVE font size (swap_size);
+    // old_adv was measured at seg.font_size — rescale so the text-space
+    // shift comes out exact even when the sizes differ.
+    let delta = if swap_size > 0.0 {
+        new_adv - old_adv * (seg.font_size / swap_size)
+    } else {
+        new_adv - old_adv
+    };
 
     let mut ops: Vec<Operation> = Vec::new();
     match op_kind.as_str() {
@@ -318,7 +378,7 @@ fn finish_swap(
     }
     ops.push(Operation::new(
         "Tf",
-        vec![Object::Name(res_name.into_bytes()), Object::Real(seg.font_size)],
+        vec![Object::Name(res_name.into_bytes()), Object::Real(swap_size)],
     ));
     let mut arr = vec![Object::String(string_bytes, lopdf::StringFormat::Literal)];
     if delta.abs() > 0.01 {
@@ -335,7 +395,7 @@ fn finish_swap(
 
     content.operations.splice(seg.op_idx..seg.op_idx + 1, ops);
     let encoded = content.encode()?;
-    doc.change_page_content(page_id, encoded)?;
+    set_page_content(doc, page_id, encoded)?;
 
     let mut bbox = seg.bbox;
     if old_adv > 0.0 && new_adv > old_adv {

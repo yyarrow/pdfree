@@ -106,6 +106,9 @@ pub struct FontInfo<'a> {
     /// (ISO 32000 9.10.3); /Encoding glyph names can be meaningless (Skia).
     pub tounicode: Option<crate::tounicode::ToUnicodeMap>,
     pub default_width: f32,
+    /// Type3 only: vertical extent from /FontBBox mapped through FontMatrix,
+    /// per unit of font size (ascent above baseline, descent below).
+    pub t3_vertical: Option<(f32, f32)>,
 }
 
 /// Map a BaseFont name (possibly subset-prefixed or an Arial/TimesNewRoman
@@ -116,7 +119,12 @@ fn std14_lookup(base_font: &[u8]) -> Option<&'static [f32; 256]> {
     let lower = s.to_ascii_lowercase();
     let bold = lower.contains("bold");
     let italic = lower.contains("italic") || lower.contains("oblique");
-    let name = if lower.contains("courier") || lower.contains("mono") {
+    let name = if lower.contains("courier")
+        || lower.contains("mono")
+        || lower.contains("monaco")
+        || lower.contains("menlo")
+        || lower.contains("consolas")
+    {
         match (bold, italic) {
             (false, false) => "Courier",
             (true, false) => "Courier-Bold",
@@ -356,6 +364,31 @@ fn build_font_info<'a>(doc: &'a Document, dict: &'a Dictionary) -> FontInfo<'a> 
                 crate::tounicode::ToUnicodeMap::parse(&stream.decompressed_content().ok()?)
             })()
         };
+        // Type3 vertical extent: FontBBox is required for Type3 and, mapped
+        // through the FontMatrix, gives real ascent/descent per unit size —
+        // Tf sizes for these fonts can be arbitrary (0.24pt with huge glyph
+        // coordinates), so em-fraction guesses are meaningless.
+        let t3_vertical = if type3 {
+            (|| {
+                let fm = doc.dereference(dict.get(b"FontMatrix").ok()?).ok()?.1.as_array().ok()?;
+                let fy = fm.get(3).and_then(|o| o.as_float().ok()).unwrap_or(0.001).abs();
+                let bb = doc.dereference(dict.get(b"FontBBox").ok()?).ok()?.1.as_array().ok()?;
+                let y0 = bb.get(1)?.as_float().ok()?;
+                let y1 = bb.get(3)?.as_float().ok()?;
+                let (asc, desc) = ((y1.max(0.0) * fy), (-y0.min(0.0) * fy));
+                if asc + desc > 0.0 { Some((asc, desc)) } else { None }
+            })()
+        } else {
+            None
+        };
+        // Out-of-range codes fall back to /MissingWidth when the descriptor
+        // provides one (ISO 32000 9.8.1), else the old 500 guess.
+        let default_width = (|| {
+            let fd = doc.dereference(dict.get(b"FontDescriptor").ok()?).ok()?.1.as_dict().ok()?;
+            let mw = doc.dereference(fd.get(b"MissingWidth").ok()?).ok()?.1.as_float().ok()?;
+            Some(mw * if type3 { width_scale } else { 1.0 })
+        })()
+        .unwrap_or(500.0);
         FontInfo {
             dict,
             cid,
@@ -366,7 +399,8 @@ fn build_font_info<'a>(doc: &'a Document, dict: &'a Dictionary) -> FontInfo<'a> 
             charprocs,
             differences,
             tounicode,
-            default_width: 500.0,
+            default_width,
+            t3_vertical,
         }
     }
 }
@@ -574,9 +608,14 @@ fn show_string(
     }
     let width_text_space = pen;
 
-    // Generous ascent/descent estimates: some fonts descend past 0.25em.
-    let (x0, y0) = trm.apply(0.0, -0.35 * gs.font_size);
-    let (x1a, y1a) = trm.apply(width_text_space, 1.05 * gs.font_size);
+    // Vertical extent: Type3 fonts get real FontBBox-derived metrics (their
+    // Tf sizes can be arbitrary); others use generous em-fraction estimates.
+    let (asc, desc) = match font.and_then(|f| f.t3_vertical) {
+        Some((a, d)) => (a * 1.1, (d * 1.1).max(a * 0.1)),
+        None => (1.05, 0.35),
+    };
+    let (x0, y0) = trm.apply(0.0, -desc * gs.font_size);
+    let (x1a, y1a) = trm.apply(width_text_space, asc * gs.font_size);
     let bbox = [x0.min(x1a), y0.min(y1a), x0.max(x1a), y0.max(y1a)];
 
     if !text.trim().is_empty() {

@@ -27,6 +27,7 @@ pub fn replace_run_text(
     new_text: &str,
     fallback: Option<&TtfFont>,
 ) -> Result<ReplaceReport, ReplaceError> {
+    crate::replace::reject_encrypted(doc)?;
     let mut work = doc.clone();
     let report = replace_run_inner(&mut work, page_no, block, line, run, new_text, fallback)?;
     *doc = work;

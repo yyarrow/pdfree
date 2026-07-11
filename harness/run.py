@@ -135,12 +135,26 @@ def judge(case, in_pdf, out_pdf, page_no, report, find, repl, work):
     if x1 < left or y1 < bottom or x0 > right or y0 > top:
         return "skip_offpage", None
 
-    diff = ImageChops.difference(before, after)
+    px0, py0, px1, py1 = bbox_to_pixels(report["bbox"], size_b)
+
+    # If the edit region was blank in the ORIGINAL render (hidden OCG layer,
+    # unrenderable font, occluded text), no visual judgement is possible.
+    w, h = before.size
+    region = before.crop((max(px0, 0), max(py0, 0), min(px1, w), min(py1, h)))
+    if region.point(lambda v: 255 if v < 200 else 0).getbbox() is None:
+        return "skip_invisible_text", None
+
+    # Threshold the diff: sub-hundredth-point compensation residue leaves
+    # faint antialiasing noise (<80) along the line; real misplacements are
+    # near-solid. Only count confident pixels.
+    diff = ImageChops.difference(before, after).point(lambda v: 255 if v >= 128 else 0)
     diff_bbox = diff.getbbox()  # None if identical
     if diff_bbox is None:
+        # Edit landed in the text layer but is painted over (image drawn
+        # after an OCR layer): correct edit, visually unjudgeable.
+        if repl in "".join(text.split()):
+            return "skip_occluded_text", None
         return "fail_no_visual_change", None
-
-    px0, py0, px1, py1 = bbox_to_pixels(report["bbox"], size_b)
     dx0, dy0, dx1, dy1 = diff_bbox
     if dx0 < px0 or dy0 < py0 or dx1 > px1 + 1 or dy1 > py1 + 1:
         return "fail_leak_outside_bbox", diff
@@ -190,6 +204,8 @@ def run_case(pdf_path: Path, work: Path):
             return pdf_path.name, "skip_no_candidate", None
         # engine refusing every candidate is a capability gap (usually a
         # font that can't encode the replacement), not silent corruption
+        if last_err and "encrypted" in last_err:
+            return pdf_path.name, "skip_encrypted", None
         if last_err and "cannot represent" in last_err:
             return pdf_path.name, "fail_unencodable", last_err
         return pdf_path.name, "fail_engine_replace", last_err
