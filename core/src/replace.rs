@@ -31,6 +31,10 @@ pub enum ReplaceError {
     MissingGlyph,
     #[error("unsupported show operator {0}")]
     UnsupportedOperator(String),
+    #[error("run not found in page model")]
+    RunNotFound,
+    #[error("replacement length differs from original; line reflow lands in Phase B")]
+    NeedsReflow,
 }
 
 /// Replace the first occurrence of `find` on page `page_no` (1-based) with
@@ -47,14 +51,32 @@ pub fn replace_text(
     let pages = doc.get_pages();
     let page_id = *pages.get(&page_no).ok_or(ReplaceError::PageNotFound(page_no))?;
 
-    let (mut content, segs) = walk_page(doc, page_id, page_no)?;
+    let (content, segs) = walk_page(doc, page_id, page_no)?;
 
-    let seg: &Seg = segs
+    let idx = segs
         .iter()
-        .find(|s| s.text.contains(find))
+        .position(|s| s.text.contains(find))
         .ok_or(ReplaceError::TextNotFound(segs.len()))?;
 
-    let new_text = seg.text.replacen(find, with, 1);
+    let new_text = segs[idx].text.replacen(find, with, 1);
+    replace_seg_internal(doc, page_id, page_no, content, segs, idx, new_text, fallback)
+}
+
+/// Replace segment `idx`'s entire text with `new_text` (same font first,
+/// then borrow/fallback rescue). The workhorse behind both the find-string
+/// API above and the model-level run editing in edit.rs.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn replace_seg_internal(
+    doc: &mut Document,
+    page_id: ObjectId,
+    page_no: u32,
+    mut content: lopdf::content::Content,
+    segs: Vec<Seg>,
+    idx: usize,
+    new_text: String,
+    fallback: Option<&TtfFont>,
+) -> Result<ReplaceReport, ReplaceError> {
+    let seg: &Seg = &segs[idx];
 
     // Re-encode through the same font (ToUnicode-first, roundtrip-verified).
     let encoded = {
@@ -85,20 +107,19 @@ pub fn replace_text(
     let (new_bytes, old_adv, new_adv) = match encoded {
         Ok(v) => v,
         Err((e @ (ReplaceError::Unencodable | ReplaceError::MissingGlyph), old_adv)) => {
-            // The segment's own font can't express the replacement. Both
-            // rescue paths rewrite the whole segment, so require that.
-            if find != seg.text {
-                return Err(e);
-            }
+            // The segment's own font can't express the replacement; both
+            // rescue paths rewrite the whole segment with `new_text`.
             let seg = seg.clone();
             // First choice: borrow another font already in the document —
             // its glyphs match the document's typography exactly. Only then
             // synthesize a Type3 fallback from the bundled font.
-            if let Some((res_name, bytes, new_adv)) = try_borrow(doc, page_id, &segs, &seg, with) {
-                return finish_swap(doc, page_id, page_no, content, seg, with, res_name, bytes, new_adv, old_adv);
+            if let Some((res_name, bytes, new_adv)) = try_borrow(doc, page_id, &segs, &seg, &new_text) {
+                return finish_swap(
+                    doc, page_id, page_no, content, seg, &new_text, res_name, bytes, new_adv, old_adv,
+                );
             }
             let Some(ttf) = fallback else { return Err(e) };
-            return replace_with_fallback(doc, page_id, page_no, content, seg, with, old_adv, ttf);
+            return replace_with_fallback(doc, page_id, page_no, content, seg, &new_text, old_adv, ttf);
         }
         Err((e, _)) => return Err(e),
     };

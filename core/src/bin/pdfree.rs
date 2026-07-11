@@ -11,6 +11,29 @@ struct Cli {
 enum Cmd {
     /// Extract text segments with positions as JSON.
     Extract { input: String },
+    /// Print the page's text model (blocks -> lines -> runs) as JSON.
+    Model {
+        input: String,
+        #[arg(long)]
+        page: u32,
+    },
+    /// Replace a run's text via the model (same length only for now).
+    ReplaceRun {
+        input: String,
+        output: String,
+        #[arg(long)]
+        page: u32,
+        #[arg(long)]
+        block: usize,
+        #[arg(long)]
+        line: usize,
+        #[arg(long)]
+        run: usize,
+        #[arg(long = "with")]
+        with_text: String,
+        #[arg(long)]
+        fallback_font: Option<String>,
+    },
     /// Replace the first occurrence of a string on a page.
     Replace {
         input: String,
@@ -48,6 +71,33 @@ fn run(cli: Cli) -> Result<String, Box<dyn std::error::Error>> {
                 "pages": pages,
                 "runs": runs,
             }))?)
+        }
+        Cmd::Model { input, page } => {
+            let doc = pdfree_core::load_with_salvage(std::path::Path::new(&input))?;
+            Ok(serde_json::to_string(&pdfree_core::extract_model(&doc, page))?)
+        }
+        Cmd::ReplaceRun {
+            input,
+            output,
+            page,
+            block,
+            line,
+            run,
+            with_text,
+            fallback_font,
+        } => {
+            let ttf = match fallback_font {
+                Some(path) => Some(
+                    pdfree_core::TtfFont::parse(std::fs::read(path)?)
+                        .ok_or("failed to parse fallback font")?,
+                ),
+                None => None,
+            };
+            let mut doc = pdfree_core::load_with_salvage(std::path::Path::new(&input))?;
+            let report =
+                pdfree_core::replace_run_text(&mut doc, page, block, line, run, &with_text, ttf.as_ref())?;
+            doc.save(&output)?;
+            Ok(serde_json::to_string(&report)?)
         }
         Cmd::Replace {
             input,

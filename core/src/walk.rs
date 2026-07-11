@@ -7,6 +7,21 @@ use lopdf::content::Content;
 use lopdf::{Dictionary, Document, Object};
 use std::collections::BTreeMap;
 
+/// One positioned glyph (one byte code, or a 2-byte code for CID fonts).
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct Glyph {
+    /// Decoded character(s) for this code.
+    pub text: String,
+    /// Byte range within the owning segment's string.
+    pub byte_start: usize,
+    pub byte_len: usize,
+    /// Baseline origin in PDF user space.
+    pub x: f32,
+    pub y: f32,
+    /// Advance to the next glyph's origin, user space (x direction).
+    pub w: f32,
+}
+
 /// One shown string (a Tj operand, or one string element of a TJ array).
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct Seg {
@@ -29,6 +44,47 @@ pub struct Seg {
     /// True for Type3 fonts, whose glyphs are inline drawing procedures;
     /// editing them safely needs CharProcs verification we don't do yet.
     pub type3: bool,
+    /// Fill color as approximate RGB (0..1 each).
+    pub color: [f32; 3],
+    /// True when the text matrix has no rotation/skew component.
+    pub horizontal: bool,
+    #[serde(skip)]
+    pub glyphs: Vec<Glyph>,
+}
+
+/// Graphics state saved/restored by q/Q — the CTM plus the text state set
+/// by Tf/TL/Tc/Tw/Tz/Tr and the fill color.
+#[derive(Clone)]
+struct GfxState {
+    ctm: Mat,
+    font_key: Vec<u8>,
+    font_size: f32,
+    leading: f32,
+    char_spacing: f32,
+    word_spacing: f32,
+    h_scale: f32,
+    render_mode: i64,
+    fill_color: [f32; 3],
+}
+
+impl GfxState {
+    fn new() -> Self {
+        GfxState {
+            ctm: Mat::identity(),
+            font_key: Vec::new(),
+            font_size: 0.0,
+            leading: 0.0,
+            char_spacing: 0.0,
+            word_spacing: 0.0,
+            h_scale: 1.0,
+            render_mode: 0,
+            fill_color: [0.0, 0.0, 0.0],
+        }
+    }
+}
+
+fn cmyk_to_rgb(c: f32, m: f32, y: f32, k: f32) -> [f32; 3] {
+    [(1.0 - c) * (1.0 - k), (1.0 - m) * (1.0 - k), (1.0 - y) * (1.0 - k)]
 }
 
 pub struct FontInfo<'a> {
@@ -266,30 +322,18 @@ pub fn walk_page(doc: &Document, page_id: lopdf::ObjectId, page_no: u32) -> lopd
 
     let mut segs = Vec::new();
 
-    let mut ctm = Mat::identity();
+    let mut gs = GfxState::new();
     let mut tm = Mat::identity(); // text matrix
     let mut tlm = Mat::identity(); // text line matrix
-    let mut font_key: Vec<u8> = Vec::new();
-    let mut font_size: f32 = 0.0;
-    let mut leading: f32 = 0.0;
-    let mut char_spacing: f32 = 0.0;
-    let mut word_spacing: f32 = 0.0;
-    let mut h_scale: f32 = 1.0;
-    let mut render_mode: i64 = 0;
-    // q/Q save and restore the whole graphics state, which includes the
-    // text state set by Tf/TL/Tc/Tw/Tz/Tr — not just the CTM.
-    #[allow(clippy::type_complexity)]
-    let mut gs_stack: Vec<(Mat, Vec<u8>, f32, f32, f32, f32, f32, i64)> = Vec::new();
+    let mut gs_stack: Vec<GfxState> = Vec::new();
 
     for (op_idx, op) in content.operations.iter().enumerate() {
         let ops = &op.operands;
         match op.operator.as_str() {
-            "q" => gs_stack.push((
-                ctm, font_key.clone(), font_size, leading, char_spacing, word_spacing, h_scale, render_mode,
-            )),
+            "q" => gs_stack.push(gs.clone()),
             "Q" => {
                 if let Some(s) = gs_stack.pop() {
-                    (ctm, font_key, font_size, leading, char_spacing, word_spacing, h_scale, render_mode) = s;
+                    gs = s;
                 }
             }
             "cm" if ops.len() == 6 => {
@@ -301,27 +345,48 @@ pub fn walk_page(doc: &Document, page_id: lopdf::ObjectId, page_no: u32) -> lopd
                     op_f32(&ops[4]),
                     op_f32(&ops[5]),
                 ]);
-                ctm = m.mul(&ctm);
+                gs.ctm = m.mul(&gs.ctm);
             }
             "BT" => {
                 tm = Mat::identity();
                 tlm = Mat::identity();
             }
             "Tf" if ops.len() == 2 => {
-                font_key = ops[0].as_name().map(|n| n.to_vec()).unwrap_or_default();
-                font_size = op_f32(&ops[1]);
+                gs.font_key = ops[0].as_name().map(|n| n.to_vec()).unwrap_or_default();
+                gs.font_size = op_f32(&ops[1]);
             }
-            "TL" if ops.len() == 1 => leading = op_f32(&ops[0]),
-            "Tc" if ops.len() == 1 => char_spacing = op_f32(&ops[0]),
-            "Tw" if ops.len() == 1 => word_spacing = op_f32(&ops[0]),
-            "Tz" if ops.len() == 1 => h_scale = op_f32(&ops[0]) / 100.0,
-            "Tr" if ops.len() == 1 => render_mode = ops[0].as_i64().unwrap_or(0),
+            "TL" if ops.len() == 1 => gs.leading = op_f32(&ops[0]),
+            "Tc" if ops.len() == 1 => gs.char_spacing = op_f32(&ops[0]),
+            "Tw" if ops.len() == 1 => gs.word_spacing = op_f32(&ops[0]),
+            "Tz" if ops.len() == 1 => gs.h_scale = op_f32(&ops[0]) / 100.0,
+            "Tr" if ops.len() == 1 => gs.render_mode = ops[0].as_i64().unwrap_or(0),
+            // Fill color (approximated to RGB; stroke color doesn't matter
+            // for the text model).
+            "rg" if ops.len() == 3 => gs.fill_color = [op_f32(&ops[0]), op_f32(&ops[1]), op_f32(&ops[2])],
+            "g" if ops.len() == 1 => {
+                let v = op_f32(&ops[0]);
+                gs.fill_color = [v, v, v];
+            }
+            "k" if ops.len() == 4 => {
+                gs.fill_color = cmyk_to_rgb(op_f32(&ops[0]), op_f32(&ops[1]), op_f32(&ops[2]), op_f32(&ops[3]));
+            }
+            "cs" => gs.fill_color = [0.0, 0.0, 0.0], // new colorspace resets to its initial color
+            "sc" | "scn" => {
+                // Component count tells the colorspace family well enough.
+                let nums: Vec<f32> = ops.iter().filter_map(|o| o.as_float().ok()).collect();
+                match nums.len() {
+                    1 => gs.fill_color = [nums[0], nums[0], nums[0]],
+                    3 => gs.fill_color = [nums[0], nums[1], nums[2]],
+                    4 => gs.fill_color = cmyk_to_rgb(nums[0], nums[1], nums[2], nums[3]),
+                    _ => {}
+                }
+            }
             "Td" if ops.len() == 2 => {
                 tlm = Mat::translate(op_f32(&ops[0]), op_f32(&ops[1])).mul(&tlm);
                 tm = tlm;
             }
             "TD" if ops.len() == 2 => {
-                leading = -op_f32(&ops[1]);
+                gs.leading = -op_f32(&ops[1]);
                 tlm = Mat::translate(op_f32(&ops[0]), op_f32(&ops[1])).mul(&tlm);
                 tm = tlm;
             }
@@ -337,30 +402,22 @@ pub fn walk_page(doc: &Document, page_id: lopdf::ObjectId, page_no: u32) -> lopd
                 tlm = tm;
             }
             "T*" => {
-                tlm = Mat::translate(0.0, -leading).mul(&tlm);
+                tlm = Mat::translate(0.0, -gs.leading).mul(&tlm);
                 tm = tlm;
             }
             "Tj" | "'" | "\"" => {
                 if op.operator == "'" || op.operator == "\"" {
-                    tlm = Mat::translate(0.0, -leading).mul(&tlm);
+                    tlm = Mat::translate(0.0, -gs.leading).mul(&tlm);
                     tm = tlm;
                 }
                 // For ", operands are [aw ac string]; for Tj and ' it's [string].
-                let (s_op, s_idx) = if op.operator == "\"" {
-                    (ops.get(2), 2)
-                } else {
-                    (ops.get(0), 0)
-                };
+                let s_op = if op.operator == "\"" { ops.get(2) } else { ops.get(0) };
                 if op.operator == "\"" {
-                    word_spacing = op_f32(&ops[0]);
-                    char_spacing = op_f32(&ops[1]);
+                    gs.word_spacing = op_f32(&ops[0]);
+                    gs.char_spacing = op_f32(&ops[1]);
                 }
                 if let Some(Object::String(bytes, _)) = s_op {
-                    let _ = s_idx;
-                    show_string(
-                        doc, &fonts, &font_key, font_size, char_spacing, word_spacing, h_scale, &ctm, &mut tm,
-                        bytes, page_no, op_idx, 0, render_mode, &mut segs,
-                    );
+                    show_string(doc, &fonts, &gs, &mut tm, bytes, page_no, op_idx, 0, &mut segs);
                 }
             }
             "TJ" if ops.len() == 1 => {
@@ -369,15 +426,12 @@ pub fn walk_page(doc: &Document, page_id: lopdf::ObjectId, page_no: u32) -> lopd
                     for el in arr {
                         match el {
                             Object::String(bytes, _) => {
-                                show_string(
-                                    doc, &fonts, &font_key, font_size, char_spacing, word_spacing, h_scale, &ctm,
-                                    &mut tm, bytes, page_no, op_idx, str_idx, render_mode, &mut segs,
-                                );
+                                show_string(doc, &fonts, &gs, &mut tm, bytes, page_no, op_idx, str_idx, &mut segs);
                                 str_idx += 1;
                             }
                             _ => {
                                 let adj = el.as_float().unwrap_or(0.0);
-                                let tx = -adj / 1000.0 * font_size * h_scale;
+                                let tx = -adj / 1000.0 * gs.font_size * gs.h_scale;
                                 tm = Mat::translate(tx, 0.0).mul(&tm);
                             }
                         }
@@ -395,40 +449,62 @@ pub fn walk_page(doc: &Document, page_id: lopdf::ObjectId, page_no: u32) -> lopd
 fn show_string(
     doc: &Document,
     fonts: &BTreeMap<Vec<u8>, FontInfo>,
-    font_key: &[u8],
-    font_size: f32,
-    char_spacing: f32,
-    word_spacing: f32,
-    h_scale: f32,
-    ctm: &Mat,
+    gs: &GfxState,
     tm: &mut Mat,
     bytes: &[u8],
     page_no: u32,
     op_idx: usize,
     str_idx: usize,
-    render_mode: i64,
     segs: &mut Vec<Seg>,
 ) {
-    let font = fonts.get(font_key);
-    let (text, cid, type3, advance_em) = match font {
-        Some(f) => {
-            let text = f.decode(doc, bytes);
-            let adv = f.advance(bytes, text.chars().count());
-            (text, f.cid, f.type3, adv)
+    let font = fonts.get(&gs.font_key);
+    let (cid, type3) = font.map(|f| (f.cid, f.type3)).unwrap_or((false, false));
+    let code_len = if cid { 2 } else { 1 };
+
+    let trm = tm.mul(&gs.ctm);
+    // Horizontal means no rotation/skew in the combined matrix.
+    let horizontal = trm.0[1].abs() < 1e-4 && trm.0[2].abs() < 1e-4;
+
+    // Walk code units, accumulating pen position in text space and emitting
+    // one positioned glyph per code.
+    let mut glyphs: Vec<Glyph> = Vec::new();
+    let mut text = String::new();
+    let mut pen: f32 = 0.0; // text-space x
+    let mut i = 0;
+    while i < bytes.len() {
+        let n = code_len.min(bytes.len() - i);
+        let code = &bytes[i..i + n];
+        let g_text = match font {
+            Some(f) => f.decode(doc, code),
+            None => String::new(),
+        };
+        let adv_em = match font {
+            Some(f) => f.advance(code, g_text.chars().count().max(1)),
+            None => 500.0,
+        };
+        let mut adv = adv_em / 1000.0 * gs.font_size * gs.h_scale + gs.char_spacing * gs.h_scale;
+        if !cid && code[0] == b' ' {
+            adv += gs.word_spacing * gs.h_scale;
         }
-        None => (String::new(), false, false, bytes.len() as f32 * 500.0),
-    };
+        let (gx, gy) = trm.apply(pen, 0.0);
+        let (gx1, _) = trm.apply(pen + adv, 0.0);
+        text.push_str(&g_text);
+        glyphs.push(Glyph {
+            text: g_text,
+            byte_start: i,
+            byte_len: n,
+            x: gx,
+            y: gy,
+            w: gx1 - gx,
+        });
+        pen += adv;
+        i += n;
+    }
+    let width_text_space = pen;
 
-    let n_units = if cid { text.chars().count() } else { bytes.len() };
-    let n_spaces = if cid { 0 } else { bytes.iter().filter(|&&b| b == b' ').count() };
-    let width_text_space = advance_em / 1000.0 * font_size * h_scale
-        + n_units as f32 * char_spacing * h_scale
-        + n_spaces as f32 * word_spacing * h_scale;
-
-    let trm = tm.mul(ctm);
     // Generous ascent/descent estimates: some fonts descend past 0.25em.
-    let (x0, y0) = trm.apply(0.0, -0.35 * font_size);
-    let (x1a, y1a) = trm.apply(width_text_space, 1.05 * font_size);
+    let (x0, y0) = trm.apply(0.0, -0.35 * gs.font_size);
+    let (x1a, y1a) = trm.apply(width_text_space, 1.05 * gs.font_size);
     let bbox = [x0.min(x1a), y0.min(y1a), x0.max(x1a), y0.max(y1a)];
 
     if !text.trim().is_empty() {
@@ -438,12 +514,15 @@ fn show_string(
             str_idx,
             bytes: bytes.to_vec(),
             text,
-            font: String::from_utf8_lossy(font_key).into_owned(),
-            font_size,
+            font: String::from_utf8_lossy(&gs.font_key).into_owned(),
+            font_size: gs.font_size,
             bbox,
             cid,
-            visible: render_mode != 3,
+            visible: gs.render_mode != 3,
             type3,
+            color: gs.fill_color,
+            horizontal,
+            glyphs,
         });
     }
 

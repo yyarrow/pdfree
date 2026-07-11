@@ -62,6 +62,26 @@ impl DocSession {
         serde_json::to_string(&report).map_err(|e| JsError::new(&e.to_string()))
     }
 
+    /// The page's text model: JSON array of blocks -> lines -> runs.
+    pub fn extract_model(&self, page: u32) -> Result<String, JsError> {
+        serde_json::to_string(&pdfree_core::extract_model(&self.doc, page)).map_err(|e| JsError::new(&e.to_string()))
+    }
+
+    /// Replace a model run's full text (same character count for now).
+    pub fn replace_run(
+        &mut self,
+        page: u32,
+        block: usize,
+        line: usize,
+        run: usize,
+        with_text: &str,
+    ) -> Result<String, JsError> {
+        let report =
+            pdfree_core::replace_run_text(&mut self.doc, page, block, line, run, with_text, self.fallback.as_ref())
+                .map_err(|e| JsError::new(&e.to_string()))?;
+        serde_json::to_string(&report).map_err(|e| JsError::new(&e.to_string()))
+    }
+
     /// Serialize the current state.
     pub fn save(&mut self) -> Result<Vec<u8>, JsError> {
         let mut out = Vec::new();

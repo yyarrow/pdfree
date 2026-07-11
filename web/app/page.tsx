@@ -2,16 +2,17 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 
-type Run = {
-  page: number;
+// A run from the engine's text model (block -> line -> run hierarchy).
+type MRun = {
   text: string;
+  bbox: [number, number, number, number];
   font: string;
   font_size: number;
-  bbox: [number, number, number, number];
+  color: [number, number, number];
   cid: boolean;
-  visible: boolean;
   type3: boolean;
 };
+type MBlock = { bbox: [number, number, number, number]; lines: { baseline: number; runs: MRun[] }[] };
 
 // The engine keeps the parsed document resident (parse once, edit many,
 // serialize only when bytes are actually needed).
@@ -19,9 +20,8 @@ type DocSession = {
   page_count: () => number;
   set_fallback_font: (bytes: Uint8Array) => void;
   has_fallback: () => boolean;
-  extract_all: () => string;
-  extract_page: (page: number) => string;
-  replace: (page: number, find: string, with_text: string) => string;
+  extract_model: (page: number) => string;
+  replace_run: (page: number, block: number, line: number, run: number, with_text: string) => string;
   save: () => Uint8Array;
   free: () => void;
 };
@@ -40,7 +40,8 @@ async function loadFallbackFont(): Promise<Uint8Array> {
   return fallbackFontCache;
 }
 
-type Popover = { run: Run; x: number; y: number; value: string };
+type RunRect = { run: MRun; b: number; l: number; r: number; left: number; top: number; w: number; h: number };
+type Popover = { rect: RunRect; x: number; y: number; value: string };
 
 // pdf.js and our WASM engine are loaded at runtime from /public so the
 // bundler never sees them (worker files and .wasm confuse it for no gain).
@@ -66,10 +67,13 @@ function loadPdfjs(): Promise<any> {
 
 function friendlyError(msg: string): string {
   if (msg.includes("cannot represent")) {
-    return "这个字体的嵌入子集里缺少替换所需的字形，暂时改不了这个词（兜底字体功能开发中）";
+    return "字体缺少所需字形且兜底失败，这段暂时改不了";
   }
-  if (msg.includes("not found on page")) {
-    return "没有在页面上定位到这段文字，可能刚被改过，请重试";
+  if (msg.includes("reflow")) {
+    return "目前只支持等长替换（字数相同）；增删字数需要重排功能，正在开发中";
+  }
+  if (msg.includes("not found")) {
+    return "没有定位到这段文字，可能刚被改过，请重试";
   }
   return `引擎报错：${msg}`;
 }
@@ -77,14 +81,13 @@ function friendlyError(msg: string): string {
 export default function Home() {
   const [pdfBytes, setPdfBytes] = useState<Uint8Array | null>(null);
   const [fileName, setFileName] = useState("");
-  const [runs, setRuns] = useState<Run[]>([]);
   const [pageCount, setPageCount] = useState(0);
   const [page, setPage] = useState(1);
   const [busy, setBusy] = useState("");
   const [toast, setToast] = useState<{ text: string; err: boolean } | null>(null);
   const [popover, setPopover] = useState<Popover | null>(null);
   const [dragOver, setDragOver] = useState(false);
-  const [rects, setRects] = useState<{ run: Run; l: number; t: number; w: number; h: number }[]>([]);
+  const [rects, setRects] = useState<RunRect[]>([]);
   const [edited, setEdited] = useState(false);
   // Shown instantly at the edit position while the real render catches up.
   const [optimistic, setOptimistic] = useState<{ l: number; t: number; w: number; h: number; text: string } | null>(
@@ -128,11 +131,9 @@ export default function Home() {
         sessionRef.current?.free?.();
         const session = new engine.DocSession(bytes);
         sessionRef.current = session;
-        const parsed = JSON.parse(session.extract_all());
         const doc = await loadPdfjsDoc(bytes);
         setPdfBytes(bytes);
         setFileName(name);
-        setRuns(parsed.runs);
         setPageCount(doc.numPages);
         setPage(1);
       } catch (e) {
@@ -192,81 +193,77 @@ export default function Home() {
         .render({ canvasContext: ctx, viewport, transform: [dpr, 0, 0, dpr, 0, 0], intent: "print" })
         .promise;
       if (cancelled) return;
-      const pageRects = runs
-        .filter((r) => r.page === page && r.visible)
-        .map((run) => {
-          const [x0, y0, x1, y1] = run.bbox;
-          const [ax, ay] = viewport.convertToViewportPoint(x0, y0);
-          const [bx, by] = viewport.convertToViewportPoint(x1, y1);
-          return {
-            run,
-            l: Math.min(ax, bx),
-            t: Math.min(ay, by),
-            w: Math.abs(bx - ax),
-            h: Math.abs(by - ay),
-          };
-        });
+      // Click targets come from the engine's text model for this page.
+      const blocks: MBlock[] = JSON.parse(sessionRef.current?.extract_model(page) ?? "[]");
+      const pageRects: RunRect[] = [];
+      blocks.forEach((blk, b) =>
+        blk.lines.forEach((line, l) =>
+          line.runs.forEach((run, r) => {
+            const [x0, y0, x1, y1] = run.bbox;
+            const [ax, ay] = viewport.convertToViewportPoint(x0, y0);
+            const [bx, by] = viewport.convertToViewportPoint(x1, y1);
+            pageRects.push({
+              run,
+              b,
+              l,
+              r,
+              left: Math.min(ax, bx),
+              top: Math.min(ay, by),
+              w: Math.abs(bx - ax),
+              h: Math.abs(by - ay),
+            });
+          }),
+        ),
+      );
       setRects(pageRects);
       setOptimistic(null); // real render is on screen now
     })();
     return () => {
       cancelled = true;
     };
-  }, [page, runs, pdfBytes]);
+  }, [page, pdfBytes]);
 
-  const clickRun = useCallback(
-    (r: { run: Run; l: number; t: number; w: number; h: number }) => {
-      if (r.run.cid) {
-        showToast("中文/CJK 文本编辑正在开发中，敬请期待", true);
-        return;
-      }
-      setPopover({ run: r.run, x: r.l, y: r.t + r.h + 6, value: r.run.text });
-    },
-    [showToast],
-  );
+  const clickRun = useCallback((rect: RunRect) => {
+    setPopover({ rect, x: rect.left, y: rect.top + rect.h + 6, value: rect.run.text });
+  }, []);
 
   const applyEdit = useCallback(async () => {
     const session = sessionRef.current;
     if (!popover || !session) return;
-    const { run, value } = popover;
-    if (value === run.text) {
+    const { rect, value } = popover;
+    if (value === rect.run.text) {
       setPopover(null);
       return;
     }
     // Optimistic: paint the new text over the old spot immediately; the
     // canvas refresh below swaps in the real render and clears it.
-    const rect = rects.find((r) => r.run === run);
-    if (rect) {
-      setOptimistic({ l: rect.l, t: rect.t, w: rect.w, h: rect.h, text: value });
-    }
+    setOptimistic({ l: rect.left, t: rect.top, w: rect.w, h: rect.h, text: value });
     setPopover(null);
     try {
       try {
-        session.replace(run.page, run.text, value);
+        session.replace_run(page, rect.b, rect.l, rect.r, value);
       } catch (e) {
         const msg = e instanceof Error ? e.message : String(e);
         if (!msg.includes("cannot represent") || session.has_fallback()) throw e;
-        // Original font lacks the glyphs — load the fallback once and retry.
+        // Fonts lack the glyphs — load the fallback once and retry.
         setBusy("原字体缺字形，正在加载兜底字体…");
         session.set_fallback_font(await loadFallbackFont());
         setBusy("");
-        session.replace(run.page, run.text, value);
+        session.replace_run(page, rect.b, rect.l, rect.r, value);
       }
-      // Only the edited page gets re-walked; pdf.js still needs full bytes.
-      const pageRuns: Run[] = JSON.parse(session.extract_page(run.page)).runs;
+      // pdf.js needs fresh full bytes; the model refresh happens in the
+      // render effect once pdfBytes changes.
       const bytes = session.save();
-      setRuns((prev) => prev.filter((r) => r.page !== run.page).concat(pageRuns));
       setPdfBytes(bytes);
       await loadPdfjsDoc(bytes);
       setEdited(true);
-      setPage(run.page);
     } catch (e) {
       setOptimistic(null);
       showToast(friendlyError(e instanceof Error ? e.message : String(e)), true);
     } finally {
       setBusy("");
     }
-  }, [popover, rects, showToast, loadPdfjsDoc]);
+  }, [popover, page, showToast, loadPdfjsDoc]);
 
   const download = useCallback(() => {
     if (!pdfBytes) return;
@@ -353,7 +350,6 @@ export default function Home() {
                 sessionRef.current?.free?.();
                 sessionRef.current = null;
                 setPdfBytes(null);
-                setRuns([]);
                 setRects([]);
                 setPopover(null);
                 setOptimistic(null);
@@ -388,9 +384,9 @@ export default function Home() {
               {rects.map((r, i) => (
                 <div
                   key={i}
-                  className={`run${r.run.cid ? " disabled" : ""}`}
-                  style={{ left: r.l, top: r.t, width: r.w, height: r.h }}
-                  title={r.run.cid ? "中文编辑开发中" : "点击编辑这段文字"}
+                  className="run"
+                  style={{ left: r.left, top: r.top, width: r.w, height: r.h }}
+                  title="点击编辑这段文字"
                   onClick={(e) => {
                     e.stopPropagation();
                     clickRun(r);
@@ -445,7 +441,7 @@ export default function Home() {
         pdfree 是 MIT 开源项目 · 引擎与网站均免费 ·{" "}
         <a href="https://github.com/yyarrow/pdfree">GitHub</a>
         <br />
-        暂不支持：扫描件（图片型 PDF）、加密文件；中文目前支持单字符替换 — 都在路上
+        暂不支持：扫描件（图片型 PDF）、加密文件、增删字数（等长替换以外）— 都在路上
       </footer>
     </div>
   );
