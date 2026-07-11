@@ -246,8 +246,11 @@ pub fn load_fonts<'a>(doc: &'a Document, page_id: lopdf::ObjectId) -> BTreeMap<V
 }
 
 /// (gs resource name, font dict, size) for every ExtGState with a /Font.
+/// Resource dicts are nearest-first; the FIRST occurrence of a name wins,
+/// so a page-level /GS1 shadows an ancestor's /GS1.
 fn gs_font_entries(doc: &Document, page_id: lopdf::ObjectId) -> Vec<(Vec<u8>, &Dictionary, f32)> {
     let mut out = Vec::new();
+    let mut seen: std::collections::HashSet<Vec<u8>> = std::collections::HashSet::new();
     let Ok((inline_res, res_ids)) = doc.get_page_resources(page_id) else {
         return out;
     };
@@ -270,6 +273,9 @@ fn gs_font_entries(doc: &Document, page_id: lopdf::ObjectId) -> Vec<(Vec<u8>, &D
             continue;
         };
         for (gs_name, gs_obj) in egs.iter() {
+            if seen.contains(gs_name) {
+                continue;
+            }
             let entry = (|| {
                 let gs = doc.dereference(gs_obj).ok()?.1.as_dict().ok()?;
                 let arr = doc.dereference(gs.get(b"Font").ok()?).ok()?.1.as_array().ok()?;
@@ -278,6 +284,7 @@ fn gs_font_entries(doc: &Document, page_id: lopdf::ObjectId) -> Vec<(Vec<u8>, &D
                 Some((gs_name.clone(), font_dict, size))
             })();
             if let Some(e) = entry {
+                seen.insert(e.0.clone());
                 out.push(e);
             }
         }

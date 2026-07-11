@@ -245,7 +245,10 @@ fn try_borrow(
     let fonts = load_fonts(doc, page_id);
     let mut candidates: Vec<(i32, String, Vec<u8>, f32)> = Vec::new();
     for (name, font) in &fonts {
-        if *name == seg.font.as_bytes() || font.cid {
+        // "gs:" entries are ExtGState-carried fonts — they have no /Font
+        // resource name a Tf operand could reference, so they can't be
+        // borrowed into a font switch.
+        if *name == seg.font.as_bytes() || font.cid || name.starts_with(b"gs:") {
             continue;
         }
         let Some(bytes) = font.encode(doc, with) else { continue };
@@ -385,10 +388,16 @@ fn finish_swap(
         arr.push(Object::Real(delta));
     }
     ops.push(Operation::new("TJ", vec![Object::Array(arr)]));
-    ops.push(Operation::new(
-        "Tf",
-        vec![Object::Name(seg.font.clone().into_bytes()), Object::Real(seg.font_size)],
-    ));
+    // Restore the original text state. Fonts that came from an ExtGState
+    // have no /Font resource name for Tf — re-apply the gs instead.
+    if let Some(gs_name) = seg.font.strip_prefix("gs:") {
+        ops.push(Operation::new("gs", vec![Object::Name(gs_name.as_bytes().to_vec())]));
+    } else {
+        ops.push(Operation::new(
+            "Tf",
+            vec![Object::Name(seg.font.clone().into_bytes()), Object::Real(seg.font_size)],
+        ));
+    }
     if !after.is_empty() {
         ops.push(Operation::new("TJ", vec![Object::Array(after)]));
     }
@@ -397,9 +406,22 @@ fn finish_swap(
     let encoded = content.encode()?;
     set_page_content(doc, page_id, encoded)?;
 
+    // Visual width ratio must account for the calibrated size: advances are
+    // in em-1000 units RELATIVE to their respective font sizes.
     let mut bbox = seg.bbox;
-    if old_adv > 0.0 && new_adv > old_adv {
-        bbox[2] = bbox[0] + (bbox[2] - bbox[0]) * (new_adv / old_adv);
+    let visual_ratio = if old_adv > 0.0 && seg.font_size > 0.0 {
+        (new_adv * swap_size) / (old_adv * seg.font_size)
+    } else {
+        1.0
+    };
+    if visual_ratio > 1.0 {
+        bbox[2] = bbox[0] + (bbox[2] - bbox[0]) * visual_ratio;
+    }
+    // A larger calibrated size can also render taller than the original box.
+    if swap_size > seg.font_size && seg.font_size > 0.0 {
+        let grow = (bbox[3] - bbox[1]) * (swap_size / seg.font_size - 1.0) * 0.5;
+        bbox[1] -= grow;
+        bbox[3] += grow;
     }
     Ok(ReplaceReport {
         page: page_no,

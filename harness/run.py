@@ -139,15 +139,18 @@ def judge(case, in_pdf, out_pdf, page_no, report, find, repl, work):
 
     # If the edit region was blank in the ORIGINAL render (hidden OCG layer,
     # unrenderable font, occluded text), no visual judgement is possible.
+    # Visibility floor 150 pairs with the diff threshold 96 below: any text
+    # dark enough to count as visible (<=150 on white) produces a diff of at
+    # least 255-150=105 > 96, so visible edits can never be masked as noise.
     w, h = before.size
     region = before.crop((max(px0, 0), max(py0, 0), min(px1, w), min(py1, h)))
-    if region.point(lambda v: 255 if v < 200 else 0).getbbox() is None:
+    if region.point(lambda v: 255 if v < 150 else 0).getbbox() is None:
         return "skip_invisible_text", None
 
     # Threshold the diff: sub-hundredth-point compensation residue leaves
-    # faint antialiasing noise (<80) along the line; real misplacements are
-    # near-solid. Only count confident pixels.
-    diff = ImageChops.difference(before, after).point(lambda v: 255 if v >= 128 else 0)
+    # faint antialiasing noise (measured max ~80); real misplacements of
+    # visible text differ by >=105. Only count confident pixels.
+    diff = ImageChops.difference(before, after).point(lambda v: 255 if v >= 96 else 0)
     diff_bbox = diff.getbbox()  # None if identical
     if diff_bbox is None:
         # Edit landed in the text layer but is painted over (image drawn
