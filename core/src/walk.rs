@@ -221,10 +221,76 @@ impl<'a> FontInfo<'a> {
 
 pub fn load_fonts<'a>(doc: &'a Document, page_id: lopdf::ObjectId) -> BTreeMap<Vec<u8>, FontInfo<'a>> {
     let mut out = BTreeMap::new();
-    let Ok(fonts) = doc.get_page_fonts(page_id) else {
+    if let Ok(fonts) = doc.get_page_fonts(page_id) {
+        for (name, dict) in fonts {
+            out.insert(name, build_font_info(doc, dict));
+        }
+    }
+    // ExtGState dicts can also set the font (ISO 32000 8.4.5, /Font entry);
+    // register those under a synthetic "gs:<name>" key so the interpreter
+    // and the rescue paths can resolve them like ordinary resources.
+    for (gs_name, font_dict, _) in gs_font_entries(doc, page_id) {
+        let mut key = b"gs:".to_vec();
+        key.extend_from_slice(&gs_name);
+        out.insert(key, build_font_info(doc, font_dict));
+    }
+    out
+}
+
+/// (gs resource name, font dict, size) for every ExtGState with a /Font.
+fn gs_font_entries(doc: &Document, page_id: lopdf::ObjectId) -> Vec<(Vec<u8>, &Dictionary, f32)> {
+    let mut out = Vec::new();
+    let Ok((inline_res, res_ids)) = doc.get_page_resources(page_id) else {
         return out;
     };
-    for (name, dict) in fonts {
+    let mut res_dicts: Vec<&Dictionary> = Vec::new();
+    if let Some(d) = inline_res {
+        res_dicts.push(d);
+    }
+    for id in res_ids {
+        if let Ok(d) = doc.get_object(id).and_then(|o| o.as_dict()) {
+            res_dicts.push(d);
+        }
+    }
+    for res in res_dicts {
+        let Some(egs) = res
+            .get(b"ExtGState")
+            .ok()
+            .and_then(|o| doc.dereference(o).ok())
+            .and_then(|(_, o)| o.as_dict().ok())
+        else {
+            continue;
+        };
+        for (gs_name, gs_obj) in egs.iter() {
+            let entry = (|| {
+                let gs = doc.dereference(gs_obj).ok()?.1.as_dict().ok()?;
+                let arr = doc.dereference(gs.get(b"Font").ok()?).ok()?.1.as_array().ok()?;
+                let font_dict = doc.dereference(arr.first()?).ok()?.1.as_dict().ok()?;
+                let size = arr.get(1).and_then(|o| o.as_float().ok()).unwrap_or(0.0);
+                Some((gs_name.clone(), font_dict, size))
+            })();
+            if let Some(e) = entry {
+                out.push(e);
+            }
+        }
+    }
+    out
+}
+
+/// Per-page map: gs resource name -> (synthetic font key, size).
+pub fn load_gs_font_map(doc: &Document, page_id: lopdf::ObjectId) -> BTreeMap<Vec<u8>, (Vec<u8>, f32)> {
+    gs_font_entries(doc, page_id)
+        .into_iter()
+        .map(|(name, _, size)| {
+            let mut key = b"gs:".to_vec();
+            key.extend_from_slice(&name);
+            (name, (key, size))
+        })
+        .collect()
+}
+
+fn build_font_info<'a>(doc: &'a Document, dict: &'a Dictionary) -> FontInfo<'a> {
+    {
         let subtype = dict
             .get(b"Subtype")
             .and_then(|o| o.as_name())
@@ -290,23 +356,19 @@ pub fn load_fonts<'a>(doc: &'a Document, page_id: lopdf::ObjectId) -> BTreeMap<V
                 crate::tounicode::ToUnicodeMap::parse(&stream.decompressed_content().ok()?)
             })()
         };
-        out.insert(
-            name,
-            FontInfo {
-                dict,
-                cid,
-                type3,
-                widths,
-                std_widths,
-                width_scale,
-                charprocs,
-                differences,
-                tounicode,
-                default_width: 500.0,
-            },
-        );
+        FontInfo {
+            dict,
+            cid,
+            type3,
+            widths,
+            std_widths,
+            width_scale,
+            charprocs,
+            differences,
+            tounicode,
+            default_width: 500.0,
+        }
     }
-    out
 }
 
 fn op_f32(op: &Object) -> f32 {
@@ -319,6 +381,7 @@ pub fn walk_page(doc: &Document, page_id: lopdf::ObjectId, page_no: u32) -> lopd
     let data = doc.get_page_content(page_id)?;
     let content = Content::decode(&data)?;
     let fonts = load_fonts(doc, page_id);
+    let gs_fonts = load_gs_font_map(doc, page_id);
 
     let mut segs = Vec::new();
 
@@ -360,6 +423,15 @@ pub fn walk_page(doc: &Document, page_id: lopdf::ObjectId, page_no: u32) -> lopd
             "Tw" if ops.len() == 1 => gs.word_spacing = op_f32(&ops[0]),
             "Tz" if ops.len() == 1 => gs.h_scale = op_f32(&ops[0]) / 100.0,
             "Tr" if ops.len() == 1 => gs.render_mode = ops[0].as_i64().unwrap_or(0),
+            // ExtGState can carry a /Font entry that sets font + size.
+            "gs" if ops.len() == 1 => {
+                if let Some((key, size)) = ops[0].as_name().ok().and_then(|n| gs_fonts.get(n)) {
+                    gs.font_key = key.clone();
+                    if *size > 0.0 {
+                        gs.font_size = *size;
+                    }
+                }
+            }
             // Fill color (approximated to RGB; stroke color doesn't matter
             // for the text model).
             "rg" if ops.len() == 3 => gs.fill_color = [op_f32(&ops[0]), op_f32(&ops[1]), op_f32(&ops[2])],
