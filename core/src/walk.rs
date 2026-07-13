@@ -240,7 +240,10 @@ pub fn load_fonts<'a>(doc: &'a Document, page_id: lopdf::ObjectId) -> BTreeMap<V
     for (gs_name, font_dict, _, _) in gs_font_entries(doc, page_id) {
         let mut key = b"gs:".to_vec();
         key.extend_from_slice(&gs_name);
-        out.insert(key, build_font_info(doc, font_dict));
+        // PDF names may legally contain ':' — if a real /Font resource is
+        // literally named "gs:GS1", it wins (Tf references it directly);
+        // the pathological collision loses gs-tracking, not correctness.
+        out.entry(key).or_insert_with(|| build_font_info(doc, font_dict));
     }
     out
 }
@@ -264,7 +267,7 @@ pub fn gs_font_ids(doc: &Document, page_id: lopdf::ObjectId) -> BTreeMap<String,
 fn gs_font_entries(
     doc: &Document,
     page_id: lopdf::ObjectId,
-) -> Vec<(Vec<u8>, &Dictionary, Option<lopdf::ObjectId>, f32)> {
+) -> Vec<(Vec<u8>, &Dictionary, Option<lopdf::ObjectId>, Option<f32>)> {
     let mut out = Vec::new();
     let mut seen: std::collections::HashSet<Vec<u8>> = std::collections::HashSet::new();
     let Ok((inline_res, res_ids)) = doc.get_page_resources(page_id) else {
@@ -297,7 +300,8 @@ fn gs_font_entries(
                 let arr = doc.dereference(gs.get(b"Font").ok()?).ok()?.1.as_array().ok()?;
                 let font_id = arr.first()?.as_reference().ok();
                 let font_dict = doc.dereference(arr.first()?).ok()?.1.as_dict().ok()?;
-                let size = arr.get(1).and_then(|o| o.as_float().ok()).unwrap_or(0.0);
+                // Size 0 is a legal value (distinct from a malformed entry).
+                let size = arr.get(1).and_then(|o| o.as_float().ok());
                 Some((gs_name.clone(), font_dict, font_id, size))
             })();
             if let Some(e) = entry {
@@ -309,7 +313,7 @@ fn gs_font_entries(
 }
 
 /// Per-page map: gs resource name -> (synthetic font key, size).
-pub fn load_gs_font_map(doc: &Document, page_id: lopdf::ObjectId) -> BTreeMap<Vec<u8>, (Vec<u8>, f32)> {
+pub fn load_gs_font_map(doc: &Document, page_id: lopdf::ObjectId) -> BTreeMap<Vec<u8>, (Vec<u8>, Option<f32>)> {
     gs_font_entries(doc, page_id)
         .into_iter()
         .map(|(name, _, _, size)| {
@@ -484,8 +488,8 @@ pub fn walk_page(doc: &Document, page_id: lopdf::ObjectId, page_no: u32) -> lopd
             "gs" if ops.len() == 1 => {
                 if let Some((key, size)) = ops[0].as_name().ok().and_then(|n| gs_fonts.get(n)) {
                     gs.font_key = key.clone();
-                    if *size > 0.0 {
-                        gs.font_size = *size;
+                    if let Some(sz) = size {
+                        gs.font_size = *sz; // 0 is a legal size, apply it too
                     }
                 }
             }

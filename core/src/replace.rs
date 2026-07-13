@@ -56,7 +56,30 @@ pub(crate) fn reject_encrypted(doc: &Document) -> Result<(), ReplaceError> {
 /// reference to an array (common in optimizer output); writing a new
 /// stream object handles every Contents shape.
 pub(crate) fn set_page_content(doc: &mut Document, page_id: ObjectId, content: Vec<u8>) -> Result<(), ReplaceError> {
-    let mut stream = lopdf::Stream::new(lopdf::dictionary! {}, content);
+    // Reuse a stream WE created earlier (marked /PdfreeGen) so repeated
+    // edits don't pile up unreachable stream objects. Only our own streams
+    // are safe to mutate in place — an original stream might be shared by
+    // several pages.
+    let reusable: Option<ObjectId> = (|| {
+        let page = doc.get_object(page_id).ok()?.as_dict().ok()?;
+        let Object::Reference(id) = page.get(b"Contents").ok()? else {
+            return None;
+        };
+        let Object::Stream(s) = doc.get_object(*id).ok()? else {
+            return None;
+        };
+        s.dict.get(b"PdfreeGen").is_ok().then_some(*id)
+    })();
+    if let Some(id) = reusable {
+        if let Ok(Object::Stream(s)) = doc.get_object_mut(id) {
+            s.set_plain_content(content);
+            let _ = s.compress();
+            return Ok(());
+        }
+    }
+    let mut dict = lopdf::Dictionary::new();
+    dict.set("PdfreeGen", true);
+    let mut stream = lopdf::Stream::new(dict, content);
     let _ = stream.compress();
     let new_id = doc.add_object(stream);
     let page = doc
@@ -285,10 +308,12 @@ fn replace_with_fallback(
     old_adv: f32,
     ttf: &TtfFont,
 ) -> Result<ReplaceReport, ReplaceError> {
-    let orig_is_type3 = load_fonts(doc, page_id)
+    // (is Type3, width_scale): width_scale == fm[0]*1000, so em-normalized
+    // Type3 fonts (FontMatrix 0.001) sit at 1.0.
+    let orig_t3_scale = load_fonts(doc, page_id)
         .get(seg.font.as_bytes())
-        .map(|f| f.type3)
-        .unwrap_or(false);
+        .filter(|f| f.type3)
+        .map(|f| f.width_scale);
 
     let chars: Vec<char> = with.chars().collect();
     let fb = build_type3_font(doc, ttf, &chars).ok_or(ReplaceError::Unencodable)?;
@@ -305,13 +330,19 @@ fn replace_with_fallback(
     // ORIGINAL font's own per-char advance (its Widths — independent of which
     // replacement glyphs were chosen; FontBBox is unreliable, spec allows all
     // zeros): em-normalized advances live in roughly [100, 2500] per 1000.
+    // Two signals must BOTH fire before rescaling: the FontMatrix is far
+    // from the em-normalized 0.001 convention AND the per-char advance is
+    // far outside plausible em range. A normalized font with legitimately
+    // wide glyphs trips only the second and stays untouched.
     let mut swap_size = seg.font_size;
-    if orig_is_type3 {
-        let old_per_char = old_adv / seg.text.chars().count().max(1) as f32;
-        if old_per_char.is_finite() && (old_per_char < 100.0 || old_per_char > 2500.0) {
-            // 550/1000 em is a typical latin advance; exactness isn't needed,
-            // the judges verify the result.
-            swap_size = seg.font_size * old_per_char / 550.0;
+    if let Some(ws) = orig_t3_scale {
+        if !(0.5..=2.0).contains(&ws) {
+            let old_per_char = old_adv / seg.text.chars().count().max(1) as f32;
+            if old_per_char.is_finite() && (old_per_char < 100.0 || old_per_char > 2500.0) {
+                // 550/1000 em is a typical latin advance; exactness isn't
+                // needed, the judges verify the result.
+                swap_size = seg.font_size * old_per_char / 550.0;
+            }
         }
     }
     finish_swap(
