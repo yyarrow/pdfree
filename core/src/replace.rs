@@ -42,7 +42,10 @@ pub enum ReplaceError {
 /// Refuse to edit encrypted documents: lopdf's writer drops /Encrypt on
 /// save, which would silently strip the owner's permission settings.
 pub(crate) fn reject_encrypted(doc: &Document) -> Result<(), ReplaceError> {
-    if doc.trailer.get(b"Encrypt").is_ok() {
+    // was_encrypted() catches PDFs lopdf auto-decrypted at load time (e.g.
+    // empty user password): /Encrypt is gone from their trailer, but saving
+    // would still silently strip the owner's encryption.
+    if doc.was_encrypted() || doc.trailer.get(b"Encrypt").is_ok() {
         return Err(ReplaceError::EncryptedUnsupported);
     }
     Ok(())
