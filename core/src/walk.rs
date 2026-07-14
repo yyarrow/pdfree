@@ -248,13 +248,17 @@ pub fn load_fonts<'a>(doc: &'a Document, page_id: lopdf::ObjectId) -> BTreeMap<V
     out
 }
 
-/// Map from the synthetic "gs:<name>" font key to the underlying font
-/// object id, for callers that need to reference the font via /Font.
-pub fn gs_font_ids(doc: &Document, page_id: lopdf::ObjectId) -> BTreeMap<String, lopdf::ObjectId> {
+/// Map from the synthetic "gs:<name>" font key to the underlying font:
+/// its object id when the /Font entry is an indirect reference, plus a
+/// clone of the dict so direct entries can be materialized as objects.
+pub fn gs_fonts_for_restore(
+    doc: &Document,
+    page_id: lopdf::ObjectId,
+) -> BTreeMap<String, (Option<lopdf::ObjectId>, Dictionary)> {
     gs_font_entries(doc, page_id)
         .into_iter()
-        .filter_map(|(name, _, id, _)| {
-            id.map(|id| (format!("gs:{}", String::from_utf8_lossy(&name)), id))
+        .map(|(name, dict, id, _)| {
+            (format!("gs:{}", String::from_utf8_lossy(&name)), (id, dict.clone()))
         })
         .collect()
 }
@@ -392,17 +396,26 @@ fn build_font_info<'a>(doc: &'a Document, dict: &'a Dictionary) -> FontInfo<'a> 
             })()
         };
         // Type3 vertical extent: FontBBox is required for Type3 and, mapped
-        // through the FontMatrix, gives real ascent/descent per unit size —
-        // Tf sizes for these fonts can be arbitrary (0.24pt with huge glyph
-        // coordinates), so em-fraction guesses are meaningless.
+        // through the FULL FontMatrix (rotation/shear included — y' depends
+        // on b*x + d*y + f, not just d), gives real ascent/descent per unit
+        // size. Tf sizes for these fonts can be arbitrary (0.24pt with huge
+        // glyph coordinates), so em-fraction guesses are meaningless.
         let t3_vertical = if type3 {
             (|| {
                 let fm = doc.dereference(dict.get(b"FontMatrix").ok()?).ok()?.1.as_array().ok()?;
-                let fy = fm.get(3).and_then(|o| o.as_float().ok()).unwrap_or(0.001).abs();
+                let m: Vec<f32> = fm.iter().map(|o| o.as_float().unwrap_or(0.0)).collect();
+                if m.len() != 6 {
+                    return None;
+                }
                 let bb = doc.dereference(dict.get(b"FontBBox").ok()?).ok()?.1.as_array().ok()?;
+                let x0 = bb.first()?.as_float().ok()?;
                 let y0 = bb.get(1)?.as_float().ok()?;
+                let x1 = bb.get(2)?.as_float().ok()?;
                 let y1 = bb.get(3)?.as_float().ok()?;
-                let (asc, desc) = ((y1.max(0.0) * fy), (-y0.min(0.0) * fy));
+                let ys = [(x0, y0), (x1, y0), (x0, y1), (x1, y1)].map(|(x, y)| m[1] * x + m[3] * y + m[5]);
+                let max_y = ys.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+                let min_y = ys.iter().copied().fold(f32::INFINITY, f32::min);
+                let (asc, desc) = (max_y.max(0.0), (-min_y).max(0.0));
                 if asc + desc > 0.0 { Some((asc, desc)) } else { None }
             })()
         } else {
@@ -637,8 +650,11 @@ fn show_string(
 
     // Vertical extent: Type3 fonts get real FontBBox-derived metrics (their
     // Tf sizes can be arbitrary); others use generous em-fraction estimates.
+    // Take the max of both for Type3 — glyphs overshooting their declared
+    // FontBBox is a common spec violation, so the declared box only ever
+    // WIDENS the estimate, never shrinks it.
     let (asc, desc) = match font.and_then(|f| f.t3_vertical) {
-        Some((a, d)) => (a * 1.1, (d * 1.1).max(a * 0.1)),
+        Some((a, d)) => ((a * 1.1).max(1.05), (d * 1.1).max(a * 0.1).max(0.35)),
         None => (1.05, 0.35),
     };
     let (x0, y0) = trm.apply(0.0, -desc * gs.font_size);

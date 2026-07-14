@@ -374,18 +374,16 @@ fn finish_swap(
     // replay unrelated state it carries (opacity, blend mode) — so the same
     // font object gets registered under a real /Font name instead.
     let restore_op = if seg.font.starts_with("gs:") {
-        match crate::walk::gs_font_ids(doc, page_id).get(&seg.font) {
-            Some(&fid) => {
+        match crate::walk::gs_fonts_for_restore(doc, page_id).remove(&seg.font) {
+            Some((id, dict)) => {
+                // Direct (non-reference) font dicts get materialized as an
+                // object; replaying the gs is never an option — it would
+                // also replay unrelated state the ExtGState carries.
+                let fid = id.unwrap_or_else(|| doc.add_object(Object::Dictionary(dict)));
                 let n = add_font_resource(doc, page_id, fid)?;
                 Operation::new("Tf", vec![Object::Name(n.into_bytes()), Object::Real(seg.font_size)])
             }
-            // Direct (non-reference) gs font dict: replaying the gs is the
-            // only handle we have; rare, and state drift is bounded by the
-            // next q/Q or gs.
-            None => Operation::new(
-                "gs",
-                vec![Object::Name(seg.font.trim_start_matches("gs:").as_bytes().to_vec())],
-            ),
+            None => return Err(ReplaceError::Unencodable),
         }
     } else {
         Operation::new(

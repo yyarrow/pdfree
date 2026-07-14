@@ -116,7 +116,7 @@ def judge(case, in_pdf, out_pdf, page_no, report, find, repl, work):
 
     # 2/3. render diff
     try:
-        before, size_b, _ = render_page(in_pdf, page_index, work / f"{case}_before.png")
+        before, size_b, text_before = render_page(in_pdf, page_index, work / f"{case}_before.png")
     except RenderCrash:
         return "skip_invalid_input", None
     try:
@@ -154,8 +154,12 @@ def judge(case, in_pdf, out_pdf, page_no, report, find, repl, work):
     diff_bbox = diff.getbbox()  # None if identical
     if diff_bbox is None:
         # Edit landed in the text layer but is painted over (image drawn
-        # after an OCR layer): correct edit, visually unjudgeable.
-        if repl in "".join(text.split()):
+        # after an OCR layer): correct edit, visually unjudgeable. Compare
+        # occurrence COUNTS before/after — mere presence would false-pass
+        # when the replacement string already existed elsewhere on the page.
+        joined_before = "".join(text_before.split())
+        joined_after = "".join(text.split())
+        if joined_after.count(repl) > joined_before.count(repl):
             return "skip_occluded_text", None
         return "fail_no_visual_change", None
     dx0, dy0, dx1, dy1 = diff_bbox

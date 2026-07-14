@@ -24,8 +24,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 ROOT = Path(__file__).parent
-# Use engine from main tree, not worktree
-ENGINE = Path("/Users/ian/Work/pdfree/core/target/debug/pdfree")
+ENGINE = ROOT.parent / "core" / "target" / "debug" / "pdfree"
 SLACK_NESTING = 1.0  # points
 TOLERANCE_BASELINE = 0.01
 TOLERANCE_RUN_ORDER = 0.01
@@ -236,7 +235,7 @@ def main():
     ap.add_argument(
         "corpus",
         nargs="*",
-        default=["/Users/ian/Work/pdfree/harness/corpus/synthetic"],
+        default=[str(ROOT / "corpus" / "synthetic")],
         help="corpus directories (default: synthetic)",
     )
     args = ap.parse_args()
