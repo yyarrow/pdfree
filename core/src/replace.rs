@@ -56,10 +56,11 @@ pub(crate) fn reject_encrypted(doc: &Document) -> Result<(), ReplaceError> {
 /// reference to an array (common in optimizer output); writing a new
 /// stream object handles every Contents shape.
 pub(crate) fn set_page_content(doc: &mut Document, page_id: ObjectId, content: Vec<u8>) -> Result<(), ReplaceError> {
-    // Reuse a stream WE created earlier (marked /PdfreeGen) so repeated
-    // edits don't pile up unreachable stream objects. Only our own streams
-    // are safe to mutate in place — an original stream might be shared by
-    // several pages.
+    // Reuse a stream WE created earlier so repeated edits don't pile up
+    // unreachable stream objects. The /PdfreeGen marker records WHICH page
+    // the stream was created for and is compared before reuse — even our
+    // own stream must not be mutated if it ended up referenced elsewhere
+    // (e.g. a duplicated page dict).
     let reusable: Option<ObjectId> = (|| {
         let page = doc.get_object(page_id).ok()?.as_dict().ok()?;
         let Object::Reference(id) = page.get(b"Contents").ok()? else {
@@ -68,7 +69,10 @@ pub(crate) fn set_page_content(doc: &mut Document, page_id: ObjectId, content: V
         let Object::Stream(s) = doc.get_object(*id).ok()? else {
             return None;
         };
-        s.dict.get(b"PdfreeGen").is_ok().then_some(*id)
+        let marker = s.dict.get(b"PdfreeGen").ok()?.as_array().ok()?;
+        let num = marker.first()?.as_i64().ok()?;
+        let generation = marker.get(1)?.as_i64().ok()?;
+        (num == page_id.0 as i64 && generation == page_id.1 as i64).then_some(*id)
     })();
     if let Some(id) = reusable {
         if let Ok(Object::Stream(s)) = doc.get_object_mut(id) {
@@ -78,7 +82,13 @@ pub(crate) fn set_page_content(doc: &mut Document, page_id: ObjectId, content: V
         }
     }
     let mut dict = lopdf::Dictionary::new();
-    dict.set("PdfreeGen", true);
+    dict.set(
+        "PdfreeGen",
+        Object::Array(vec![
+            Object::Integer(page_id.0 as i64),
+            Object::Integer(page_id.1 as i64),
+        ]),
+    );
     let mut stream = lopdf::Stream::new(dict, content);
     let _ = stream.compress();
     let new_id = doc.add_object(stream);
