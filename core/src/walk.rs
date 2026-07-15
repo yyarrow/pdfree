@@ -357,11 +357,11 @@ fn build_font_info<'a>(doc: &'a Document, dict: &'a Dictionary) -> FontInfo<'a> 
         let (width_scale, charprocs, differences) = if type3 {
             let scale = (|| {
                 let fm = doc.dereference(dict.get(b"FontMatrix").ok()?).ok()?.1.as_array().ok()?;
-                // x-advance magnitude under the matrix: |(a, b)|, so rotated
-                // or sheared FontMatrices scale widths correctly too.
-                let a = fm.first()?.as_float().ok()?;
-                let b = fm.get(1).and_then(|o| o.as_float().ok()).unwrap_or(0.0);
-                Some(a.hypot(b) * 1000.0)
+                // Per the PDF reference, a Type3 width contributes only the
+                // HORIZONTAL component of its FontMatrix transform (signed
+                // `a`) — hypot would overstate shear by sqrt(2) and give a
+                // nonzero advance for 90-degree rotations.
+                Some(fm.first()?.as_float().ok()? * 1000.0)
             })()
             .unwrap_or(1.0);
             let procs = (|| {

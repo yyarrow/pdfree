@@ -307,6 +307,7 @@ fn rebuild(data: &[u8]) -> Option<Vec<u8>> {
         Some((root, info)) => (root, info),
         None => (find_catalog_object(data, &objects)?, None),
     };
+    let encrypted = original_had_encrypt(data);
 
     let max_num = objects
         .keys()
@@ -319,7 +320,22 @@ fn rebuild(data: &[u8]) -> Option<Vec<u8>> {
         return None;
     }
 
-    Some(build_repaired(data, &objects, max_num, root, info))
+    Some(build_repaired(data, &objects, max_num, root, info, encrypted))
+}
+
+/// Whether the damaged original declared encryption. The rebuilt trailer
+/// intentionally drops /Encrypt (we can't decrypt), so without a marker the
+/// salvaged document would silently bypass the editing guard and be saved
+/// with the owner's permissions stripped. Boundary-checked token scan; a
+/// false positive only refuses an edit, which is the safe direction.
+fn original_had_encrypt(data: &[u8]) -> bool {
+    for pos in find_all(data, b"/Encrypt") {
+        let after = pos + b"/Encrypt".len();
+        if after >= data.len() || is_boundary(data[after]) {
+            return true;
+        }
+    }
+    false
 }
 
 /// Append a fresh `xref` + `trailer` + `startxref` to `data` covering object
@@ -328,6 +344,7 @@ fn rebuild(data: &[u8]) -> Option<Vec<u8>> {
 /// contiguous subsection starting at 0.
 fn build_repaired(
     data: &[u8], objects: &BTreeMap<u32, (u32, usize)>, max_num: u32, root: (u32, u32), info: Option<(u32, u32)>,
+    encrypted: bool,
 ) -> Vec<u8> {
     let mut out = Vec::with_capacity(data.len() + (max_num as usize + 1) * 20 + 128);
     out.extend_from_slice(data);
@@ -350,6 +367,9 @@ fn build_repaired(
     out.extend_from_slice(format!("trailer\n<< /Size {} /Root {} {} R", max_num + 1, root.0, root.1).as_bytes());
     if let Some((inum, igen)) = info {
         out.extend_from_slice(format!(" /Info {inum} {igen} R").as_bytes());
+    }
+    if encrypted {
+        out.extend_from_slice(b" /PdfreeSalvagedEncrypted true");
     }
     out.extend_from_slice(b" >>\n");
     out.extend_from_slice(format!("startxref\n{xref_offset}\n%%EOF").as_bytes());

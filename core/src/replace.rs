@@ -44,11 +44,30 @@ pub enum ReplaceError {
 pub(crate) fn reject_encrypted(doc: &Document) -> Result<(), ReplaceError> {
     // was_encrypted() catches PDFs lopdf auto-decrypted at load time (e.g.
     // empty user password): /Encrypt is gone from their trailer, but saving
-    // would still silently strip the owner's encryption.
-    if doc.was_encrypted() || doc.trailer.get(b"Encrypt").is_ok() {
+    // would still silently strip the owner's encryption. The salvage marker
+    // covers rebuilt documents, whose trailer never carries /Encrypt.
+    if doc.was_encrypted()
+        || doc.trailer.get(b"Encrypt").is_ok()
+        || doc.trailer.get(b"PdfreeSalvagedEncrypted").is_ok()
+    {
         return Err(ReplaceError::EncryptedUnsupported);
     }
     Ok(())
+}
+
+/// How many places in the document reference `target`.
+fn reference_count(doc: &Document, target: ObjectId) -> usize {
+    fn count_in(obj: &Object, target: ObjectId) -> usize {
+        match obj {
+            Object::Reference(id) => usize::from(*id == target),
+            Object::Array(items) => items.iter().map(|o| count_in(o, target)).sum(),
+            Object::Dictionary(d) => d.iter().map(|(_, o)| count_in(o, target)).sum(),
+            Object::Stream(s) => s.dict.iter().map(|(_, o)| count_in(o, target)).sum(),
+            _ => 0,
+        }
+    }
+    doc.objects.values().map(|o| count_in(o, target)).sum::<usize>()
+        + doc.trailer.iter().map(|(_, o)| count_in(o, target)).sum::<usize>()
 }
 
 /// Point the page's /Contents at a fresh single stream. lopdf's
@@ -56,11 +75,11 @@ pub(crate) fn reject_encrypted(doc: &Document) -> Result<(), ReplaceError> {
 /// reference to an array (common in optimizer output); writing a new
 /// stream object handles every Contents shape.
 pub(crate) fn set_page_content(doc: &mut Document, page_id: ObjectId, content: Vec<u8>) -> Result<(), ReplaceError> {
-    // Reuse a stream WE created earlier so repeated edits don't pile up
-    // unreachable stream objects. The /PdfreeGen marker records WHICH page
-    // the stream was created for and is compared before reuse — even our
-    // own stream must not be mutated if it ended up referenced elsewhere
-    // (e.g. a duplicated page dict).
+    // Copy-on-write reuse: a stream WE created (marked /PdfreeGen for this
+    // page) is mutated in place ONLY while this page is its sole referrer.
+    // The moment anything else shares it (page duplicated by another tool),
+    // the write allocates a fresh stream and the shared one stays intact —
+    // same policy as forked memory pages.
     let reusable: Option<ObjectId> = (|| {
         let page = doc.get_object(page_id).ok()?.as_dict().ok()?;
         let Object::Reference(id) = page.get(b"Contents").ok()? else {
@@ -72,7 +91,8 @@ pub(crate) fn set_page_content(doc: &mut Document, page_id: ObjectId, content: V
         let marker = s.dict.get(b"PdfreeGen").ok()?.as_array().ok()?;
         let num = marker.first()?.as_i64().ok()?;
         let generation = marker.get(1)?.as_i64().ok()?;
-        (num == page_id.0 as i64 && generation == page_id.1 as i64).then_some(*id)
+        (num == page_id.0 as i64 && generation == page_id.1 as i64 && reference_count(doc, *id) == 1)
+            .then_some(*id)
     })();
     if let Some(id) = reusable {
         if let Ok(Object::Stream(s)) = doc.get_object_mut(id) {
@@ -348,7 +368,9 @@ fn replace_with_fallback(
     if let Some(ws) = orig_t3_scale {
         if !(0.5..=2.0).contains(&ws) {
             let old_per_char = old_adv / seg.text.chars().count().max(1) as f32;
-            if old_per_char.is_finite() && (old_per_char < 100.0 || old_per_char > 2500.0) {
+            // width_scale is signed now; mirrored matrices (negative advance)
+            // stay out of size calibration entirely.
+            if old_per_char.is_finite() && old_per_char > 0.0 && (old_per_char < 100.0 || old_per_char > 2500.0) {
                 // 550/1000 em is a typical latin advance; exactness isn't
                 // needed, the judges verify the result.
                 swap_size = seg.font_size * old_per_char / 550.0;

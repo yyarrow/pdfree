@@ -15,6 +15,8 @@
 - 引擎代码**禁止参考 AGPL/GPL 实现**（MuPDF、Ghostscript、iText 等），只准对着 ISO 32000 规范和测试结果写。允许的依赖：lopdf（MIT）、pdfium（BSD，只用于 harness 渲染裁判）
 - `core/src/std14.rs` 是 make_corpus 同款 venv 里 reportlab AFM 数据生成的，别手改；重新生成的脚本在 git history 里
 - 通过率是唯一 KPI：改引擎前先跑基线，改完对比，任何类别变差都要查
+- **加密 PDF 一律拒绝编辑**（`reject_encrypted`：trailer /Encrypt、lopdf 自动解密的 `was_encrypted()`、打捞通道的 `/PdfreeSalvagedEncrypted` 哨兵三路都要认）。原因：现在的保存会剥掉加密和权限限制。任何新的加载/编辑入口都必须过这道门；直到实现「原样保留加密」才允许放开
+- **内部记号进公共命名空间要认命名碰撞**：`gs:` 前缀合成字体键与 PDF 合法资源名（允许含冒号）理论上可碰撞，属已评估接受的风险（PR#1 waived）——处理原则是首见者胜、真实资源优先，绝不覆盖文档自己的定义。新增内部记号（如 /PdfreeGen、/PdfreeSalvagedEncrypted）时必须按同一原则评估
 
 ## Web 端（web/ + wasm/）
 
