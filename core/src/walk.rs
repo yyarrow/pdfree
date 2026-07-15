@@ -106,6 +106,9 @@ pub struct FontInfo<'a> {
     /// (ISO 32000 9.10.3); /Encoding glyph names can be meaningless (Skia).
     pub tounicode: Option<crate::tounicode::ToUnicodeMap>,
     pub default_width: f32,
+    /// Type3 only: vertical extent from /FontBBox mapped through FontMatrix,
+    /// per unit of font size (ascent above baseline, descent below).
+    pub t3_vertical: Option<(f32, f32)>,
 }
 
 /// Map a BaseFont name (possibly subset-prefixed or an Arial/TimesNewRoman
@@ -116,7 +119,12 @@ fn std14_lookup(base_font: &[u8]) -> Option<&'static [f32; 256]> {
     let lower = s.to_ascii_lowercase();
     let bold = lower.contains("bold");
     let italic = lower.contains("italic") || lower.contains("oblique");
-    let name = if lower.contains("courier") || lower.contains("mono") {
+    let name = if lower.contains("courier")
+        || lower.contains("mono")
+        || lower.contains("monaco")
+        || lower.contains("menlo")
+        || lower.contains("consolas")
+    {
         match (bold, italic) {
             (false, false) => "Courier",
             (true, false) => "Courier-Bold",
@@ -221,10 +229,107 @@ impl<'a> FontInfo<'a> {
 
 pub fn load_fonts<'a>(doc: &'a Document, page_id: lopdf::ObjectId) -> BTreeMap<Vec<u8>, FontInfo<'a>> {
     let mut out = BTreeMap::new();
-    let Ok(fonts) = doc.get_page_fonts(page_id) else {
+    if let Ok(fonts) = doc.get_page_fonts(page_id) {
+        for (name, dict) in fonts {
+            out.insert(name, build_font_info(doc, dict));
+        }
+    }
+    // ExtGState dicts can also set the font (ISO 32000 8.4.5, /Font entry);
+    // register those under a synthetic "gs:<name>" key so the interpreter
+    // and the rescue paths can resolve them like ordinary resources.
+    for (gs_name, font_dict, _, _) in gs_font_entries(doc, page_id) {
+        let mut key = b"gs:".to_vec();
+        key.extend_from_slice(&gs_name);
+        // PDF names may legally contain ':' — if a real /Font resource is
+        // literally named "gs:GS1", it wins (Tf references it directly);
+        // the pathological collision loses gs-tracking, not correctness.
+        out.entry(key).or_insert_with(|| build_font_info(doc, font_dict));
+    }
+    out
+}
+
+/// Map from the synthetic "gs:<name>" font key to the underlying font:
+/// its object id when the /Font entry is an indirect reference, plus a
+/// clone of the dict so direct entries can be materialized as objects.
+pub fn gs_fonts_for_restore(
+    doc: &Document,
+    page_id: lopdf::ObjectId,
+) -> BTreeMap<String, (Option<lopdf::ObjectId>, Dictionary)> {
+    gs_font_entries(doc, page_id)
+        .into_iter()
+        .map(|(name, dict, id, _)| {
+            (format!("gs:{}", String::from_utf8_lossy(&name)), (id, dict.clone()))
+        })
+        .collect()
+}
+
+/// (gs resource name, font dict, font object id, size) for every ExtGState
+/// with a /Font. Resource dicts are nearest-first and the FIRST occurrence
+/// of a name wins — including font-less ones, so a page-level /GS1 without
+/// /Font correctly shadows an ancestor's font-bearing /GS1.
+#[allow(clippy::type_complexity)]
+fn gs_font_entries(
+    doc: &Document,
+    page_id: lopdf::ObjectId,
+) -> Vec<(Vec<u8>, &Dictionary, Option<lopdf::ObjectId>, Option<f32>)> {
+    let mut out = Vec::new();
+    let mut seen: std::collections::HashSet<Vec<u8>> = std::collections::HashSet::new();
+    let Ok((inline_res, res_ids)) = doc.get_page_resources(page_id) else {
         return out;
     };
-    for (name, dict) in fonts {
+    let mut res_dicts: Vec<&Dictionary> = Vec::new();
+    if let Some(d) = inline_res {
+        res_dicts.push(d);
+    }
+    for id in res_ids {
+        if let Ok(d) = doc.get_object(id).and_then(|o| o.as_dict()) {
+            res_dicts.push(d);
+        }
+    }
+    for res in res_dicts {
+        let Some(egs) = res
+            .get(b"ExtGState")
+            .ok()
+            .and_then(|o| doc.dereference(o).ok())
+            .and_then(|(_, o)| o.as_dict().ok())
+        else {
+            continue;
+        };
+        for (gs_name, gs_obj) in egs.iter() {
+            if !seen.insert(gs_name.clone()) {
+                continue; // a nearer dict already defined this name
+            }
+            let entry = (|| {
+                let gs = doc.dereference(gs_obj).ok()?.1.as_dict().ok()?;
+                let arr = doc.dereference(gs.get(b"Font").ok()?).ok()?.1.as_array().ok()?;
+                let font_id = arr.first()?.as_reference().ok();
+                let font_dict = doc.dereference(arr.first()?).ok()?.1.as_dict().ok()?;
+                // Size 0 is a legal value (distinct from a malformed entry).
+                let size = arr.get(1).and_then(|o| o.as_float().ok());
+                Some((gs_name.clone(), font_dict, font_id, size))
+            })();
+            if let Some(e) = entry {
+                out.push(e);
+            }
+        }
+    }
+    out
+}
+
+/// Per-page map: gs resource name -> (synthetic font key, size).
+pub fn load_gs_font_map(doc: &Document, page_id: lopdf::ObjectId) -> BTreeMap<Vec<u8>, (Vec<u8>, Option<f32>)> {
+    gs_font_entries(doc, page_id)
+        .into_iter()
+        .map(|(name, _, _, size)| {
+            let mut key = b"gs:".to_vec();
+            key.extend_from_slice(&name);
+            (name, (key, size))
+        })
+        .collect()
+}
+
+fn build_font_info<'a>(doc: &'a Document, dict: &'a Dictionary) -> FontInfo<'a> {
+    {
         let subtype = dict
             .get(b"Subtype")
             .and_then(|o| o.as_name())
@@ -252,7 +357,11 @@ pub fn load_fonts<'a>(doc: &'a Document, page_id: lopdf::ObjectId) -> BTreeMap<V
         let (width_scale, charprocs, differences) = if type3 {
             let scale = (|| {
                 let fm = doc.dereference(dict.get(b"FontMatrix").ok()?).ok()?.1.as_array().ok()?;
-                Some(fm.first()?.as_float().ok()?.abs() * 1000.0)
+                // Per the PDF reference, a Type3 width contributes only the
+                // HORIZONTAL component of its FontMatrix transform (signed
+                // `a`) — hypot would overstate shear by sqrt(2) and give a
+                // nonzero advance for 90-degree rotations.
+                Some(fm.first()?.as_float().ok()? * 1000.0)
             })()
             .unwrap_or(1.0);
             let procs = (|| {
@@ -290,23 +399,54 @@ pub fn load_fonts<'a>(doc: &'a Document, page_id: lopdf::ObjectId) -> BTreeMap<V
                 crate::tounicode::ToUnicodeMap::parse(&stream.decompressed_content().ok()?)
             })()
         };
-        out.insert(
-            name,
-            FontInfo {
-                dict,
-                cid,
-                type3,
-                widths,
-                std_widths,
-                width_scale,
-                charprocs,
-                differences,
-                tounicode,
-                default_width: 500.0,
-            },
-        );
+        // Type3 vertical extent: FontBBox is required for Type3 and, mapped
+        // through the FULL FontMatrix (rotation/shear included — y' depends
+        // on b*x + d*y + f, not just d), gives real ascent/descent per unit
+        // size. Tf sizes for these fonts can be arbitrary (0.24pt with huge
+        // glyph coordinates), so em-fraction guesses are meaningless.
+        let t3_vertical = if type3 {
+            (|| {
+                let fm = doc.dereference(dict.get(b"FontMatrix").ok()?).ok()?.1.as_array().ok()?;
+                let m: Vec<f32> = fm.iter().map(|o| o.as_float().unwrap_or(0.0)).collect();
+                if m.len() != 6 {
+                    return None;
+                }
+                let bb = doc.dereference(dict.get(b"FontBBox").ok()?).ok()?.1.as_array().ok()?;
+                let x0 = bb.first()?.as_float().ok()?;
+                let y0 = bb.get(1)?.as_float().ok()?;
+                let x1 = bb.get(2)?.as_float().ok()?;
+                let y1 = bb.get(3)?.as_float().ok()?;
+                let ys = [(x0, y0), (x1, y0), (x0, y1), (x1, y1)].map(|(x, y)| m[1] * x + m[3] * y + m[5]);
+                let max_y = ys.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+                let min_y = ys.iter().copied().fold(f32::INFINITY, f32::min);
+                let (asc, desc) = (max_y.max(0.0), (-min_y).max(0.0));
+                if asc + desc > 0.0 { Some((asc, desc)) } else { None }
+            })()
+        } else {
+            None
+        };
+        // Out-of-range codes fall back to /MissingWidth when the descriptor
+        // provides one (ISO 32000 9.8.1), else the old 500 guess.
+        let default_width = (|| {
+            let fd = doc.dereference(dict.get(b"FontDescriptor").ok()?).ok()?.1.as_dict().ok()?;
+            let mw = doc.dereference(fd.get(b"MissingWidth").ok()?).ok()?.1.as_float().ok()?;
+            Some(mw * if type3 { width_scale } else { 1.0 })
+        })()
+        .unwrap_or(500.0);
+        FontInfo {
+            dict,
+            cid,
+            type3,
+            widths,
+            std_widths,
+            width_scale,
+            charprocs,
+            differences,
+            tounicode,
+            default_width,
+            t3_vertical,
+        }
     }
-    out
 }
 
 fn op_f32(op: &Object) -> f32 {
@@ -319,6 +459,7 @@ pub fn walk_page(doc: &Document, page_id: lopdf::ObjectId, page_no: u32) -> lopd
     let data = doc.get_page_content(page_id)?;
     let content = Content::decode(&data)?;
     let fonts = load_fonts(doc, page_id);
+    let gs_fonts = load_gs_font_map(doc, page_id);
 
     let mut segs = Vec::new();
 
@@ -360,6 +501,15 @@ pub fn walk_page(doc: &Document, page_id: lopdf::ObjectId, page_no: u32) -> lopd
             "Tw" if ops.len() == 1 => gs.word_spacing = op_f32(&ops[0]),
             "Tz" if ops.len() == 1 => gs.h_scale = op_f32(&ops[0]) / 100.0,
             "Tr" if ops.len() == 1 => gs.render_mode = ops[0].as_i64().unwrap_or(0),
+            // ExtGState can carry a /Font entry that sets font + size.
+            "gs" if ops.len() == 1 => {
+                if let Some((key, size)) = ops[0].as_name().ok().and_then(|n| gs_fonts.get(n)) {
+                    gs.font_key = key.clone();
+                    if let Some(sz) = size {
+                        gs.font_size = *sz; // 0 is a legal size, apply it too
+                    }
+                }
+            }
             // Fill color (approximated to RGB; stroke color doesn't matter
             // for the text model).
             "rg" if ops.len() == 3 => gs.fill_color = [op_f32(&ops[0]), op_f32(&ops[1]), op_f32(&ops[2])],
@@ -502,9 +652,17 @@ fn show_string(
     }
     let width_text_space = pen;
 
-    // Generous ascent/descent estimates: some fonts descend past 0.25em.
-    let (x0, y0) = trm.apply(0.0, -0.35 * gs.font_size);
-    let (x1a, y1a) = trm.apply(width_text_space, 1.05 * gs.font_size);
+    // Vertical extent: Type3 fonts get real FontBBox-derived metrics (their
+    // Tf sizes can be arbitrary); others use generous em-fraction estimates.
+    // Take the max of both for Type3 — glyphs overshooting their declared
+    // FontBBox is a common spec violation, so the declared box only ever
+    // WIDENS the estimate, never shrinks it.
+    let (asc, desc) = match font.and_then(|f| f.t3_vertical) {
+        Some((a, d)) => ((a * 1.1).max(1.05), (d * 1.1).max(a * 0.1).max(0.35)),
+        None => (1.05, 0.35),
+    };
+    let (x0, y0) = trm.apply(0.0, -desc * gs.font_size);
+    let (x1a, y1a) = trm.apply(width_text_space, asc * gs.font_size);
     let bbox = [x0.min(x1a), y0.min(y1a), x0.max(x1a), y0.max(y1a)];
 
     if !text.trim().is_empty() {
