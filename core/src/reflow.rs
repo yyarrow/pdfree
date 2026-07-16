@@ -138,13 +138,37 @@ pub(crate) fn replace_run_reflow(
         // mode of text we hoisted before it.
         let lo = *line_ops.iter().min().unwrap();
         let hi = *line_ops.iter().max().unwrap();
-        for op in &content.operations[lo..=hi] {
-            if !matches!(
-                op.operator.as_str(),
-                "Tj" | "TJ" | "'" | "\"" | "Td" | "TD" | "Tm" | "T*" | "Tf" | "TL"
-                    | "Tc" | "Tw" | "Tz" | "rg" | "g" | "k" | "cs" | "sc" | "scn" | "BT" | "ET"
-            ) {
-                return Err(ReplaceError::NeedsReflow);
+        for (i, op) in content.operations.iter().enumerate().take(hi + 1).skip(lo) {
+            match op.operator.as_str() {
+                // Only state ops we can reason about may sit between chunks.
+                "Td" | "TD" | "Tm" | "T*" | "Tf" | "TL" | "Tc" | "Tw" | "Tz" | "rg" | "g" | "k" | "cs" | "sc"
+                | "scn" | "BT" | "ET" => {}
+                // A show op that isn't part of this modeled line would be left
+                // in place while target chunks hoist to the first op —
+                // corrupting its inherited state. Refuse.
+                "Tj" | "TJ" | "'" | "\"" => {
+                    if !line_ops.contains(&i) {
+                        return Err(ReplaceError::NeedsReflow);
+                    }
+                    // Every String element of a line op must map to a modeled
+                    // segment; an undecodable string yields no seg and would
+                    // be silently dropped when we delete the op. Require the
+                    // string count to match this op's segment count.
+                    let n_strings = op
+                        .operands
+                        .iter()
+                        .map(|o| match o {
+                            Object::String(..) => 1,
+                            Object::Array(a) => a.iter().filter(|x| matches!(x, Object::String(..))).count(),
+                            _ => 0,
+                        })
+                        .sum::<usize>();
+                    let n_segs = segs.iter().filter(|s| s.op_idx == i).count();
+                    if n_strings != n_segs {
+                        return Err(ReplaceError::NeedsReflow);
+                    }
+                }
+                _ => return Err(ReplaceError::NeedsReflow),
             }
         }
     }
@@ -182,13 +206,18 @@ pub(crate) fn replace_run_reflow(
 
     // --- Geometry: widths, shift, fit ------------------------------------
     let anchor = Mat(segs[first_run_seg].trm);
-    // Horizontal user-space scale of the anchor matrix. Mirrored/negative
-    // scales (negative Tz or a negative-determinant matrix) invert advance
-    // direction — out of v1 scope, refuse.
-    if segs[first_run_seg].h_scale <= 0.0 || (anchor.0[0] * anchor.0[3] - anchor.0[1] * anchor.0[2]) <= 0.0 {
+    // Text must advance in the +x direction: the SIGNED horizontal advance
+    // is anchor.a * font_size * h_scale. A matrix like [-1 0 0 -1] has a
+    // positive determinant yet advances left, so the determinant is not the
+    // right test — check the effective x advance sign directly. (delta is
+    // later applied as +x to following runs, valid only for +x text.)
+    let x_dir = anchor.0[0] * plan.size * segs[first_run_seg].h_scale;
+    if x_dir <= 1e-6 {
         return Err(ReplaceError::NeedsReflow);
     }
     let x_scale = (anchor.0[0].powi(2) + anchor.0[1].powi(2)).sqrt().max(1e-6);
+    // Vertical user-space scale, for the affected-region height.
+    let y_scale = (anchor.0[2].powi(2) + anchor.0[3].powi(2)).sqrt().max(1e-6);
     // Old width is the visual SPAN (rightmost edge − leftmost origin), not
     // the sum of advances: segments merged into one run can have TJ-kerning
     // or positioning gaps between them that a sum would miss.
@@ -324,7 +353,9 @@ pub(crate) fn replace_run_reflow(
     // --- Report: the whole line (old and new extents) is the edit region --
     // Vertical pad covers ascenders/descenders of whichever font renders,
     // generously (with an absolute floor) — a few px short reads as a leak.
-    let size_pad = (mrun.font_size.max(plan.size) * 1.1).max(6.0);
+    // Vertical extent scales with the text matrix's y-scale — a 4x Tm makes
+    // glyphs render 4x taller than raw font size would suggest.
+    let size_pad = (mrun.font_size.max(plan.size) * 1.1 * y_scale).max(6.0);
     let bbox = [
         mline.bbox[0] - 1.0,
         mline.bbox[1].min(mrun.bbox[1]) - size_pad,

@@ -585,7 +585,14 @@ pub fn walk_page(doc: &Document, page_id: lopdf::ObjectId, page_no: u32) -> lopd
                 let name = ops.first().and_then(|o| o.as_name().ok()).unwrap_or(b"");
                 gs.fill_device_cs = matches!(name, b"DeviceRGB" | b"DeviceGray" | b"DeviceCMYK");
                 gs.pattern_fill = !gs.fill_device_cs;
-                gs.fill_op = ("g".into(), vec![0.0]);
+                // Record the initial-color fill_op in the SELECTED space, not
+                // always "g 0" — regenerating "g" under a DeviceRGB line would
+                // switch the space to DeviceGray for following content.
+                gs.fill_op = match name {
+                    b"DeviceRGB" => ("rg".into(), vec![0.0, 0.0, 0.0]),
+                    b"DeviceCMYK" => ("k".into(), vec![0.0, 0.0, 0.0, 1.0]),
+                    _ => ("g".into(), vec![0.0]),
+                };
             }
             "sc" | "scn" => {
                 // Pattern (trailing name) or a non-device color space means a
