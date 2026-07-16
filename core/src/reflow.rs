@@ -116,6 +116,36 @@ pub(crate) fn replace_run_reflow(
         }
     }
 
+    // Uniform-context guard. All regenerated text is hoisted to the first
+    // show op, so any state that differs between the line's segments — or any
+    // state-changing operator interleaved among them — would be applied to
+    // the wrong text. Require every line segment to share spacing state, and
+    // forbid state-changing ops (q/Q/cm/gs/clip/marked-content) between the
+    // line's first and last op. Simple positioning/text ops are fine.
+    {
+        let s0 = &segs[first_run_seg];
+        for &si in &line_segs {
+            let s = &segs[si];
+            if (s.char_spacing - s0.char_spacing).abs() > 1e-4
+                || (s.word_spacing - s0.word_spacing).abs() > 1e-4
+                || (s.h_scale - s0.h_scale).abs() > 1e-4
+            {
+                return Err(ReplaceError::NeedsReflow);
+            }
+        }
+        let lo = *line_ops.iter().min().unwrap();
+        let hi = *line_ops.iter().max().unwrap();
+        for op in &content.operations[lo..=hi] {
+            if !matches!(
+                op.operator.as_str(),
+                "Tj" | "TJ" | "'" | "\"" | "Td" | "TD" | "Tm" | "T*" | "Tf" | "TL"
+                    | "Tc" | "Tw" | "Tz" | "Tr" | "rg" | "g" | "k" | "cs" | "sc" | "scn" | "BT" | "ET"
+            ) {
+                return Err(ReplaceError::NeedsReflow);
+            }
+        }
+    }
+
     // BT/ET-span guard. Following lines in the SAME text object are often
     // positioned RELATIVE to this one (T*/Td chains); regenerating this line
     // with absolute Tm would break that chain even with a restored line
@@ -151,7 +181,12 @@ pub(crate) fn replace_run_reflow(
     let anchor = Mat(segs[first_run_seg].trm);
     // Horizontal user-space scale of the anchor matrix.
     let x_scale = (anchor.0[0].powi(2) + anchor.0[1].powi(2)).sqrt().max(1e-6);
-    let old_w: f32 = mrun.glyphs.iter().map(|g| g.w).sum();
+    // Old width is the visual SPAN (rightmost edge − leftmost origin), not
+    // the sum of advances: segments merged into one run can have TJ-kerning
+    // or positioning gaps between them that a sum would miss.
+    let g_min = mrun.glyphs.iter().map(|g| g.x).fold(f32::INFINITY, f32::min);
+    let g_max = mrun.glyphs.iter().map(|g| g.x + g.w).fold(f32::NEG_INFINITY, f32::max);
+    let old_w: f32 = (g_max - g_min).max(0.0);
     // The new run's advance must include the same Tz/Tc/Tw the walked
     // old_w already reflects, or the delta (and the overflow guard) is wrong
     // under non-default spacing. All run segments share these (same style).
@@ -206,13 +241,16 @@ pub(crate) fn replace_run_reflow(
         if run_segs.contains(&si) {
             if !emitted_new_run {
                 emitted_new_run = true;
+                // Anchor at the run's VISUALLY-leftmost segment, not this
+                // paint-order-first one — they differ when the right chunk
+                // was painted first.
                 emit_text(
                     &mut ops_new,
                     &plan.res_name,
                     plan.size,
                     mrun.color,
-                    &Mat(s.trm),
-                    &Mat(s.ctm),
+                    &anchor,
+                    &Mat(segs[first_run_seg].ctm),
                     0.0,
                     plan.string_bytes.clone(),
                 );

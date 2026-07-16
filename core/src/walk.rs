@@ -90,6 +90,10 @@ struct GfxState {
     render_mode: i64,
     fill_color: [f32; 3],
     pattern_fill: bool,
+    /// True while the nonstroking color space (set by `cs`) is a plain
+    /// device space we can reproduce with rg/g/k. Separation/DeviceN/Pattern/
+    /// ICC set this false, so any scn under them is flagged unreproducible.
+    fill_device_cs: bool,
 }
 
 impl GfxState {
@@ -105,6 +109,7 @@ impl GfxState {
             render_mode: 0,
             fill_color: [0.0, 0.0, 0.0],
             pattern_fill: false,
+            fill_device_cs: true,
         }
     }
 }
@@ -542,24 +547,34 @@ pub fn walk_page(doc: &Document, page_id: lopdf::ObjectId, page_no: u32) -> lopd
             "rg" if ops.len() == 3 => {
                 gs.fill_color = [op_f32(&ops[0]), op_f32(&ops[1]), op_f32(&ops[2])];
                 gs.pattern_fill = false;
+                gs.fill_device_cs = true;
             }
             "g" if ops.len() == 1 => {
                 let v = op_f32(&ops[0]);
                 gs.fill_color = [v, v, v];
                 gs.pattern_fill = false;
+                gs.fill_device_cs = true;
             }
             "k" if ops.len() == 4 => {
                 gs.fill_color = cmyk_to_rgb(op_f32(&ops[0]), op_f32(&ops[1]), op_f32(&ops[2]), op_f32(&ops[3]));
                 gs.pattern_fill = false;
+                gs.fill_device_cs = true;
             }
             "cs" => {
                 gs.fill_color = [0.0, 0.0, 0.0]; // new colorspace resets to its initial color
                 gs.pattern_fill = false;
+                // Only the named device spaces are safe to reproduce as
+                // rg/g/k; Separation, DeviceN, ICCBased, Indexed, Pattern and
+                // resource-named spaces are not (numeric scn under them is a
+                // tint, not device components).
+                let name = ops.first().and_then(|o| o.as_name().ok()).unwrap_or(b"");
+                gs.fill_device_cs = matches!(name, b"DeviceRGB" | b"DeviceGray" | b"DeviceCMYK");
             }
             "sc" | "scn" => {
-                // A trailing name operand means a pattern/separation fill we
-                // can only approximate; flag it so reflow can refuse.
-                gs.pattern_fill = ops.last().map(|o| o.as_name().is_ok()).unwrap_or(false);
+                // Pattern (trailing name) or a non-device color space means a
+                // fill we can only approximate — flag it so reflow refuses.
+                let has_name = ops.last().map(|o| o.as_name().is_ok()).unwrap_or(false);
+                gs.pattern_fill = has_name || !gs.fill_device_cs;
                 let nums: Vec<f32> = ops.iter().filter_map(|o| o.as_float().ok()).collect();
                 match nums.len() {
                     1 => gs.fill_color = [nums[0], nums[0], nums[0]],
