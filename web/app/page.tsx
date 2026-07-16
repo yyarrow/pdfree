@@ -50,6 +50,12 @@ function loadEngine(): Promise<Engine> {
   enginePromise ??= (async () => {
     const mod = await import(/* webpackIgnore: true */ "/wasm/pdfree_wasm.js" as string);
     await mod.default({ module_or_path: "/wasm/pdfree_wasm_bg.wasm" });
+    // The wasm is fetched at runtime while the page bundle may be a stale
+    // browser-cached copy from an earlier deploy — surface the mismatch as
+    // a refresh hint instead of a cryptic missing-function error.
+    if (typeof (mod as { DocSession?: unknown }).DocSession !== "function") {
+      throw new Error("页面已更新，请强制刷新后重试（Cmd+Shift+R）");
+    }
     return mod as unknown as Engine;
   })();
   return enginePromise;

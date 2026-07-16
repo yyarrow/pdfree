@@ -326,14 +326,41 @@ fn rebuild(data: &[u8]) -> Option<Vec<u8>> {
 /// Whether the damaged original declared encryption. The rebuilt trailer
 /// intentionally drops /Encrypt (we can't decrypt), so without a marker the
 /// salvaged document would silently bypass the editing guard and be saved
-/// with the owner's permissions stripped. Boundary-checked token scan; a
-/// false positive only refuses an edit, which is the safe direction.
+/// with the owner's permissions stripped.
+///
+/// PDF names may hex-escape any character (`/Encr#79pt` == /Encrypt), so
+/// every name token is DECODED before comparison — a literal byte search
+/// would be bypassable. A false positive only refuses an edit, which is
+/// the safe direction.
 fn original_had_encrypt(data: &[u8]) -> bool {
-    for pos in find_all(data, b"/Encrypt") {
-        let after = pos + b"/Encrypt".len();
-        if after >= data.len() || is_boundary(data[after]) {
+    let mut i = 0;
+    while i < data.len() {
+        if data[i] != b'/' {
+            i += 1;
+            continue;
+        }
+        // Decode the name token (ISO 32000 7.3.5), capped well past
+        // "Encrypt"'s length so degenerate tokens can't blow up the scan.
+        let mut decoded: Vec<u8> = Vec::with_capacity(8);
+        let mut j = i + 1;
+        while j < data.len() && !is_boundary(data[j]) && decoded.len() <= 8 {
+            if data[j] == b'#' && j + 2 < data.len() {
+                let hex = std::str::from_utf8(&data[j + 1..j + 3])
+                    .ok()
+                    .and_then(|s| u8::from_str_radix(s, 16).ok());
+                if let Some(b) = hex {
+                    decoded.push(b);
+                    j += 3;
+                    continue;
+                }
+            }
+            decoded.push(data[j]);
+            j += 1;
+        }
+        if decoded == b"Encrypt" {
             return true;
         }
+        i = j.max(i + 1);
     }
     false
 }
