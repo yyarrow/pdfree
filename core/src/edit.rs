@@ -69,10 +69,12 @@ fn replace_run_inner(
     let mut cursor = 0usize;
     // seg index -> (byte_start -> replacement text)
     let mut per_seg: BTreeMap<usize, BTreeMap<usize, String>> = BTreeMap::new();
+    let mut length_matches = true;
     for g in &mrun.glyphs {
         let n = g.text.chars().count();
         if cursor + n > new_chars.len() {
-            return Err(ReplaceError::NeedsReflow);
+            length_matches = false;
+            break;
         }
         let piece: String = new_chars[cursor..cursor + n].iter().collect();
         if piece != g.text {
@@ -80,8 +82,10 @@ fn replace_run_inner(
         }
         cursor += n;
     }
-    if cursor != new_chars.len() {
-        return Err(ReplaceError::NeedsReflow);
+    if !length_matches || cursor != new_chars.len() {
+        // Length changed: Phase B path — regenerate the whole line with the
+        // following runs pushed by the width delta.
+        return crate::reflow::replace_run_reflow(doc, page_no, block, line, run, new_text, fallback);
     }
 
     // Build each affected segment's full new text from its own glyph list.

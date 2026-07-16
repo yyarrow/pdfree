@@ -7,6 +7,7 @@
 pub mod edit;
 mod matrix;
 pub mod model;
+pub mod reflow;
 pub mod replace;
 pub mod salvage;
 mod std14;

@@ -31,4 +31,15 @@ impl Mat {
         let m = self.0;
         (m[0] * x + m[2] * y + m[4], m[1] * x + m[3] * y + m[5])
     }
+
+    /// Inverse of the affine transform; None when singular.
+    pub fn invert(&self) -> Option<Mat> {
+        let [a, b, c, d, e, f] = self.0;
+        let det = a * d - b * c;
+        if det.abs() < 1e-9 {
+            return None;
+        }
+        let (ia, ib, ic, id) = (d / det, -b / det, -c / det, a / det);
+        Some(Mat([ia, ib, ic, id, -(e * ia + f * ic), -(e * ib + f * id)]))
+    }
 }

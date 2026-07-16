@@ -535,7 +535,7 @@ fn finish_swap(
 /// Register `font_id` under a fresh name in the page's /Resources /Font,
 /// creating dictionaries as needed. Handles both inline and referenced
 /// Resources/Font dicts (adding a key to a shared dict is harmless).
-fn add_font_resource(doc: &mut Document, page_id: ObjectId, font_id: ObjectId) -> Result<String, ReplaceError> {
+pub(crate) fn add_font_resource(doc: &mut Document, page_id: ObjectId, font_id: ObjectId) -> Result<String, ReplaceError> {
     enum Loc {
         Inline,
         Ref(ObjectId),

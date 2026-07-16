@@ -63,6 +63,9 @@ def render_page(pdf_path, page_index, out_png):
     return Image.open(out_png), info["box"], info["text"]
 
 
+VARLEN = False  # set by --varlen: probe variable-length replacements too
+
+
 def pick_edits(runs, rng, n=3):
     """Yield up to n distinct (run, find, with_) candidates, so a font that
     can't encode one replacement doesn't end the whole case."""
@@ -89,6 +92,32 @@ def pick_edits(runs, rng, n=3):
         if repl != find:
             picked += 1
             yield run, find, repl
+
+
+def pick_model_edits(engine_model_json, rng, n=3):
+    """Variable-length candidates from the text model: (block, line, run,
+    old_text, new_text). Always changes length — this probes line reflow."""
+    blocks = json.loads(engine_model_json)
+    cands = []
+    for b, blk in enumerate(blocks):
+        for l, ln in enumerate(blk["lines"]):
+            for r, run in enumerate(ln["runs"]):
+                t = run["text"]
+                if len(t) >= 4 and t.isascii() and any(c.isalpha() for c in t) \
+                        and not run["cid"] and not run["type3"]:
+                    cands.append((b, l, r, t))
+    rng.shuffle(cands)
+    out = []
+    for b, l, r, t in cands[:n]:
+        repl = "".join(
+            chr((ord(ch.lower()) - 97 + 7) % 26 + 97).upper() if ch.isupper()
+            else (chr((ord(ch) - 97 + 7) % 26 + 97) if ch.isalpha() else ch)
+            for ch in t
+        )
+        repl = repl[:-1] if rng.random() < 0.5 and len(repl) > 4 else repl + "x"
+        if repl != t:
+            out.append((b, l, r, t, repl))
+    return out
 
 
 def bbox_to_pixels(bbox, page_box):
@@ -168,7 +197,7 @@ def judge(case, in_pdf, out_pdf, page_no, report, find, repl, work):
 
     # 4. semantics — whitespace-insensitive: pdfium reinserts line breaks
     # at visual wrap points, which can split the replacement word.
-    if repl not in "".join(text.split()):
+    if "".join(repl.split()) not in "".join(text.split()):
         return "fail_text_semantics", diff
 
     return "pass", None
@@ -190,6 +219,8 @@ def run_case(pdf_path: Path, work: Path):
         if not input_renderable():
             return pdf_path.name, "skip_invalid_input", None
         return pdf_path.name, "fail_engine_extract", r.stderr.strip()[:200]
+    if VARLEN:
+        return run_case_varlen(pdf_path, work, case, rng)
     runs = json.loads(r.stdout)["runs"]
     out_pdf = work / f"{case}_out.pdf"
     run = find = repl = None
@@ -237,12 +268,56 @@ def run_case(pdf_path: Path, work: Path):
     return pdf_path.name, verdict, None
 
 
+def run_case_varlen(pdf_path: Path, work: Path, case: str, rng):
+    """Variable-length probing through the model path (replace-run)."""
+    out_pdf = work / f"{case}_out.pdf"
+    for page in (1, 2):
+        r = sh([str(ENGINE), "model", str(pdf_path), "--page", str(page)])
+        if r.returncode != 0:
+            continue
+        for b, l, run_i, old, repl in pick_model_edits(r.stdout, rng):
+            rr = sh([
+                str(ENGINE), "replace-run", str(pdf_path), str(out_pdf),
+                "--page", str(page), "--block", str(b), "--line", str(l), "--run", str(run_i),
+                "--with", repl, "--fallback-font", str(ROOT.parent / "assets" / "NotoSansSC.ttf"),
+            ])
+            if rr.returncode != 0:
+                err = rr.stderr.strip()[:200]
+                if "reflow" in err or "length differs" in err:
+                    return pdf_path.name, "fail_needs_reflow", f"{old!r}->{repl!r}"
+                if "encrypted" in err:
+                    return pdf_path.name, "skip_encrypted", None
+                if "cannot represent" in err:
+                    return pdf_path.name, "fail_unencodable", err
+                return pdf_path.name, "fail_engine_replace", err
+            report = json.loads(rr.stdout)
+            try:
+                verdict, diff = judge(case, pdf_path, out_pdf, page, report, old, repl, work)
+            except Exception as e:
+                return pdf_path.name, "fail_harness_error", f"{type(e).__name__}: {e}"[:200]
+            if verdict.startswith("fail"):
+                dest = FAILURES / f"{pdf_path.stem}_{verdict}"
+                dest.mkdir(parents=True, exist_ok=True)
+                shutil.copy(pdf_path, dest / "in.pdf")
+                shutil.copy(out_pdf, dest / "out.pdf")
+                (dest / "case.json").write_text(json.dumps(
+                    {"find": old, "with": repl, "report": report, "mode": "varlen"}, indent=2))
+                if diff is not None:
+                    diff.save(dest / "diff.png")
+                return pdf_path.name, verdict, f"find={old!r} with={repl!r} page={page}"
+            return pdf_path.name, verdict, None
+    return pdf_path.name, "skip_no_candidate", None
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("corpus", nargs="+", help="corpus directories")
     ap.add_argument("--limit", type=int, default=0)
     ap.add_argument("--fresh", action="store_true", help="clear failures dir first")
+    ap.add_argument("--varlen", action="store_true", help="probe variable-length replacements")
     args = ap.parse_args()
+    global VARLEN
+    VARLEN = args.varlen
 
     if not ENGINE.exists():
         sys.exit(f"engine not built: {ENGINE} (run: cargo build in core/)")

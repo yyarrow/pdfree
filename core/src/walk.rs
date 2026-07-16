@@ -50,6 +50,17 @@ pub struct Seg {
     pub horizontal: bool,
     #[serde(skip)]
     pub glyphs: Vec<Glyph>,
+    /// Full text-rendering matrix (Tm x CTM) at the segment's start — the
+    /// anchor for regenerating this segment's ops with absolute positions.
+    #[serde(skip)]
+    pub trm: [f32; 6],
+    /// CTM at the segment, for converting user-space targets back to Tm.
+    #[serde(skip)]
+    pub ctm: [f32; 6],
+    /// Text line matrix AFTER this segment's op completed — the state the
+    /// following operations' Td/TD/T* derive from.
+    #[serde(skip)]
+    pub tlm_after: [f32; 6],
 }
 
 /// Graphics state saved/restored by q/Q — the CTM plus the text state set
@@ -470,6 +481,7 @@ pub fn walk_page(doc: &Document, page_id: lopdf::ObjectId, page_no: u32) -> lopd
 
     for (op_idx, op) in content.operations.iter().enumerate() {
         let ops = &op.operands;
+        let segs_before_op = segs.len();
         match op.operator.as_str() {
             "q" => gs_stack.push(gs.clone()),
             "Q" => {
@@ -590,6 +602,11 @@ pub fn walk_page(doc: &Document, page_id: lopdf::ObjectId, page_no: u32) -> lopd
             }
             _ => {}
         }
+        // Backfill: segments emitted by this op record the text line matrix
+        // as it stands once the op is done — what following Td/T* build on.
+        for seg in &mut segs[segs_before_op..] {
+            seg.tlm_after = tlm.0;
+        }
     }
 
     Ok((content, segs))
@@ -681,6 +698,9 @@ fn show_string(
             color: gs.fill_color,
             horizontal,
             glyphs,
+            trm: trm.0,
+            ctm: gs.ctm.0,
+            tlm_after: [0.0; 6], // filled in by walk_page once the op ends
         });
     }
 
