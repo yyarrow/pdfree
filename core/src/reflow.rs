@@ -129,17 +129,20 @@ pub(crate) fn replace_run_reflow(
             if (s.char_spacing - s0.char_spacing).abs() > 1e-4
                 || (s.word_spacing - s0.word_spacing).abs() > 1e-4
                 || (s.h_scale - s0.h_scale).abs() > 1e-4
+                || s.render_mode != s0.render_mode
             {
                 return Err(ReplaceError::NeedsReflow);
             }
         }
+        // Tr excluded from the allowlist: a later Tr would change the render
+        // mode of text we hoisted before it.
         let lo = *line_ops.iter().min().unwrap();
         let hi = *line_ops.iter().max().unwrap();
         for op in &content.operations[lo..=hi] {
             if !matches!(
                 op.operator.as_str(),
                 "Tj" | "TJ" | "'" | "\"" | "Td" | "TD" | "Tm" | "T*" | "Tf" | "TL"
-                    | "Tc" | "Tw" | "Tz" | "Tr" | "rg" | "g" | "k" | "cs" | "sc" | "scn" | "BT" | "ET"
+                    | "Tc" | "Tw" | "Tz" | "rg" | "g" | "k" | "cs" | "sc" | "scn" | "BT" | "ET"
             ) {
                 return Err(ReplaceError::NeedsReflow);
             }
@@ -179,7 +182,12 @@ pub(crate) fn replace_run_reflow(
 
     // --- Geometry: widths, shift, fit ------------------------------------
     let anchor = Mat(segs[first_run_seg].trm);
-    // Horizontal user-space scale of the anchor matrix.
+    // Horizontal user-space scale of the anchor matrix. Mirrored/negative
+    // scales (negative Tz or a negative-determinant matrix) invert advance
+    // direction — out of v1 scope, refuse.
+    if segs[first_run_seg].h_scale <= 0.0 || (anchor.0[0] * anchor.0[3] - anchor.0[1] * anchor.0[2]) <= 0.0 {
+        return Err(ReplaceError::NeedsReflow);
+    }
     let x_scale = (anchor.0[0].powi(2) + anchor.0[1].powi(2)).sqrt().max(1e-6);
     // Old width is the visual SPAN (rightmost edge − leftmost origin), not
     // the sum of advances: segments merged into one run can have TJ-kerning
@@ -190,10 +198,18 @@ pub(crate) fn replace_run_reflow(
     // The new run's advance must include the same Tz/Tc/Tw the walked
     // old_w already reflects, or the delta (and the overflow guard) is wrong
     // under non-default spacing. All run segments share these (same style).
+    // Tc is applied once per ENCODED code, Tw once per single-byte code 32 —
+    // count the emitted bytes, not Unicode scalars (a ligature code maps to
+    // multiple scalars but is one code).
     let sp = &segs[first_run_seg];
-    let n_chars = new_text.chars().count() as f32;
-    let n_spaces = new_text.chars().filter(|&c| c == ' ').count() as f32;
-    let new_w = (plan.adv_em / 1000.0 * plan.size + n_chars * sp.char_spacing + n_spaces * sp.word_spacing)
+    let code_len = if segs[first_run_seg].cid { 2 } else { 1 };
+    let n_codes = (plan.string_bytes.len() / code_len).max(1) as f32;
+    let n_spaces = if code_len == 1 {
+        plan.string_bytes.iter().filter(|&&b| b == b' ').count() as f32
+    } else {
+        0.0
+    };
+    let new_w = (plan.adv_em / 1000.0 * plan.size + n_codes * sp.char_spacing + n_spaces * sp.word_spacing)
         * sp.h_scale
         * x_scale;
     let delta = new_w - old_w;
@@ -248,7 +264,7 @@ pub(crate) fn replace_run_reflow(
                     &mut ops_new,
                     &plan.res_name,
                     plan.size,
-                    mrun.color,
+                    &segs[first_run_seg].fill_op,
                     &anchor,
                     &Mat(segs[first_run_seg].ctm),
                     0.0,
@@ -267,7 +283,7 @@ pub(crate) fn replace_run_reflow(
             Some(n) => n.clone(),
             None => s.font.clone(),
         };
-        emit_text(&mut ops_new, &res, s.font_size, s.color, &Mat(s.trm), &Mat(s.ctm), dx, s.bytes.clone());
+        emit_text(&mut ops_new, &res, s.font_size, &s.fill_op, &Mat(s.trm), &Mat(s.ctm), dx, s.bytes.clone());
     }
     // Restore the text state the FOLLOWING ops inherit. Font, size and color
     // persist across BT/ET (each line here is its own BT/ET with no Tf), so
@@ -284,10 +300,10 @@ pub(crate) fn replace_run_reflow(
             vec![Object::Name(tail_res.into_bytes()), Object::Real(tail_seg.font_size)],
         ));
     }
-    ops_new.push(Operation::new(
-        "rg",
-        tail_seg.color.iter().map(|v| Object::Real(*v)).collect(),
-    ));
+    // Replay the ORIGINAL fill operator (rg/g/k) so the nonstroking color
+    // space that following content inherits is unchanged.
+    let (fop, fargs) = &tail_seg.fill_op;
+    ops_new.push(Operation::new(fop, fargs.iter().map(|v| Object::Real(*v)).collect()));
     let last_tlm = segs[tail].tlm_after;
     ops_new.push(Operation::new("Tm", last_tlm.iter().map(|v| Object::Real(*v)).collect()));
 
@@ -414,15 +430,16 @@ fn plan_new_run(
     Ok(NewRunPlan { res_name, string_bytes, size: fb_size, adv_em })
 }
 
-/// rg + Tf + Tm + TJ for one positioned chunk. `dx` shifts the anchor in
-/// user space along x; the Tm operand is the desired TRM mapped back
-/// through the CTM.
+/// fill-color + Tf + Tm + TJ for one positioned chunk. `dx` shifts the
+/// anchor in user space along x; the Tm operand is the desired TRM mapped
+/// back through the CTM. `fill` replays the segment's original nonstroking
+/// color operator (rg/g/k) so the color space is preserved.
 #[allow(clippy::too_many_arguments)]
 fn emit_text(
     ops: &mut Vec<Operation>,
     res_name: &str,
     size: f32,
-    color: [f32; 3],
+    fill: &(String, Vec<f32>),
     trm: &Mat,
     ctm: &Mat,
     dx: f32,
@@ -437,10 +454,7 @@ fn emit_text(
         Some(inv) => desired.mul(&inv),
         None => desired, // degenerate CTM: emit as-is, judges will decide
     };
-    ops.push(Operation::new(
-        "rg",
-        color.iter().map(|v| Object::Real(*v)).collect(),
-    ));
+    ops.push(Operation::new(&fill.0, fill.1.iter().map(|v| Object::Real(*v)).collect()));
     ops.push(Operation::new(
         "Tf",
         vec![Object::Name(res_name.as_bytes().to_vec()), Object::Real(size)],

@@ -74,6 +74,15 @@ pub struct Seg {
     /// only approximated (scn with a name operand) — such runs can't be
     /// faithfully re-emitted as rg.
     pub pattern_fill: bool,
+    /// Text rendering mode (Tr): fill/stroke/clip. Regeneration must not
+    /// change it, so lines with mixed Tr refuse.
+    #[serde(skip)]
+    pub render_mode: i64,
+    /// The exact nonstroking-color operator + numeric operands active for
+    /// this segment (e.g. ("g",[0.0]) or ("rg",[1,0,0])), so regeneration
+    /// replays the ORIGINAL color space instead of flattening to rg.
+    #[serde(skip)]
+    pub fill_op: (String, Vec<f32>),
 }
 
 /// Graphics state saved/restored by q/Q — the CTM plus the text state set
@@ -94,6 +103,8 @@ struct GfxState {
     /// device space we can reproduce with rg/g/k. Separation/DeviceN/Pattern/
     /// ICC set this false, so any scn under them is flagged unreproducible.
     fill_device_cs: bool,
+    /// Original nonstroking-color operator + operands, for faithful replay.
+    fill_op: (String, Vec<f32>),
 }
 
 impl GfxState {
@@ -110,6 +121,7 @@ impl GfxState {
             fill_color: [0.0, 0.0, 0.0],
             pattern_fill: false,
             fill_device_cs: true,
+            fill_op: ("g".to_string(), vec![0.0]), // initial nonstroking color is black
         }
     }
 }
@@ -548,27 +560,32 @@ pub fn walk_page(doc: &Document, page_id: lopdf::ObjectId, page_no: u32) -> lopd
                 gs.fill_color = [op_f32(&ops[0]), op_f32(&ops[1]), op_f32(&ops[2])];
                 gs.pattern_fill = false;
                 gs.fill_device_cs = true;
+                gs.fill_op = ("rg".into(), vec![op_f32(&ops[0]), op_f32(&ops[1]), op_f32(&ops[2])]);
             }
             "g" if ops.len() == 1 => {
                 let v = op_f32(&ops[0]);
                 gs.fill_color = [v, v, v];
                 gs.pattern_fill = false;
                 gs.fill_device_cs = true;
+                gs.fill_op = ("g".into(), vec![v]);
             }
             "k" if ops.len() == 4 => {
                 gs.fill_color = cmyk_to_rgb(op_f32(&ops[0]), op_f32(&ops[1]), op_f32(&ops[2]), op_f32(&ops[3]));
                 gs.pattern_fill = false;
                 gs.fill_device_cs = true;
+                gs.fill_op = ("k".into(), ops.iter().map(op_f32).collect());
             }
             "cs" => {
                 gs.fill_color = [0.0, 0.0, 0.0]; // new colorspace resets to its initial color
-                gs.pattern_fill = false;
                 // Only the named device spaces are safe to reproduce as
                 // rg/g/k; Separation, DeviceN, ICCBased, Indexed, Pattern and
                 // resource-named spaces are not (numeric scn under them is a
-                // tint, not device components).
+                // tint, not device components). The INITIAL color under a
+                // non-device space is likewise unreproducible, so flag now.
                 let name = ops.first().and_then(|o| o.as_name().ok()).unwrap_or(b"");
                 gs.fill_device_cs = matches!(name, b"DeviceRGB" | b"DeviceGray" | b"DeviceCMYK");
+                gs.pattern_fill = !gs.fill_device_cs;
+                gs.fill_op = ("g".into(), vec![0.0]);
             }
             "sc" | "scn" => {
                 // Pattern (trailing name) or a non-device color space means a
@@ -577,9 +594,18 @@ pub fn walk_page(doc: &Document, page_id: lopdf::ObjectId, page_no: u32) -> lopd
                 gs.pattern_fill = has_name || !gs.fill_device_cs;
                 let nums: Vec<f32> = ops.iter().filter_map(|o| o.as_float().ok()).collect();
                 match nums.len() {
-                    1 => gs.fill_color = [nums[0], nums[0], nums[0]],
-                    3 => gs.fill_color = [nums[0], nums[1], nums[2]],
-                    4 => gs.fill_color = cmyk_to_rgb(nums[0], nums[1], nums[2], nums[3]),
+                    1 => {
+                        gs.fill_color = [nums[0], nums[0], nums[0]];
+                        gs.fill_op = ("g".into(), vec![nums[0]]);
+                    }
+                    3 => {
+                        gs.fill_color = [nums[0], nums[1], nums[2]];
+                        gs.fill_op = ("rg".into(), nums.clone());
+                    }
+                    4 => {
+                        gs.fill_color = cmyk_to_rgb(nums[0], nums[1], nums[2], nums[3]);
+                        gs.fill_op = ("k".into(), nums.clone());
+                    }
                     _ => {}
                 }
             }
@@ -745,6 +771,8 @@ fn show_string(
             word_spacing: gs.word_spacing,
             h_scale: gs.h_scale,
             pattern_fill: gs.pattern_fill,
+            render_mode: gs.render_mode,
+            fill_op: gs.fill_op.clone(),
         });
     }
 
