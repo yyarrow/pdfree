@@ -61,6 +61,19 @@ pub struct Seg {
     /// following operations' Td/TD/T* derive from.
     #[serde(skip)]
     pub tlm_after: [f32; 6],
+    /// Text-spacing state active for this segment (needed to reproduce its
+    /// exact advance when regenerating): char spacing, word spacing,
+    /// horizontal scale (Tz/100).
+    #[serde(skip)]
+    pub char_spacing: f32,
+    #[serde(skip)]
+    pub word_spacing: f32,
+    #[serde(skip)]
+    pub h_scale: f32,
+    /// True when the fill color came from a pattern/separation space we
+    /// only approximated (scn with a name operand) — such runs can't be
+    /// faithfully re-emitted as rg.
+    pub pattern_fill: bool,
 }
 
 /// Graphics state saved/restored by q/Q — the CTM plus the text state set
@@ -76,6 +89,7 @@ struct GfxState {
     h_scale: f32,
     render_mode: i64,
     fill_color: [f32; 3],
+    pattern_fill: bool,
 }
 
 impl GfxState {
@@ -90,6 +104,7 @@ impl GfxState {
             h_scale: 1.0,
             render_mode: 0,
             fill_color: [0.0, 0.0, 0.0],
+            pattern_fill: false,
         }
     }
 }
@@ -524,17 +539,27 @@ pub fn walk_page(doc: &Document, page_id: lopdf::ObjectId, page_no: u32) -> lopd
             }
             // Fill color (approximated to RGB; stroke color doesn't matter
             // for the text model).
-            "rg" if ops.len() == 3 => gs.fill_color = [op_f32(&ops[0]), op_f32(&ops[1]), op_f32(&ops[2])],
+            "rg" if ops.len() == 3 => {
+                gs.fill_color = [op_f32(&ops[0]), op_f32(&ops[1]), op_f32(&ops[2])];
+                gs.pattern_fill = false;
+            }
             "g" if ops.len() == 1 => {
                 let v = op_f32(&ops[0]);
                 gs.fill_color = [v, v, v];
+                gs.pattern_fill = false;
             }
             "k" if ops.len() == 4 => {
                 gs.fill_color = cmyk_to_rgb(op_f32(&ops[0]), op_f32(&ops[1]), op_f32(&ops[2]), op_f32(&ops[3]));
+                gs.pattern_fill = false;
             }
-            "cs" => gs.fill_color = [0.0, 0.0, 0.0], // new colorspace resets to its initial color
+            "cs" => {
+                gs.fill_color = [0.0, 0.0, 0.0]; // new colorspace resets to its initial color
+                gs.pattern_fill = false;
+            }
             "sc" | "scn" => {
-                // Component count tells the colorspace family well enough.
+                // A trailing name operand means a pattern/separation fill we
+                // can only approximate; flag it so reflow can refuse.
+                gs.pattern_fill = ops.last().map(|o| o.as_name().is_ok()).unwrap_or(false);
                 let nums: Vec<f32> = ops.iter().filter_map(|o| o.as_float().ok()).collect();
                 match nums.len() {
                     1 => gs.fill_color = [nums[0], nums[0], nums[0]],
@@ -701,6 +726,10 @@ fn show_string(
             trm: trm.0,
             ctm: gs.ctm.0,
             tlm_after: [0.0; 6], // filled in by walk_page once the op ends
+            char_spacing: gs.char_spacing,
+            word_spacing: gs.word_spacing,
+            h_scale: gs.h_scale,
+            pattern_fill: gs.pattern_fill,
         });
     }
 

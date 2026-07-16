@@ -512,17 +512,21 @@ fn finish_swap(
     if visual_ratio > 1.0 {
         bbox[2] = bbox[0] + (bbox[2] - bbox[0]) * visual_ratio;
     }
-    // A calibrated size renders with OUR font's metrics, not the original's:
-    // union the box with a SYMMETRIC extent around the baseline (the first
-    // glyph's origin). Symmetric because the text matrix may be y-flipped
-    // (Skia pairs a negative-d Tm with a negative-d FontMatrix; our normal
-    // fallback font under that Tm extends BELOW the baseline).
+    // A calibrated size renders with OUR font's metrics, not the original's.
+    // swap_size is a Tf (text-space) value — map the vertical extent through
+    // the text rendering matrix so scaled/rotated text gets a correct box.
+    // Symmetric ±1.15em because a y-flipped matrix (Skia negative-d) makes
+    // our normal font extend the opposite way from the baseline.
     if (swap_size - seg.font_size).abs() > 0.01 {
-        if let Some(g) = seg.glyphs.first() {
-            let baseline = g.y;
-            bbox[1] = bbox[1].min(baseline - 1.15 * swap_size);
-            bbox[3] = bbox[3].max(baseline + 1.15 * swap_size);
-        }
+        let trm = crate::matrix::Mat(seg.trm);
+        let ext = 1.15 * swap_size;
+        // Baseline origin and the ±extent, all through the matrix.
+        let (bx, by) = trm.apply(0.0, 0.0);
+        let (_, uy) = trm.apply(0.0, ext);
+        let (_, ly) = trm.apply(0.0, -ext);
+        let _ = bx;
+        bbox[1] = bbox[1].min(by.min(uy).min(ly));
+        bbox[3] = bbox[3].max(by.max(uy).max(ly));
     }
     Ok(ReplaceReport {
         page: page_no,

@@ -73,8 +73,32 @@ pub(crate) fn replace_run_reflow(
             return Err(ReplaceError::NeedsReflow);
         }
     }
-    let first_run_seg = *run_segs.iter().next().ok_or(ReplaceError::RunNotFound)?;
+    // Anchor from the VISUALLY leftmost segment of the run, not the lowest
+    // segment index: paint order may draw the right chunk first, and the
+    // replacement must start where the run visually begins.
+    let first_run_seg = *run_segs
+        .iter()
+        .min_by(|&&a, &&b| {
+            segs[a].trm[4].partial_cmp(&segs[b].trm[4]).unwrap_or(std::cmp::Ordering::Equal)
+        })
+        .ok_or(ReplaceError::RunNotFound)?;
     let anchor_ref = Mat(segs[first_run_seg].trm);
+
+    // CTM-uniformity guard: regenerated ops are all spliced at the first
+    // show position, so they execute under ONE live CTM. If the line's
+    // chunks were drawn under different CTMs (cm/q between them), that's
+    // unsafe — refuse. Also refuse pattern/separation fills we can only
+    // approximate as rg, which would recolor the whole regenerated line.
+    let anchor_ctm = Mat(segs[first_run_seg].ctm).0;
+    for &si in &line_segs {
+        let c = segs[si].ctm;
+        if (0..6).any(|i| (c[i] - anchor_ctm[i]).abs() > 1e-4) {
+            return Err(ReplaceError::NeedsReflow);
+        }
+        if segs[si].pattern_fill {
+            return Err(ReplaceError::NeedsReflow);
+        }
+    }
 
     // Pushing runs that follow the edit only works when they share the
     // edited run's text-matrix orientation and scale (same a,b,c,d); a
@@ -128,7 +152,15 @@ pub(crate) fn replace_run_reflow(
     // Horizontal user-space scale of the anchor matrix.
     let x_scale = (anchor.0[0].powi(2) + anchor.0[1].powi(2)).sqrt().max(1e-6);
     let old_w: f32 = mrun.glyphs.iter().map(|g| g.w).sum();
-    let new_w = plan.adv_em / 1000.0 * plan.size * x_scale;
+    // The new run's advance must include the same Tz/Tc/Tw the walked
+    // old_w already reflects, or the delta (and the overflow guard) is wrong
+    // under non-default spacing. All run segments share these (same style).
+    let sp = &segs[first_run_seg];
+    let n_chars = new_text.chars().count() as f32;
+    let n_spaces = new_text.chars().filter(|&c| c == ' ').count() as f32;
+    let new_w = (plan.adv_em / 1000.0 * plan.size + n_chars * sp.char_spacing + n_spaces * sp.word_spacing)
+        * sp.h_scale
+        * x_scale;
     let delta = new_w - old_w;
 
     let line_end: f32 = mline.bbox[2];
