@@ -32,6 +32,9 @@ struct NewRunPlan {
     size: f32,
     /// Advance in em-1000 units at `size`.
     adv_em: f32,
+    /// True when the CHOSEN font is CID (2-byte codes) — may differ from the
+    /// original segment's font, so spacing counts use this, not the seg's.
+    cid: bool,
 }
 
 pub(crate) fn replace_run_reflow(
@@ -83,6 +86,24 @@ pub(crate) fn replace_run_reflow(
         })
         .ok_or(ReplaceError::RunNotFound)?;
     let anchor_ref = Mat(segs[first_run_seg].trm);
+
+    // Clipping render modes (Tr 4–7) accumulate a text clip path that each ET
+    // applies; regenerating the shows before one ET would union clips from
+    // several text objects. We don't model clip paths — refuse.
+    if line_segs.iter().any(|&si| segs[si].render_mode >= 4) {
+        return Err(ReplaceError::NeedsReflow);
+    }
+
+    // Byte-coverage: a segment the run owns may contain glyphs whose decoded
+    // text is empty (dropped from the model). If the run's modeled glyphs
+    // don't account for every byte of a segment it deletes, those bytes —
+    // possibly still painting — would be silently erased. Refuse.
+    for &si in &run_segs {
+        let covered: usize = mrun.glyphs.iter().filter(|g| g.seg == si).map(|g| g.byte_len).sum();
+        if covered != segs[si].bytes.len() {
+            return Err(ReplaceError::NeedsReflow);
+        }
+    }
 
     // CTM-uniformity guard: regenerated ops are all spliced at the first
     // show position, so they execute under ONE live CTM. If the line's
@@ -231,7 +252,10 @@ pub(crate) fn replace_run_reflow(
     // count the emitted bytes, not Unicode scalars (a ligature code maps to
     // multiple scalars but is one code).
     let sp = &segs[first_run_seg];
-    let code_len = if segs[first_run_seg].cid { 2 } else { 1 };
+    // Code length of the CHOSEN font (Tc counts per code, Tw per 1-byte
+    // code 32) — the plan may borrow/synthesize a font whose CID status
+    // differs from the original segment's.
+    let code_len = if plan.cid { 2 } else { 1 };
     let n_codes = (plan.string_bytes.len() / code_len).max(1) as f32;
     let n_spaces = if code_len == 1 {
         plan.string_bytes.iter().filter(|&&b| b == b' ').count() as f32
@@ -254,10 +278,9 @@ pub(crate) fn replace_run_reflow(
     if new_line_end > mblock.bbox[2] + slack {
         return Err(ReplaceError::NeedsReflow);
     }
-    // Never push text past the page's right edge: it would render truncated
-    // (and some generators emit already-overflowing lines — don't make them
-    // worse).
-    if let Some(page_right) = page_media_right(doc, page_id) {
+    // Never push text past the page's VISIBLE right edge (CropBox, which may
+    // be narrower than MediaBox): beyond it the text renders clipped.
+    if let Some(page_right) = page_visible_right(doc, page_id) {
         if new_line_end > page_right - 2.0 {
             return Err(ReplaceError::NeedsReflow);
         }
@@ -398,7 +421,7 @@ fn plan_new_run(
                 candidates.push(name);
             }
         }
-        let mut found: Option<(String, Vec<u8>, f32)> = None;
+        let mut found: Option<(String, Vec<u8>, f32, bool)> = None;
         for cand in &candidates {
             let Some(font) = fonts.get(cand.as_bytes()) else { continue };
             if font.cid && !segs.iter().any(|s| &s.font == cand) {
@@ -412,12 +435,12 @@ fn plan_new_run(
             if adv <= 0.0 {
                 continue;
             }
-            found = Some((cand.clone(), bytes, adv));
+            found = Some((cand.clone(), bytes, adv, font.cid));
             break;
         }
         found
     };
-    if let Some((key, bytes, adv)) = chosen {
+    if let Some((key, bytes, adv, cid)) = chosen {
         // gs-carried fonts must be materialized under a real /Font name.
         let res_name = if key.starts_with("gs:") {
             let (id, dict) = gs_fonts_for_restore(doc, page_id)
@@ -429,7 +452,7 @@ fn plan_new_run(
         } else {
             key
         };
-        return Ok(NewRunPlan { res_name, string_bytes: bytes, size, adv_em: adv });
+        return Ok(NewRunPlan { res_name, string_bytes: bytes, size, adv_em: adv, cid });
     }
 
     // Fallback synthesis, with the same weird-scale calibration policy as
@@ -458,7 +481,8 @@ fn plan_new_run(
             }
         }
     }
-    Ok(NewRunPlan { res_name, string_bytes, size: fb_size, adv_em })
+    // The synthesized fallback Type3 font is single-byte.
+    Ok(NewRunPlan { res_name, string_bytes, size: fb_size, adv_em, cid: false })
 }
 
 /// fill-color + Tf + Tm + TJ for one positioned chunk. `dx` shifts the
@@ -497,21 +521,28 @@ fn emit_text(
     ));
 }
 
-/// The page's MediaBox right edge, following /Parent inheritance.
-fn page_media_right(doc: &Document, page_id: ObjectId) -> Option<f32> {
-    let mut id = page_id;
-    for _ in 0..8 {
-        let dict = doc.get_object(id).ok()?.as_dict().ok()?;
-        if let Ok(mb) = dict.get(b"MediaBox").and_then(|o| doc.dereference(o)).map(|(_, o)| o) {
-            let arr = mb.as_array().ok()?;
-            return arr.get(2)?.as_float().ok();
+/// The page's visible right edge: the inherited CropBox if present, else the
+/// MediaBox. Both /CropBox and /MediaBox are inheritable page-tree
+/// attributes; the walk carries a visited set for cycle safety.
+fn page_visible_right(doc: &Document, page_id: ObjectId) -> Option<f32> {
+    let right_of = |key: &[u8]| -> Option<f32> {
+        let mut id = page_id;
+        let mut seen = std::collections::HashSet::new();
+        while seen.insert(id) {
+            let dict = doc.get_object(id).ok()?.as_dict().ok()?;
+            if let Ok(b) = dict.get(key).and_then(|o| doc.dereference(o)).map(|(_, o)| o) {
+                if let Ok(arr) = b.as_array() {
+                    return arr.get(2)?.as_float().ok();
+                }
+            }
+            match dict.get(b"Parent") {
+                Ok(Object::Reference(p)) => id = *p,
+                _ => return None,
+            }
         }
-        match dict.get(b"Parent") {
-            Ok(Object::Reference(p)) => id = *p,
-            _ => return None,
-        }
-    }
-    None
+        None
+    };
+    right_of(b"CropBox").or_else(|| right_of(b"MediaBox"))
 }
 
 /// The line's last segment in content-stream order — its text state is what

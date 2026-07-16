@@ -55,34 +55,23 @@ pub(crate) fn reject_encrypted(doc: &Document) -> Result<(), ReplaceError> {
     Ok(())
 }
 
-/// How many pages reference `target` from their /Contents. Content-stream
-/// sharing happens through page duplication, so scanning page dicts (not
-/// the whole object table) covers the threat model at O(pages) per edit —
-/// the full-document walk was measurable on large files.
+/// Document-wide count of references to `target`. Page /Contents is not the
+/// only possible referrer — an appearance stream, Form XObject, or any other
+/// reachable dictionary can share the object — so the full object graph is
+/// scanned. Called only on the copy-on-write reuse path, so the cost is
+/// incidental to an edit, not per-op.
 fn reference_count(doc: &Document, target: ObjectId) -> usize {
-    doc.get_pages()
-        .values()
-        .map(|pid| {
-            let Ok(page) = doc.get_object(*pid).and_then(|o| o.as_dict()) else {
-                return 0;
-            };
-            let Ok(contents) = page.get(b"Contents") else {
-                return 0;
-            };
-            match contents {
-                Object::Reference(id) if *id == target => 1,
-                Object::Reference(id) => match doc.get_object(*id) {
-                    // Contents may be an indirect reference to an array.
-                    Ok(Object::Array(a)) => {
-                        a.iter().filter(|o| matches!(o, Object::Reference(i) if *i == target)).count()
-                    }
-                    _ => 0,
-                },
-                Object::Array(a) => a.iter().filter(|o| matches!(o, Object::Reference(i) if *i == target)).count(),
-                _ => 0,
-            }
-        })
-        .sum()
+    fn count_in(obj: &Object, target: ObjectId) -> usize {
+        match obj {
+            Object::Reference(id) => usize::from(*id == target),
+            Object::Array(items) => items.iter().map(|o| count_in(o, target)).sum(),
+            Object::Dictionary(d) => d.iter().map(|(_, o)| count_in(o, target)).sum(),
+            Object::Stream(s) => s.dict.iter().map(|(_, o)| count_in(o, target)).sum(),
+            _ => 0,
+        }
+    }
+    doc.objects.values().map(|o| count_in(o, target)).sum::<usize>()
+        + doc.trailer.iter().map(|(_, o)| count_in(o, target)).sum::<usize>()
 }
 
 /// Point the page's /Contents at a fresh single stream. lopdf's

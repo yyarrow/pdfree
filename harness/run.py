@@ -269,13 +269,23 @@ def run_case(pdf_path: Path, work: Path):
 
 
 def run_case_varlen(pdf_path: Path, work: Path, case: str, rng):
-    """Variable-length probing through the model path (replace-run)."""
+    """Variable-length probing through the model path (replace-run).
+
+    An engine refusal (reflow/unencodable/encrypted) on one candidate is
+    NOT a verdict for the file — keep trying later candidates and page 2, so
+    one unsupported run doesn't hide a real corruption elsewhere. Returns
+    only on a judged edit (pass or fail); the last seen refusal is reported
+    if nothing was ever judged.
+    """
     out_pdf = work / f"{case}_out.pdf"
+    last_refusal = None
+    tried = 0
     for page in (1, 2):
         r = sh([str(ENGINE), "model", str(pdf_path), "--page", str(page)])
         if r.returncode != 0:
             continue
         for b, l, run_i, old, repl in pick_model_edits(r.stdout, rng):
+            tried += 1
             rr = sh([
                 str(ENGINE), "replace-run", str(pdf_path), str(out_pdf),
                 "--page", str(page), "--block", str(b), "--line", str(l), "--run", str(run_i),
@@ -284,12 +294,14 @@ def run_case_varlen(pdf_path: Path, work: Path, case: str, rng):
             if rr.returncode != 0:
                 err = rr.stderr.strip()[:200]
                 if "reflow" in err or "length differs" in err:
-                    return pdf_path.name, "fail_needs_reflow", f"{old!r}->{repl!r}"
-                if "encrypted" in err:
+                    last_refusal = ("fail_needs_reflow", f"{old!r}->{repl!r}")
+                elif "encrypted" in err:
                     return pdf_path.name, "skip_encrypted", None
-                if "cannot represent" in err:
-                    return pdf_path.name, "fail_unencodable", err
-                return pdf_path.name, "fail_engine_replace", err
+                elif "cannot represent" in err:
+                    last_refusal = ("fail_unencodable", err)
+                else:
+                    last_refusal = ("fail_engine_replace", err)
+                continue  # try the next candidate; don't let one refusal decide the file
             report = json.loads(rr.stdout)
             try:
                 verdict, diff = judge(case, pdf_path, out_pdf, page, report, old, repl, work)
@@ -305,7 +317,9 @@ def run_case_varlen(pdf_path: Path, work: Path, case: str, rng):
                 if diff is not None:
                     diff.save(dest / "diff.png")
                 return pdf_path.name, verdict, f"find={old!r} with={repl!r} page={page}"
-            return pdf_path.name, verdict, None
+            return pdf_path.name, verdict, None  # a judged pass
+    if last_refusal:
+        return pdf_path.name, last_refusal[0], last_refusal[1]
     return pdf_path.name, "skip_no_candidate", None
 
 
