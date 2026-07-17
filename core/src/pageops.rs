@@ -387,7 +387,9 @@ fn dest_hits(
 /// deleted page or pruned name can never be their referent. Gating on
 /// `/S == /GoTo` prevents wrongly stripping e.g. `<< /S /GoToR /F (x.pdf)
 /// /D (foo) >>` just because a local dest named `foo` was pruned (7.11.2,
-/// 12.6.4.2/.3). An action dict without a readable /S is treated as non-local.
+/// 12.6.4.2/.3). `/S` is dereferenced before comparison, since it may itself
+/// be an indirect reference to the name object. An action dict without a
+/// readable /S is treated as non-local.
 fn action_hits(
     doc: &Document,
     aobj: &Object,
@@ -397,7 +399,7 @@ fn action_hits(
     let Object::Dictionary(d) = deref(doc, aobj) else {
         return false;
     };
-    match d.get(b"S").ok().and_then(|s| s.as_name().ok()) {
+    match d.get(b"S").ok().map(|s| deref(doc, s)).and_then(|s| s.as_name().ok()) {
         Some(b"GoTo") => d
             .get(b"D")
             .map(|dd| dest_hits(doc, dd, deleted, dead_names))
@@ -704,19 +706,29 @@ fn scrub_annots(doc: &mut Document, deleted: &HashSet<ObjectId>, dead_names: &Ha
 }
 
 /// Replace every indirect reference to a deleted page object with null, across
-/// the entire object store. Page objects were removed from `doc.objects`, so
-/// any surviving `Reference` to one dangles (resolves to null) and trips
-/// validators. We cannot always know the semantic container — a destination
-/// array, a structure element's /Pg, a form widget's /P, an action we don't
-/// model — so we neutralize the *reference itself* to null, a value that is
-/// legal in every context and severs the link to the removed page. This is the
-/// last-resort backstop: the targeted scrubbers above give clean output for the
-/// sites they model, and this guarantees nothing at all still points at a
-/// removed page. Recurses through arrays/dicts/stream dicts; indirect
-/// references are not followed (each stored object is rewritten exactly once).
+/// the entire object store *and* the trailer dictionary. Page objects were
+/// removed from `doc.objects`, so any surviving `Reference` to one dangles
+/// (resolves to null) and trips validators. We cannot always know the
+/// semantic container — a destination array, a structure element's /Pg, a
+/// form widget's /P, an action we don't model, or even a private/extension
+/// trailer key — so we neutralize the *reference itself* to null, a value
+/// that is legal in every context and severs the link to the removed page.
+/// This is the last-resort backstop: the targeted scrubbers above give clean
+/// output for the sites they model, and this guarantees nothing at all —
+/// including the trailer — still points at a removed page. Recurses through
+/// arrays/dicts/stream dicts; indirect references are not followed (each
+/// stored object, and each trailer value, is rewritten exactly once).
+///
+/// The trailer's standard entries (/Root, /Info, /Size, /Prev, /Encrypt, ...)
+/// are never references to page objects, so `deleted.contains(id)` never
+/// matches them; only a trailer value that actually references a deleted
+/// page — e.g. a private/extension key — is affected.
 fn null_out_deleted_refs(doc: &mut Document, deleted: &HashSet<ObjectId>) {
     for obj in doc.objects.values_mut() {
         null_refs_in_object(obj, deleted);
+    }
+    for (_k, v) in doc.trailer.iter_mut() {
+        null_refs_in_object(v, deleted);
     }
 }
 
@@ -1247,6 +1259,83 @@ mod tests {
         assert_eq!(resolve_count(&doc, inter_id), 1, "intermediate /Count 2->1");
         assert_eq!(doc.get_pages().len(), 2);
         assert!(!doc.objects.contains_key(&p1));
+        assert_no_dangling(&doc);
+    }
+
+    /// Round-3 finding 1: a custom/private trailer key that references a
+    /// deleted page must be nulled by the document-wide sweep too, not just
+    /// entries under `doc.objects`. Mirrors the whole-document (incl. trailer)
+    /// scan the other tests already do via `all_references`/`refs_to`.
+    #[test]
+    fn delete_nulls_custom_trailer_ref_to_deleted_page() {
+        let (mut doc, _cat, _pages, pids) = flat_doc(2);
+        let p2 = pids[1];
+        // A private/extension trailer key pointing directly at the doomed page.
+        doc.trailer.set("PdfreePageRef", Object::Reference(p2));
+
+        delete_pages(&mut doc, &[2]).unwrap();
+
+        assert!(
+            matches!(doc.trailer.get(b"PdfreePageRef"), Ok(Object::Null)),
+            "trailer ref to the deleted page must be nulled, not left dangling"
+        );
+        assert_eq!(
+            refs_to(&doc, p2),
+            0,
+            "whole-document scan (including trailer) must find zero refs to the removed page"
+        );
+        assert_no_dangling(&doc);
+    }
+
+    /// Round-3 finding 2: `/S` on an action dict may itself be an indirect
+    /// reference to the `/GoTo` name object, rather than an inline name. Such
+    /// an action must still be recognized as a *local* GoTo and scrubbed when
+    /// its /D targets a deleted page/name — and a /GoToR action must still
+    /// survive regardless of how /S is encoded.
+    #[test]
+    fn delete_scrubs_action_with_indirect_s_name() {
+        let (mut doc, _cat, _pages, pids) = flat_doc(2);
+        let (p1, p2) = (pids[0], pids[1]);
+
+        // /S stored as an indirect reference to the name object `/GoTo`.
+        let s_goto_id = doc.add_object(Object::Name(b"GoTo".to_vec()));
+        let action = doc.add_object(dictionary! {
+            "S" => Object::Reference(s_goto_id),
+            "D" => goto_dest(p2),
+        });
+        let annot = doc.add_object(dictionary! {
+            "Subtype" => "Link", "A" => Object::Reference(action),
+        });
+
+        // Control: /S is also indirect but names /GoToR — must NOT be stripped.
+        let s_gotor_id = doc.add_object(Object::Name(b"GoToR".to_vec()));
+        let remote_action = doc.add_object(dictionary! {
+            "S" => Object::Reference(s_gotor_id),
+            "F" => Object::string_literal("x.pdf"),
+            "D" => Object::string_literal("foo"),
+        });
+        let remote_annot = doc.add_object(dictionary! {
+            "Subtype" => "Link", "A" => Object::Reference(remote_action),
+        });
+
+        set_key(
+            &mut doc,
+            p1,
+            "Annots",
+            Object::Array(vec![Object::Reference(annot), Object::Reference(remote_annot)]),
+        );
+
+        delete_pages(&mut doc, &[2]).unwrap();
+
+        assert!(
+            doc.get_dictionary(annot).unwrap().get(b"A").is_err(),
+            "local GoTo action with indirect /S must be scrubbed"
+        );
+        assert!(
+            doc.get_dictionary(remote_annot).unwrap().get(b"A").is_ok(),
+            "GoToR action with indirect /S must survive"
+        );
+        assert_eq!(refs_to(&doc, p2), 0);
         assert_no_dangling(&doc);
     }
 }
