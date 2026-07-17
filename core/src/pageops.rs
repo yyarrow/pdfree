@@ -185,45 +185,77 @@ pub fn delete_pages(doc: &mut Document, pages: &[u32]) -> Result<(), PageOpsErro
 }
 
 fn remove_page(doc: &mut Document, page_id: ObjectId) -> Result<(), PageOpsError> {
-    let parent_id = doc
+    // The page contributes 1 to the /Count of EVERY ancestor Pages node, not
+    // just its immediate parent, so a multi-level page tree needs the whole
+    // chain decremented (7.7.3.3: /Count is the number of leaf pages in the
+    // subtree). Collect the chain first (with a cycle guard).
+    let ancestors = ancestor_chain(doc, page_id)?;
+    let immediate_parent = *ancestors.first().ok_or(PageOpsError::Malformed("page missing /Parent"))?;
+
+    for &anc in &ancestors {
+        let dict = doc.get_object_mut(anc).and_then(Object::as_dict_mut)?;
+        let count = dict.get(b"Count").and_then(Object::as_i64).unwrap_or(1);
+        dict.set("Count", (count - 1).max(0));
+    }
+
+    remove_kid(doc, immediate_parent, page_id)?;
+    doc.objects.remove(&page_id);
+
+    // Prune ancestors that are now empty (walking up), but never the root.
+    for i in 0..ancestors.len() {
+        let node = ancestors[i];
+        let empty = doc
+            .get_dictionary(node)
+            .ok()
+            .and_then(|d| d.get(b"Kids").and_then(Object::as_array).ok())
+            .map(|k| k.is_empty())
+            .unwrap_or(false);
+        if !empty {
+            break; // once a non-empty node is reached, everything above stays
+        }
+        match ancestors.get(i + 1) {
+            Some(&gp) => {
+                remove_kid(doc, gp, node)?;
+                doc.objects.remove(&node);
+            }
+            None => break, // node is the tree root — always keep it
+        }
+    }
+    Ok(())
+}
+
+/// /Parent chain from `page_id`'s immediate parent up to the page-tree root
+/// (inclusive), with a cycle guard.
+fn ancestor_chain(doc: &Document, page_id: ObjectId) -> Result<Vec<ObjectId>, PageOpsError> {
+    let mut chain = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    seen.insert(page_id);
+    let mut cur = doc
         .get_dictionary(page_id)?
         .get(b"Parent")
         .and_then(Object::as_reference)
         .map_err(|_| PageOpsError::Malformed("page missing /Parent"))?;
-    remove_kid_and_prune(doc, parent_id, page_id)?;
-    doc.objects.remove(&page_id);
-    Ok(())
+    while seen.insert(cur) {
+        chain.push(cur);
+        match doc.get_dictionary(cur).ok().and_then(|d| d.get(b"Parent").and_then(Object::as_reference).ok()) {
+            Some(p) => cur = p,
+            None => break,
+        }
+    }
+    Ok(chain)
 }
 
-/// Remove `child_id` from `parent_id`'s /Kids, decrement /Count, and if the
-/// parent is left with no children, prune it from its own parent too
-/// (recursively) — unless it's the page-tree root, which we always keep.
-fn remove_kid_and_prune(doc: &mut Document, parent_id: ObjectId, child_id: ObjectId) -> Result<(), PageOpsError> {
-    let (remaining, grandparent) = {
-        let parent_dict = doc
-            .get_object_mut(parent_id)
-            .and_then(Object::as_dict_mut)
-            .map_err(|_| PageOpsError::Malformed("missing parent Pages dict"))?;
-        let kids = parent_dict
-            .get_mut(b"Kids")
-            .and_then(Object::as_array_mut)
-            .map_err(|_| PageOpsError::Malformed("Pages node missing /Kids"))?;
-        let before = kids.len();
-        kids.retain(|o| o.as_reference().map(|r| r != child_id).unwrap_or(true));
-        let remaining = kids.len();
-        let count = parent_dict.get(b"Count").and_then(Object::as_i64).unwrap_or(before as i64);
-        parent_dict.set("Count", (count - 1).max(0));
-        let gp = parent_dict.get(b"Parent").and_then(Object::as_reference).ok();
-        (remaining, gp)
-    };
-    if remaining == 0 {
-        if let Some(gp) = grandparent {
-            remove_kid_and_prune(doc, gp, parent_id)?;
-            doc.objects.remove(&parent_id);
-        }
-        // No grandparent means `parent_id` is the tree root; leave it be
-        // (unreachable in practice since we refuse deleting every page).
-    }
+/// Remove the reference to `child_id` from `parent_id`'s /Kids array.
+fn remove_kid(doc: &mut Document, parent_id: ObjectId, child_id: ObjectId) -> Result<(), PageOpsError> {
+    let parent_dict = doc
+        .get_object_mut(parent_id)
+        .and_then(Object::as_dict_mut)
+        .map_err(|_| PageOpsError::Malformed("missing parent Pages dict"))?;
+    let kids = parent_dict
+        .get_mut(b"Kids")
+        .and_then(Object::as_array_mut)
+        .map_err(|_| PageOpsError::Malformed("Pages node missing /Kids"))?;
+    kids.retain(|o| o.as_reference().map(|r| r != child_id).unwrap_or(true));
     Ok(())
 }
 
