@@ -380,16 +380,25 @@ fn dest_hits(
     }
 }
 
-/// Does an /A action target a deleted page? Only GoTo-style actions carry a
-/// local /D destination; remote/URI actions never reference a page object.
+/// Does an /A action target a deleted page? Only a *local* GoTo action carries
+/// a /D that names a destination in THIS document. Remote/embedded actions
+/// (`/GoToR`, `/GoToE`, `/Launch`, `/URI`, ...) also use /D, but it points into
+/// another file or is a page *number*, never a page object here — so a local
+/// deleted page or pruned name can never be their referent. Gating on
+/// `/S == /GoTo` prevents wrongly stripping e.g. `<< /S /GoToR /F (x.pdf)
+/// /D (foo) >>` just because a local dest named `foo` was pruned (7.11.2,
+/// 12.6.4.2/.3). An action dict without a readable /S is treated as non-local.
 fn action_hits(
     doc: &Document,
     aobj: &Object,
     deleted: &HashSet<ObjectId>,
     dead_names: &HashSet<Vec<u8>>,
 ) -> bool {
-    match deref(doc, aobj) {
-        Object::Dictionary(d) => d
+    let Object::Dictionary(d) = deref(doc, aobj) else {
+        return false;
+    };
+    match d.get(b"S").ok().and_then(|s| s.as_name().ok()) {
+        Some(b"GoTo") => d
             .get(b"D")
             .map(|dd| dest_hits(doc, dd, deleted, dead_names))
             .unwrap_or(false),
@@ -398,10 +407,21 @@ fn action_hits(
 }
 
 /// After pages are removed from the /Pages tree, scrub every remaining
-/// reference to a deleted page's ObjectId: outline destinations, named
-/// destinations, and link-annotation actions on surviving pages. A reference
-/// to a nonexistent object is technically legal (resolves to null) but breaks
-/// navigation and trips validators, so we neutralize it.
+/// reference to a deleted page's ObjectId. A reference to a nonexistent object
+/// is technically legal (resolves to null) but breaks navigation and trips
+/// validators, so we neutralize it.
+///
+/// Two layers:
+///  1. *Targeted* cleanup of the navigation sites the spec defines — named
+///     destinations, outline items, the catalog /OpenAction and /AA, and /AA
+///     plus /Dest//A on surviving pages and their annotations — so the output
+///     is clean (dead keys removed, not just nulled) and by-name references to
+///     pruned named destinations are caught too.
+///  2. A *document-wide null-sweep* that replaces any lingering indirect
+///     reference to a deleted page — anywhere, including form fields, the
+///     structure tree, orphaned destination objects, or sites we don't model —
+///     with null. This is the correctness backstop: after it runs, a
+///     whole-document scan finds ZERO references to any removed page object.
 fn scrub_deleted_refs(doc: &mut Document, deleted: &HashSet<ObjectId>) -> Result<(), PageOpsError> {
     if deleted.is_empty() {
         return Ok(());
@@ -410,15 +430,51 @@ fn scrub_deleted_refs(doc: &mut Document, deleted: &HashSet<ObjectId>) -> Result
     // tells us which named destinations died, so references-by-name elsewhere
     // can be neutralized too.
     let dead_names = scrub_named_dests(doc, deleted);
+    scrub_catalog(doc, deleted, &dead_names);
     scrub_outlines(doc, deleted, &dead_names);
     scrub_annots(doc, deleted, &dead_names);
+    // Backstop: guarantee no surviving object still points at a removed page.
+    null_out_deleted_refs(doc, deleted);
     Ok(())
+}
+
+/// Neutralize document-level navigation on the catalog: the /OpenAction
+/// (7.7.2 — a destination or an action shown when the document opens) and the
+/// /AA additional-actions dictionary, when they target a deleted page or a
+/// pruned named destination.
+fn scrub_catalog(doc: &mut Document, deleted: &HashSet<ObjectId>, dead_names: &HashSet<Vec<u8>>) {
+    let Some(cat_id) = doc
+        .trailer
+        .get(b"Root")
+        .ok()
+        .and_then(|o| o.as_reference().ok())
+    else {
+        return;
+    };
+    // /OpenAction may be an explicit destination OR an action dictionary; strip
+    // it if either interpretation targets a deleted page / dead name. (A remote
+    // action like /GoToR is rejected by both predicates, so it is left intact.)
+    let strip_oa = doc
+        .get_dictionary(cat_id)
+        .ok()
+        .and_then(|d| d.get(b"OpenAction").ok())
+        .map(|oa| dest_hits(doc, oa, deleted, dead_names) || action_hits(doc, oa, deleted, dead_names))
+        .unwrap_or(false);
+    if strip_oa
+        && let Ok(d) = doc.get_object_mut(cat_id).and_then(Object::as_dict_mut)
+    {
+        d.remove(b"OpenAction");
+    }
+    // Document-level /AA (and, harmlessly, any /Dest//A the catalog shouldn't have).
+    neutralize_item(doc, cat_id, deleted, dead_names);
 }
 
 /// Prune entries whose destination targets a deleted page from the catalog's
 /// destination name tree (`/Names /Dests`) and the legacy `/Dests` dictionary.
-/// Removes the now-orphaned destination value objects too, and returns the set
-/// of destination names that were pruned.
+/// Leaves the now-orphaned destination value objects in place (they may be
+/// shared; the null-sweep severs any deleted-page reference inside them), and
+/// returns the set of destination names that were pruned so references-by-name
+/// elsewhere can be neutralized.
 fn scrub_named_dests(doc: &mut Document, deleted: &HashSet<ObjectId>) -> HashSet<Vec<u8>> {
     let mut dead_names: HashSet<Vec<u8>> = HashSet::new();
 
@@ -456,7 +512,6 @@ fn scrub_named_dests(doc: &mut Document, deleted: &HashSet<ObjectId>) -> HashSet
             _ => None,
         };
         let mut kept: Vec<Object> = Vec::with_capacity(arr.len());
-        let mut orphans: Vec<ObjectId> = Vec::new();
         let mut i = 0;
         while i + 1 < arr.len() {
             let key = &arr[i];
@@ -468,9 +523,10 @@ fn scrub_named_dests(doc: &mut Document, deleted: &HashSet<ObjectId>) -> HashSet
                 if let Some(k) = key_bytes(key) {
                     dead_names.insert(k);
                 }
-                if let Object::Reference(id) = val {
-                    orphans.push(*id);
-                }
+                // Do not remove the value object: it may be shared (e.g. an
+                // outline /Dest referencing the same dict). Dropping the entry
+                // from the /Names array is enough; the null-sweep severs any
+                // deleted-page reference still inside the orphaned value.
             } else {
                 kept.push(key.clone());
                 kept.push(val.clone());
@@ -496,9 +552,6 @@ fn scrub_named_dests(doc: &mut Document, deleted: &HashSet<ObjectId>) -> HashSet
         {
             d.remove(b"Limits");
         }
-        for o in orphans {
-            doc.objects.remove(&o);
-        }
     }
 
     // Legacy /Dests dict: remove dead keys and orphan their value objects.
@@ -507,24 +560,19 @@ fn scrub_named_dests(doc: &mut Document, deleted: &HashSet<ObjectId>) -> HashSet
             Ok(d) => d.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
             Err(_) => Vec::new(),
         };
-        let mut orphans: Vec<ObjectId> = Vec::new();
         let mut dead_keys: Vec<Vec<u8>> = Vec::new();
         for (k, v) in &entries {
             if dest_page_ref(doc, v).map(|r| deleted.contains(&r)).unwrap_or(false) {
                 dead_keys.push(k.clone());
                 dead_names.insert(k.clone());
-                if let Object::Reference(rid) = v {
-                    orphans.push(*rid);
-                }
+                // Value object left in place (may be shared); see the name-tree
+                // branch above. The null-sweep severs any deleted-page reference.
             }
         }
         if let Ok(d) = doc.get_object_mut(id).and_then(Object::as_dict_mut) {
             for k in &dead_keys {
                 d.remove(k);
             }
-        }
-        for o in orphans {
-            doc.objects.remove(&o);
         }
     }
 
@@ -592,40 +640,47 @@ fn scrub_outlines(doc: &mut Document, deleted: &HashSet<ObjectId>, dead_names: &
     }
 }
 
-/// Collect every node reachable from the Outlines root via /First and /Next
-/// (recursing into children). The root itself carries no destination, so
-/// including it is harmless. Cycle-guarded by node id.
+/// Collect every node reachable from the Outlines root via /First and /Next.
+/// The root itself carries no destination, so including it is harmless.
+///
+/// Siblings form a /Next linked list that can be tens of thousands long; we
+/// walk it *iteratively* so recursion depth is bounded by real tree depth
+/// (nesting via /First), not sibling count — a per-sibling recursion would
+/// blow the stack on a flat outline. Cycle-guarded by node id.
 fn collect_outline_items(
     doc: &Document,
-    node_id: ObjectId,
+    start_id: ObjectId,
     out: &mut Vec<ObjectId>,
     visited: &mut HashSet<ObjectId>,
 ) {
-    if !visited.insert(node_id) {
-        return;
-    }
-    out.push(node_id);
-    let dict = match doc.get_dictionary(node_id) {
-        Ok(d) => d,
-        Err(_) => return,
-    };
-    let first = dict.get(b"First").ok().and_then(|o| o.as_reference().ok());
-    let next = dict.get(b"Next").ok().and_then(|o| o.as_reference().ok());
-    if let Some(f) = first {
-        collect_outline_items(doc, f, out, visited);
-    }
-    if let Some(n) = next {
-        collect_outline_items(doc, n, out, visited);
+    let mut cur = Some(start_id);
+    while let Some(node_id) = cur {
+        if !visited.insert(node_id) {
+            break;
+        }
+        out.push(node_id);
+        let dict = match doc.get_dictionary(node_id) {
+            Ok(d) => d,
+            Err(_) => break,
+        };
+        let first = dict.get(b"First").ok().and_then(|o| o.as_reference().ok());
+        let next = dict.get(b"Next").ok().and_then(|o| o.as_reference().ok());
+        // Recurse only into children (bounded by tree depth); loop across siblings.
+        if let Some(f) = first {
+            collect_outline_items(doc, f, out, visited);
+        }
+        cur = next;
     }
 }
 
-/// Neutralize link annotations on surviving pages whose /Dest or /A targets a
-/// deleted page.
+/// Neutralize navigation on surviving pages: each page's own /AA (additional
+/// actions, e.g. /O open, /C close — 12.6.3) and every link annotation whose
+/// /Dest, /A, or /AA targets a deleted page.
 fn scrub_annots(doc: &mut Document, deleted: &HashSet<ObjectId>, dead_names: &HashSet<Vec<u8>>) {
     // get_pages() now returns only surviving pages.
     let page_ids: Vec<ObjectId> = doc.get_pages().into_values().collect();
     let mut annot_ids: Vec<ObjectId> = Vec::new();
-    for pid in page_ids {
+    for &pid in &page_ids {
         let annots = doc
             .get_dictionary(pid)
             .ok()
@@ -639,57 +694,142 @@ fn scrub_annots(doc: &mut Document, deleted: &HashSet<ObjectId>, dead_names: &Ha
             }
         }
     }
+    // Page-level /AA on the surviving pages themselves.
+    for pid in page_ids {
+        neutralize_item(doc, pid, deleted, dead_names);
+    }
     for id in annot_ids {
         neutralize_item(doc, id, deleted, dead_names);
     }
 }
 
-/// Strip a /Dest and/or /A whose destination targets a deleted page from the
-/// dict `id` (an outline item or annotation). Also removes an orphaned
-/// destination/action object that was referenced solely from the stripped key.
+/// Replace every indirect reference to a deleted page object with null, across
+/// the entire object store. Page objects were removed from `doc.objects`, so
+/// any surviving `Reference` to one dangles (resolves to null) and trips
+/// validators. We cannot always know the semantic container — a destination
+/// array, a structure element's /Pg, a form widget's /P, an action we don't
+/// model — so we neutralize the *reference itself* to null, a value that is
+/// legal in every context and severs the link to the removed page. This is the
+/// last-resort backstop: the targeted scrubbers above give clean output for the
+/// sites they model, and this guarantees nothing at all still points at a
+/// removed page. Recurses through arrays/dicts/stream dicts; indirect
+/// references are not followed (each stored object is rewritten exactly once).
+fn null_out_deleted_refs(doc: &mut Document, deleted: &HashSet<ObjectId>) {
+    for obj in doc.objects.values_mut() {
+        null_refs_in_object(obj, deleted);
+    }
+}
+
+fn null_refs_in_object(obj: &mut Object, deleted: &HashSet<ObjectId>) {
+    match obj {
+        Object::Reference(id) if deleted.contains(id) => {
+            *obj = Object::Null;
+        }
+        Object::Array(a) => {
+            for o in a.iter_mut() {
+                null_refs_in_object(o, deleted);
+            }
+        }
+        Object::Dictionary(d) => {
+            for (_k, v) in d.iter_mut() {
+                null_refs_in_object(v, deleted);
+            }
+        }
+        Object::Stream(s) => {
+            for (_k, v) in s.dict.iter_mut() {
+                null_refs_in_object(v, deleted);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Strip navigation entries whose destination targets a deleted page or a
+/// pruned named destination from the dict `id` (an outline item, annotation,
+/// page, or catalog): the /Dest, the /A action, and any /AA (additional-
+/// actions) sub-action that hits. Empty /AA dicts are dropped.
+///
+/// It only ever removes *keys from this dict*. It does NOT remove the
+/// referenced destination/action objects, because a single indirect
+/// dest/action object may be legally shared by several sites (7.11.4);
+/// eagerly deleting it while processing one sharer would dangle every other
+/// sharer's reference. Orphaned dest/action objects are left in place
+/// (harmless — a later gc pass could collect the truly-unreferenced ones),
+/// and any page reference still living inside them is severed by the
+/// document-wide null-sweep in `scrub_deleted_refs`.
 fn neutralize_item(
     doc: &mut Document,
     id: ObjectId,
     deleted: &HashSet<ObjectId>,
     dead_names: &HashSet<Vec<u8>>,
 ) {
-    let (strip_dest, strip_a, orphans) = {
+    let (strip_dest, strip_a, dead_aa_events, drop_aa) = {
         let dict = match doc.get_dictionary(id) {
             Ok(d) => d,
             Err(_) => return,
         };
-        let mut orphans: Vec<ObjectId> = Vec::new();
-        let mut strip_dest = false;
-        let mut strip_a = false;
-        if let Ok(dest) = dict.get(b"Dest")
-            && dest_hits(doc, dest, deleted, dead_names)
+        let strip_dest = dict
+            .get(b"Dest")
+            .map(|dest| dest_hits(doc, dest, deleted, dead_names))
+            .unwrap_or(false);
+        let strip_a = dict
+            .get(b"A")
+            .map(|a| action_hits(doc, a, deleted, dead_names))
+            .unwrap_or(false);
+        // /AA is a dictionary of event-name -> action; drop each event whose
+        // action targets a deleted page, and the whole /AA if none survive.
+        let mut dead_aa_events: Vec<Vec<u8>> = Vec::new();
+        let mut drop_aa = false;
+        if let Ok(aa) = dict.get(b"AA")
+            && let Object::Dictionary(aad) = deref(doc, aa)
         {
-            strip_dest = true;
-            if let Object::Reference(rid) = dest {
-                orphans.push(*rid);
+            let mut live = 0usize;
+            for (ev, act) in aad.iter() {
+                if action_hits(doc, act, deleted, dead_names) {
+                    dead_aa_events.push(ev.clone());
+                } else {
+                    live += 1;
+                }
             }
+            drop_aa = live == 0 && !dead_aa_events.is_empty();
         }
-        if let Ok(a) = dict.get(b"A")
-            && action_hits(doc, a, deleted, dead_names)
-        {
-            strip_a = true;
-            if let Object::Reference(rid) = a {
-                orphans.push(*rid);
-            }
-        }
-        (strip_dest, strip_a, orphans)
+        (strip_dest, strip_a, dead_aa_events, drop_aa)
     };
-    if strip_dest || strip_a {
-        if let Ok(dict) = doc.get_object_mut(id).and_then(Object::as_dict_mut) {
-            if strip_dest {
-                dict.remove(b"Dest");
-            }
-            if strip_a {
-                dict.remove(b"A");
+    if !strip_dest && !strip_a && dead_aa_events.is_empty() {
+        return;
+    }
+    // If /AA is an indirect dictionary object, edit that object; otherwise it is
+    // inline in this dict. Resolve its id (if any) before taking the mut borrow.
+    let aa_ref = if drop_aa || dead_aa_events.is_empty() {
+        None
+    } else {
+        match doc.get_dictionary(id).ok().and_then(|d| d.get(b"AA").ok()) {
+            Some(Object::Reference(rid)) => Some(*rid),
+            _ => None,
+        }
+    };
+    if let Ok(dict) = doc.get_object_mut(id).and_then(Object::as_dict_mut) {
+        if strip_dest {
+            dict.remove(b"Dest");
+        }
+        if strip_a {
+            dict.remove(b"A");
+        }
+        if drop_aa {
+            dict.remove(b"AA");
+        } else if aa_ref.is_none()
+            && let Ok(aad) = dict.get_mut(b"AA").and_then(Object::as_dict_mut)
+        {
+            for ev in &dead_aa_events {
+                aad.remove(ev);
             }
         }
-        for o in orphans {
-            doc.objects.remove(&o);
+    }
+    if let Some(rid) = aa_ref
+        && let Ok(aad) = doc.get_object_mut(rid).and_then(Object::as_dict_mut)
+    {
+        for ev in &dead_aa_events {
+            aad.remove(ev);
         }
     }
 }
@@ -827,5 +967,286 @@ mod tests {
     #[test]
     fn parse_page_spec_valid_range() {
         assert_eq!(parse_page_spec("1-3", 5).unwrap(), vec![1, 2, 3]);
+    }
+
+    // ---- delete-pages / dangling-reference tests -------------------------
+
+    /// Build a doc with `n` pages under a single flat /Pages node. Returns the
+    /// doc plus the catalog id, pages-node id, and page ids in order.
+    fn flat_doc(n: usize) -> (Document, ObjectId, ObjectId, Vec<ObjectId>) {
+        let mut doc = Document::with_version("1.5");
+        let pages_id = doc.new_object_id();
+        let mut page_ids = Vec::new();
+        for _ in 0..n {
+            let pid = doc.add_object(dictionary! {
+                "Type" => "Page",
+                "Parent" => pages_id,
+                "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+            });
+            page_ids.push(pid);
+        }
+        let kids: Vec<Object> = page_ids.iter().map(|&id| id.into()).collect();
+        doc.objects.insert(
+            pages_id,
+            Object::Dictionary(dictionary! {
+                "Type" => "Pages",
+                "Kids" => kids,
+                "Count" => n as i64,
+            }),
+        );
+        let catalog_id = doc.add_object(dictionary! {
+            "Type" => "Catalog",
+            "Pages" => pages_id,
+        });
+        doc.trailer.set("Root", catalog_id);
+        (doc, catalog_id, pages_id, page_ids)
+    }
+
+    fn set_key(doc: &mut Document, id: ObjectId, key: &str, val: Object) {
+        doc.get_object_mut(id)
+            .and_then(Object::as_dict_mut)
+            .unwrap()
+            .set(key, val);
+    }
+
+    /// Every indirect reference held anywhere in the object store + trailer.
+    fn all_references(doc: &Document) -> Vec<ObjectId> {
+        fn walk(o: &Object, refs: &mut Vec<ObjectId>) {
+            match o {
+                Object::Reference(id) => refs.push(*id),
+                Object::Array(a) => a.iter().for_each(|x| walk(x, refs)),
+                Object::Dictionary(d) => d.iter().for_each(|(_, v)| walk(v, refs)),
+                Object::Stream(s) => s.dict.iter().for_each(|(_, v)| walk(v, refs)),
+                _ => {}
+            }
+        }
+        let mut refs = Vec::new();
+        for o in doc.objects.values() {
+            walk(o, &mut refs);
+        }
+        for (_, v) in doc.trailer.iter() {
+            walk(v, &mut refs);
+        }
+        refs
+    }
+
+    fn refs_to(doc: &Document, id: ObjectId) -> usize {
+        all_references(doc).iter().filter(|r| **r == id).count()
+    }
+
+    /// Assert every reference in the document resolves to a stored object.
+    fn assert_no_dangling(doc: &Document) {
+        for r in all_references(doc) {
+            assert!(
+                doc.objects.contains_key(&r),
+                "dangling reference to {r:?} (object not in store)"
+            );
+        }
+    }
+
+    fn goto_dest(page: ObjectId) -> Object {
+        Object::Array(vec![Object::Reference(page), Object::Name(b"Fit".to_vec())])
+    }
+
+    fn goto_action(page: ObjectId) -> Dictionary {
+        dictionary! { "S" => "GoTo", "D" => goto_dest(page) }
+    }
+
+    /// Finding 1: catalog /OpenAction, catalog /AA and page /AA that target a
+    /// deleted page are neutralized, and a whole-doc scan shows zero refs.
+    #[test]
+    fn delete_neutralizes_open_action_and_additional_actions() {
+        let (mut doc, cat, _pages, pids) = flat_doc(3);
+        let (p1, p2) = (pids[0], pids[1]);
+        // Catalog /OpenAction -> explicit destination on the doomed page.
+        set_key(&mut doc, cat, "OpenAction", goto_dest(p2));
+        // Catalog document-level /AA with one event pointing at the doomed page.
+        let cat_aa = Object::Dictionary(dictionary! { "WC" => Object::Dictionary(goto_action(p2)) });
+        set_key(&mut doc, cat, "AA", cat_aa);
+        // Page /AA on a surviving page pointing at the doomed page.
+        let pg_aa = Object::Dictionary(dictionary! { "O" => Object::Dictionary(goto_action(p2)) });
+        set_key(&mut doc, p1, "AA", pg_aa);
+
+        delete_pages(&mut doc, &[2]).unwrap();
+
+        assert!(!doc.objects.contains_key(&p2), "page object removed");
+        let cat_dict = doc.get_dictionary(cat).unwrap();
+        assert!(cat_dict.get(b"OpenAction").is_err(), "/OpenAction stripped");
+        assert!(cat_dict.get(b"AA").is_err(), "empty catalog /AA dropped");
+        assert!(
+            doc.get_dictionary(p1).unwrap().get(b"AA").is_err(),
+            "empty page /AA dropped"
+        );
+        assert_eq!(refs_to(&doc, p2), 0, "zero references to the removed page");
+        assert_no_dangling(&doc);
+    }
+
+    /// Finding 2: a 50k-long /Next sibling chain must be walked iteratively —
+    /// a per-sibling recursion would overflow the (2 MiB) test-thread stack.
+    #[test]
+    fn delete_with_huge_outline_next_chain_does_not_overflow() {
+        let (mut doc, cat, _pages, pids) = flat_doc(2);
+        let p1 = pids[0];
+        let root_id = doc.new_object_id();
+        let n = 50_000usize;
+        let item_ids: Vec<ObjectId> = (0..n).map(|_| doc.new_object_id()).collect();
+        for i in 0..n {
+            let mut d = dictionary! { "Parent" => root_id, "Dest" => goto_dest(p1) };
+            if i + 1 < n {
+                d.set("Next", Object::Reference(item_ids[i + 1]));
+            }
+            if i > 0 {
+                d.set("Prev", Object::Reference(item_ids[i - 1]));
+            }
+            doc.objects.insert(item_ids[i], Object::Dictionary(d));
+        }
+        doc.objects.insert(
+            root_id,
+            Object::Dictionary(dictionary! {
+                "Type" => "Outlines",
+                "First" => item_ids[0],
+                "Last" => item_ids[n - 1],
+                "Count" => n as i64,
+            }),
+        );
+        set_key(&mut doc, cat, "Outlines", Object::Reference(root_id));
+
+        // Deleting page 2 forces a full outline walk; must simply complete.
+        delete_pages(&mut doc, &[2]).unwrap();
+        assert_eq!(doc.get_pages().len(), 1);
+        assert_no_dangling(&doc);
+    }
+
+    /// Finding 3: one indirect action object shared by two annotations must not
+    /// be deleted out from under the second sharer.
+    #[test]
+    fn delete_keeps_shared_action_object_and_leaves_no_dangling() {
+        let (mut doc, _cat, _pages, pids) = flat_doc(2);
+        let (p1, p2) = (pids[0], pids[1]);
+        let action_id = doc.add_object(goto_action(p2));
+        let annot1 = doc.add_object(dictionary! {
+            "Subtype" => "Link", "A" => Object::Reference(action_id),
+        });
+        let annot2 = doc.add_object(dictionary! {
+            "Subtype" => "Link", "A" => Object::Reference(action_id),
+        });
+        set_key(
+            &mut doc,
+            p1,
+            "Annots",
+            Object::Array(vec![Object::Reference(annot1), Object::Reference(annot2)]),
+        );
+
+        delete_pages(&mut doc, &[2]).unwrap();
+
+        // The shared object survives (only orphaned), and BOTH annotations had
+        // their now-dead /A stripped — neither dangles at a removed object.
+        assert!(
+            doc.objects.contains_key(&action_id),
+            "shared action object must not be removed while a sharer might still reference it"
+        );
+        assert!(doc.get_dictionary(annot1).unwrap().get(b"A").is_err());
+        assert!(doc.get_dictionary(annot2).unwrap().get(b"A").is_err());
+        assert_eq!(refs_to(&doc, p2), 0, "no reference to the removed page anywhere");
+        assert_no_dangling(&doc);
+    }
+
+    /// Finding 4: a remote /GoToR action naming a dest that collides with a
+    /// pruned *local* name must NOT be stripped (its /D lives in another file).
+    #[test]
+    fn delete_does_not_strip_remote_gotor_action() {
+        let (mut doc, cat, _pages, pids) = flat_doc(2);
+        let (p1, p2) = (pids[0], pids[1]);
+        // Local named destination "foo" -> doomed page, in the /Names dest tree.
+        let leaf_id = doc.add_object(dictionary! {
+            "Names" => Object::Array(vec![Object::string_literal("foo"), goto_dest(p2)]),
+            "Limits" => Object::Array(vec![Object::string_literal("foo"), Object::string_literal("foo")]),
+        });
+        let names_id = doc.add_object(dictionary! { "Dests" => Object::Reference(leaf_id) });
+        set_key(&mut doc, cat, "Names", Object::Reference(names_id));
+
+        // Remote GoToR whose /D (foo) targets *another* document.
+        let gotor = doc.add_object(dictionary! {
+            "S" => "GoToR",
+            "F" => Object::string_literal("other.pdf"),
+            "D" => Object::string_literal("foo"),
+        });
+        let remote_annot = doc.add_object(dictionary! {
+            "Subtype" => "Link", "A" => Object::Reference(gotor),
+        });
+        // Control: a LOCAL GoTo naming the same (now dead) local dest -> stripped.
+        let goto_local = doc.add_object(dictionary! {
+            "S" => "GoTo", "D" => Object::string_literal("foo"),
+        });
+        let local_annot = doc.add_object(dictionary! {
+            "Subtype" => "Link", "A" => Object::Reference(goto_local),
+        });
+        set_key(
+            &mut doc,
+            p1,
+            "Annots",
+            Object::Array(vec![Object::Reference(remote_annot), Object::Reference(local_annot)]),
+        );
+
+        delete_pages(&mut doc, &[2]).unwrap();
+
+        assert!(
+            doc.get_dictionary(remote_annot).unwrap().get(b"A").is_ok(),
+            "remote /GoToR action must be preserved"
+        );
+        assert!(
+            doc.get_dictionary(local_annot).unwrap().get(b"A").is_err(),
+            "local /GoTo naming a pruned dest must be stripped"
+        );
+        assert_no_dangling(&doc);
+    }
+
+    /// A bookmarked page: deleting it strips the outline /Dest and leaves no
+    /// dangling reference (mirrors the TAMReview corpus regression).
+    #[test]
+    fn delete_bookmarked_page_scrubs_outline() {
+        let (mut doc, cat, _pages, pids) = flat_doc(3);
+        let p2 = pids[1];
+        let item = doc.add_object(dictionary! { "Title" => Object::string_literal("Ch2"), "Dest" => goto_dest(p2) });
+        let root = doc.add_object(dictionary! {
+            "Type" => "Outlines", "First" => item, "Last" => item, "Count" => 1,
+        });
+        set_key(&mut doc, item, "Parent", Object::Reference(root));
+        set_key(&mut doc, cat, "Outlines", Object::Reference(root));
+
+        delete_pages(&mut doc, &[2]).unwrap();
+
+        assert!(doc.get_dictionary(item).unwrap().get(b"Dest").is_err(), "outline /Dest stripped");
+        assert_eq!(refs_to(&doc, p2), 0);
+        assert_no_dangling(&doc);
+    }
+
+    /// Multi-level page tree: deleting a leaf decrements /Count on the whole
+    /// ancestor chain (3->2 at root, 2->1 at the intermediate node).
+    #[test]
+    fn delete_updates_count_up_multi_level_tree() {
+        let mut doc = Document::with_version("1.5");
+        let root_id = doc.new_object_id();
+        let inter_id = doc.new_object_id();
+        let p1 = doc.add_object(dictionary! { "Type" => "Page", "Parent" => inter_id, "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()] });
+        let p2 = doc.add_object(dictionary! { "Type" => "Page", "Parent" => inter_id, "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()] });
+        let p3 = doc.add_object(dictionary! { "Type" => "Page", "Parent" => root_id, "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()] });
+        doc.objects.insert(inter_id, Object::Dictionary(dictionary! {
+            "Type" => "Pages", "Parent" => root_id,
+            "Kids" => vec![p1.into(), p2.into()], "Count" => 2,
+        }));
+        doc.objects.insert(root_id, Object::Dictionary(dictionary! {
+            "Type" => "Pages", "Kids" => vec![inter_id.into(), p3.into()], "Count" => 3,
+        }));
+        let cat = doc.add_object(dictionary! { "Type" => "Catalog", "Pages" => root_id });
+        doc.trailer.set("Root", cat);
+
+        delete_pages(&mut doc, &[1]).unwrap();
+
+        assert_eq!(resolve_count(&doc, root_id), 2, "root /Count 3->2");
+        assert_eq!(resolve_count(&doc, inter_id), 1, "intermediate /Count 2->1");
+        assert_eq!(doc.get_pages().len(), 2);
+        assert!(!doc.objects.contains_key(&p1));
+        assert_no_dangling(&doc);
     }
 }
