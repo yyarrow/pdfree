@@ -285,10 +285,12 @@ pub(crate) fn replace_run_reflow(
         * sp.h_scale
         * x_scale;
     // Our CID advance is a fabricated chars*1000/em placeholder, not the
-    // descendant font's real /W metrics — a proportional Type0 font would
-    // shift following runs by the wrong distance. Refuse CID reflow until
-    // /W parsing lands (same-length CID never computes a delta, so it's safe).
-    if plan.cid {
+    // descendant font's real /W metrics. This poisons BOTH sides of the
+    // delta: the chosen font (new_w) AND the original run, whose glyph
+    // positions — and thus old_w's span — were laid out with the fabricated
+    // width even when the replacement font is simple. Refuse if either the
+    // chosen or any source-run font is CID (until /W parsing lands).
+    if plan.cid || run_segs.iter().any(|&si| segs[si].cid) {
         return Err(ReplaceError::NeedsReflow);
     }
     let delta = new_w - old_w;
