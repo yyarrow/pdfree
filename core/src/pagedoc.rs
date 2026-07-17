@@ -4,8 +4,8 @@
 //! Written purely against ISO 32000 (7.7.3 "Document Catalog"/"Page Tree")
 //! and the lopdf (MIT) API; no GPL/AGPL PDF source was consulted.
 
-use lopdf::{Dictionary, Document, Object, ObjectId};
-use std::collections::{HashMap, HashSet};
+use lopdf::{Dictionary, Document, Object, ObjectId, StringFormat};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
 
 #[derive(Debug, thiserror::Error)]
@@ -24,6 +24,10 @@ pub enum PageDocError {
     BadRangeSpec(String),
     #[error("page selection is empty")]
     EmptySelection,
+    /// A document-level table cannot be combined across inputs without losing
+    /// what it describes. Refuse the merge instead of dropping it silently.
+    #[error("cannot merge {0} across documents; the merge would lose it")]
+    UnmergeableCatalog(&'static str),
 }
 
 /// Refuse encrypted documents (same guard as text editing): lopdf's writer
@@ -43,11 +47,12 @@ pub fn merge(inputs: &[PathBuf]) -> Result<Document, PageDocError> {
     let pages_id = out.new_object_id();
     let mut kids = Vec::new();
     // Document-level catalog data (named dests, AcroForm, optional content, ...)
-    // carried onto the output catalog. See the multi-input policy note below.
+    // carried onto the output catalog. See the carry-over policy note below.
     let mut extra_catalog: Vec<(Vec<u8>, Object)> = Vec::new();
     let single_input = inputs.len() == 1;
+    let mut merger = CatalogMerger::default();
 
-    for path in inputs.iter() {
+    for (input, path) in inputs.iter().enumerate() {
         let src = crate::load_with_salvage(path).map_err(|e| PageDocError::Load(path.clone(), e))?;
         check_not_encrypted(&src)?;
 
@@ -56,6 +61,12 @@ pub fn merge(inputs: &[PathBuf]) -> Result<Document, PageDocError> {
         // share a Resources/font dict dedupe onto the same copied object.
         let mut id_map = HashMap::new();
         let pages = src.get_pages();
+
+        // Every object this input contributes to `out` gets an id above this
+        // mark (lopdf hands out ids by incrementing `max_id`). That is how a
+        // destination renamed for collision (below) is rewritten in THIS
+        // input's copied objects only, leaving earlier inputs untouched.
+        let id_floor = out.max_id;
 
         // Pre-register every source page id -> a fresh output id BEFORE copying
         // anything, and record the set of copyable page ids. A page reached
@@ -71,9 +82,10 @@ pub fn merge(inputs: &[PathBuf]) -> Result<Document, PageDocError> {
             id_map.insert(page_id, new_id);
             page_set.insert(page_id);
         }
+        let ctx = PruneCtx::new(&src, page_set);
         for (_, &page_id) in &pages {
             let new_id = id_map[&page_id];
-            copy_page_into(&src, page_id, new_id, &mut out, &mut id_map, &page_set)?;
+            copy_page_into(&src, page_id, new_id, &mut out, &mut id_map, &ctx)?;
             if let Ok(dict) = out.get_object_mut(new_id).and_then(Object::as_dict_mut) {
                 dict.set("Parent", Object::Reference(pages_id));
             }
@@ -81,23 +93,28 @@ pub fn merge(inputs: &[PathBuf]) -> Result<Document, PageDocError> {
         }
 
         // Catalog carry-over policy (finding 1):
-        //  - Single input: carry its document-level tables (pruned; nothing is
-        //    excluded, so pruning is a no-op).
-        //  - Multi-input merge: carry NOTHING. Cross-document merging of
-        //    /AcroForm /Fields, /Names destination trees and /OCProperties
-        //    /OCGs cannot be done without field-name / dest-name / OCG-id
-        //    collisions, and carrying only the FIRST input's tables (the prior
-        //    behavior) left inputs 2..N's widgets/OCGs referencing table
-        //    entries that were never emitted. Dropping the tables keeps every
-        //    widget/OCG reference resolvable — the field and OCG objects are
-        //    still copied via the pages that reference them, so there are no
-        //    dangling refs — at the cost of document-level form / optional-
-        //    content / named-navigation registration. Known limitation.
+        //  - Single input: carry its document-level tables verbatim (pruned;
+        //    nothing is excluded, so pruning is a no-op).
+        //  - Multi-input: MERGE them (CatalogMerger). Concatenating /AcroForm
+        //    /Fields and unioning /OCProperties /OCGs is well defined; named
+        //    destinations are unioned with colliding names suffixed and every
+        //    reference to a renamed one rewritten. A table that cannot be
+        //    combined without losing what it describes (an XFA form, alternate
+        //    optional-content configurations) fails the merge with
+        //    UnmergeableCatalog rather than being dropped silently — the old
+        //    behavior (carry the first input's tables, or none at all) lost
+        //    inputs 2..N's interactive fields, OCG visibility and named dests
+        //    without a word.
         if single_input {
-            extra_catalog = collect_carried_catalog(&src, &mut id_map, &mut out, &page_set);
+            extra_catalog = collect_carried_catalog(&src, &mut id_map, &mut out, &ctx);
+        } else {
+            merger.add_source(&src, &mut out, &mut id_map, &ctx, InputMark { index: input, id_floor })?;
         }
     }
 
+    if !single_input {
+        extra_catalog = merger.finish(&mut out);
+    }
     finish_document(out, pages_id, kids, extra_catalog)
 }
 
@@ -126,6 +143,7 @@ pub fn extract_pages(doc: &Document, spec: &str) -> Result<Document, PageDocErro
         id_map.entry(page_id).or_insert_with(|| out.new_object_id());
         page_set.insert(page_id);
     }
+    let ctx = PruneCtx::new(doc, page_set);
 
     let mut filled: HashSet<ObjectId> = HashSet::new();
     for &p in &selected {
@@ -133,7 +151,7 @@ pub fn extract_pages(doc: &Document, spec: &str) -> Result<Document, PageDocErro
         let canonical = id_map[&page_id];
         let new_id = if filled.insert(page_id) {
             // First (canonical) copy of this page: fill its pre-registered id.
-            copy_page_into(doc, page_id, canonical, &mut out, &mut id_map, &page_set)?;
+            copy_page_into(doc, page_id, canonical, &mut out, &mut id_map, &ctx)?;
             canonical
         } else {
             // Same page selected more than once (duplicates are allowed): emit a
@@ -144,7 +162,7 @@ pub fn extract_pages(doc: &Document, spec: &str) -> Result<Document, PageDocErro
             // id_map, and the canonical mapping is left untouched so cross-page
             // links from elsewhere keep resolving to the first copy.
             let dup = out.new_object_id();
-            copy_duplicate_page(doc, page_id, canonical, dup, &mut out, &mut id_map, &page_set)?;
+            copy_duplicate_page(doc, page_id, canonical, dup, &mut out, &mut id_map, &ctx)?;
             dup
         };
         if let Ok(dict) = out.get_object_mut(new_id).and_then(Object::as_dict_mut) {
@@ -155,7 +173,7 @@ pub fn extract_pages(doc: &Document, spec: &str) -> Result<Document, PageDocErro
 
     // Single input: carry over the whole document-level catalog data set,
     // pruned so entries targeting non-selected pages are dropped (finding 3).
-    let extra_catalog = collect_carried_catalog(doc, &mut id_map, &mut out, &page_set);
+    let extra_catalog = collect_carried_catalog(doc, &mut id_map, &mut out, &ctx);
     finish_document(out, pages_id, kids, extra_catalog)
 }
 
@@ -260,6 +278,62 @@ fn resolve_inherited(doc: &Document, page_id: ObjectId) -> Result<Dictionary, Pa
 /// /Parent — dragging the original page tree into the output (finding 3).
 type PageSet = HashSet<ObjectId>;
 
+/// Everything pruned copying needs to know about the SOURCE document: which
+/// pages may be reproduced, and which page each annotation belongs to.
+struct PruneCtx {
+    /// Source page ids allowed in the output (see `PageSet`).
+    pages: PageSet,
+    /// annot id -> the page whose /Annots lists it, built from EVERY page of
+    /// the source (not just the kept ones). A widget annotation's page cannot
+    /// always be read off the widget: /P is only optional (ISO 32000 12.5.2),
+    /// so without this map a /Kids widget with no /P could not be told apart
+    /// from one on an excluded page (finding 4).
+    annot_page: HashMap<ObjectId, ObjectId>,
+}
+
+impl PruneCtx {
+    fn new(src: &Document, pages: PageSet) -> Self {
+        let mut annot_page = HashMap::new();
+        for &page_id in src.get_pages().values() {
+            let Ok(dict) = src.get_dictionary(page_id) else { continue };
+            for annot in dict_array(src, dict, b"Annots").unwrap_or(&[]) {
+                if let Ok(id) = annot.as_reference() {
+                    annot_page.insert(id, page_id);
+                }
+            }
+        }
+        Self { pages, annot_page }
+    }
+
+    fn keeps(&self, page_id: ObjectId) -> bool {
+        self.pages.contains(&page_id)
+    }
+
+    /// The page an annotation sits on: its /P if that names a page, otherwise
+    /// the page whose /Annots lists it. None if neither says (an orphan
+    /// annotation on no page at all), in which case callers keep it: there is
+    /// no evidence it belongs to an excluded page.
+    fn page_of_annot(&self, src: &Document, annot_id: ObjectId) -> Option<ObjectId> {
+        if let Ok(d) = src.get_dictionary(annot_id) {
+            if let Ok(pid) = d.get(b"P").and_then(Object::as_reference) {
+                if is_page_tree_node(src, pid) {
+                    return Some(pid);
+                }
+            }
+        }
+        self.annot_page.get(&annot_id).copied()
+    }
+}
+
+/// Resolve `d[key]` through `src` down to an array. Arrays that the spec allows
+/// to be indirect (/Annots, a field's /Kids) are frequently written that way, and
+/// a plain `as_array()` on the raw value silently fails on them (finding 2).
+fn dict_array<'a>(src: &'a Document, d: &'a Dictionary, key: &[u8]) -> Option<&'a [Object]> {
+    let v = d.get(key).ok()?;
+    let (_, obj) = src.dereference(v).ok()?;
+    obj.as_array().ok().map(Vec::as_slice)
+}
+
 /// True if `id` is a node of the source page tree (/Type /Page or /Pages).
 /// Such nodes are handled specially by pruned copying: selected pages are
 /// reused via `id_map`, everything else (excluded pages, intermediate /Pages
@@ -285,37 +359,41 @@ fn is_page_tree_node(src: &Document, id: ObjectId) -> bool {
 /// reference to a page NOT selected is dropped instead of pulling that page in.
 fn copy_page_into(
     src: &Document, page_id: ObjectId, new_id: ObjectId, out: &mut Document,
-    id_map: &mut HashMap<ObjectId, ObjectId>, pages: &PageSet,
+    id_map: &mut HashMap<ObjectId, ObjectId>, ctx: &PruneCtx,
 ) -> Result<(), PageDocError> {
     let mut page_dict = resolve_inherited(src, page_id)?;
     page_dict.remove(b"Parent");
     page_dict.set("Type", Object::Name(b"Page".to_vec()));
 
-    let new_dict = copy_page_dict(src, &page_dict, out, id_map, pages);
+    let new_dict = copy_page_dict(src, &page_dict, out, id_map, ctx);
     out.set_object(new_id, Object::Dictionary(new_dict));
     Ok(())
 }
 
 /// Copy a page dictionary leniently: a page must always be produced, so a key
 /// whose value references an excluded page is dropped rather than failing the
-/// page. /Annots is pruned element-by-element (dead annotations dropped).
+/// page. /Annots is resolved through `src` (it is often an INDIRECT reference to
+/// the array — finding 2) and pruned element-by-element, so one dead annotation
+/// no longer takes the whole array down with it. The rebuilt array is emitted
+/// DIRECTLY on the page: an /Annots array belongs to exactly one page, and a
+/// direct array cannot be accidentally shared with another copy of it.
 fn copy_page_dict(
     src: &Document, d: &Dictionary, out: &mut Document,
-    id_map: &mut HashMap<ObjectId, ObjectId>, pages: &PageSet,
+    id_map: &mut HashMap<ObjectId, ObjectId>, ctx: &PruneCtx,
 ) -> Dictionary {
     let mut nd = Dictionary::new();
     for (k, v) in d.iter() {
         if k == b"Annots" {
-            if let Ok(items) = v.as_array() {
+            if let Some(items) = dict_array(src, d, b"Annots") {
                 let kept: Vec<Object> = items
                     .iter()
-                    .filter_map(|a| deep_copy_pruned(src, a, out, id_map, pages))
+                    .filter_map(|a| deep_copy_pruned(src, a, out, id_map, ctx))
                     .collect();
                 nd.set(k.clone(), Object::Array(kept));
                 continue;
             }
         }
-        match deep_copy_pruned(src, v, out, id_map, pages) {
+        match deep_copy_pruned(src, v, out, id_map, ctx) {
             Some(cv) => {
                 nd.set(k.clone(), cv);
             }
@@ -332,9 +410,16 @@ fn copy_page_dict(
 /// (finding 2). Non-/Annots keys share immutable substructure (contents,
 /// resources) with the canonical copy via `id_map`; the annotation dictionaries
 /// themselves are new objects so the two page instances are independent.
+///
+/// /Annots is resolved through `src` before the fresh-copy path: when it is an
+/// INDIRECT reference to the array, a raw `as_array()` fails and the generic
+/// path would hand the duplicate the canonical page's already-copied array —
+/// annotations and all — leaving this page's annots' /P on the first copy. The
+/// duplicate always gets a fresh direct array of fresh annotation objects,
+/// whatever shape the source used.
 fn copy_duplicate_page(
     src: &Document, page_id: ObjectId, canonical_id: ObjectId, dup_id: ObjectId,
-    out: &mut Document, id_map: &mut HashMap<ObjectId, ObjectId>, pages: &PageSet,
+    out: &mut Document, id_map: &mut HashMap<ObjectId, ObjectId>, ctx: &PruneCtx,
 ) -> Result<(), PageDocError> {
     let mut page_dict = resolve_inherited(src, page_id)?;
     page_dict.remove(b"Parent");
@@ -343,16 +428,16 @@ fn copy_duplicate_page(
     let mut nd = Dictionary::new();
     for (k, v) in page_dict.iter() {
         if k == b"Annots" {
-            if let Ok(items) = v.as_array() {
+            if let Some(items) = dict_array(src, &page_dict, b"Annots") {
                 let kept: Vec<Object> = items
                     .iter()
-                    .filter_map(|a| copy_dup_annot(src, a, canonical_id, dup_id, out, id_map, pages))
+                    .filter_map(|a| copy_dup_annot(src, a, canonical_id, dup_id, out, id_map, ctx))
                     .collect();
                 nd.set(k.clone(), Object::Array(kept));
                 continue;
             }
         }
-        match deep_copy_pruned(src, v, out, id_map, pages) {
+        match deep_copy_pruned(src, v, out, id_map, ctx) {
             Some(cv) => {
                 nd.set(k.clone(), cv);
             }
@@ -372,7 +457,7 @@ fn copy_duplicate_page(
 /// annotation targets an excluded page (dropped, like on the canonical copy).
 fn copy_dup_annot(
     src: &Document, annot: &Object, canonical_id: ObjectId, dup_id: ObjectId,
-    out: &mut Document, id_map: &mut HashMap<ObjectId, ObjectId>, pages: &PageSet,
+    out: &mut Document, id_map: &mut HashMap<ObjectId, ObjectId>, ctx: &PruneCtx,
 ) -> Option<Object> {
     let annot_dict = match annot {
         Object::Reference(id) => src.get_dictionary(*id).ok()?,
@@ -382,7 +467,7 @@ fn copy_dup_annot(
     // Copy the annotation's contents into a fresh dictionary WITHOUT registering
     // the source annotation id in id_map, so the canonical copy keeps its own
     // annotation object. Shared substructure (/AP etc.) still dedupes via id_map.
-    let mut copied = deep_copy_dict_pruned(src, annot_dict, out, id_map, pages)?;
+    let mut copied = deep_copy_dict_pruned(src, annot_dict, out, id_map, ctx)?;
     // pruned copy mapped every reference to the annot's own (canonical) page to
     // `canonical_id`; redirect those to the duplicate. Covers /P and any
     // self-referential destination.
@@ -419,22 +504,22 @@ fn retarget_object(obj: &mut Object, from: ObjectId, to: ObjectId) {
 /// to a SELECTED page resolves to its pre-registered id and is never re-copied.
 fn deep_copy_pruned(
     src: &Document, obj: &Object, out: &mut Document,
-    id_map: &mut HashMap<ObjectId, ObjectId>, pages: &PageSet,
+    id_map: &mut HashMap<ObjectId, ObjectId>, ctx: &PruneCtx,
 ) -> Option<Object> {
     match obj {
-        Object::Reference(old_id) => copy_ref_pruned(src, *old_id, out, id_map, pages),
+        Object::Reference(old_id) => copy_ref_pruned(src, *old_id, out, id_map, ctx),
         Object::Array(items) => {
             let mut arr = Vec::with_capacity(items.len());
             for it in items {
-                arr.push(deep_copy_pruned(src, it, out, id_map, pages)?);
+                arr.push(deep_copy_pruned(src, it, out, id_map, ctx)?);
             }
             Some(Object::Array(arr))
         }
         Object::Dictionary(d) => {
-            Some(Object::Dictionary(deep_copy_dict_pruned(src, d, out, id_map, pages)?))
+            Some(Object::Dictionary(deep_copy_dict_pruned(src, d, out, id_map, ctx)?))
         }
         Object::Stream(s) => {
-            let dict = deep_copy_dict_pruned(src, &s.dict, out, id_map, pages)?;
+            let dict = deep_copy_dict_pruned(src, &s.dict, out, id_map, ctx)?;
             Some(Object::Stream(lopdf::Stream {
                 dict,
                 content: s.content.clone(),
@@ -448,46 +533,171 @@ fn deep_copy_pruned(
 
 fn deep_copy_dict_pruned(
     src: &Document, d: &Dictionary, out: &mut Document,
-    id_map: &mut HashMap<ObjectId, ObjectId>, pages: &PageSet,
+    id_map: &mut HashMap<ObjectId, ObjectId>, ctx: &PruneCtx,
 ) -> Option<Dictionary> {
     let mut nd = Dictionary::new();
     for (k, v) in d.iter() {
-        // Never chase a /Parent that points into the page tree: that is the
-        // exact link that would drag excluded pages (and the whole /Pages tree)
-        // into the output. Drop such a key. (A field's /Parent points at a
-        // parent field, not a page node, and is preserved.)
         if k == b"Parent" {
             if let Ok(pid) = v.as_reference() {
+                // Never chase a /Parent that points into the page tree: that is
+                // the exact link that would drag excluded pages (and the whole
+                // /Pages tree) into the output. Drop such a key.
                 if is_page_tree_node(src, pid) {
                     continue;
                 }
+                // Any other /Parent is a form-field parent (a widget's field, a
+                // field's ancestor field). Copy it PARTIALLY (finding 4): the
+                // strict copy used to fail on the parent as soon as one of its
+                // /Kids sat on an excluded page, which then deleted THIS object
+                // — a widget belonging to a page we are keeping. On the (near
+                // impossible) chance the parent still cannot be produced, drop
+                // the /Parent key and keep the widget rather than the reverse.
+                match copy_field_node(src, pid, out, id_map, ctx) {
+                    Some(nid) => nd.set(k.clone(), Object::Reference(nid)),
+                    None => {}
+                }
+                continue;
             }
         }
-        nd.set(k.clone(), deep_copy_pruned(src, v, out, id_map, pages)?);
+        nd.set(k.clone(), deep_copy_pruned(src, v, out, id_map, ctx)?);
     }
     Some(nd)
 }
 
+/// Copy a node of the /AcroForm field hierarchy, PARTIALLY (finding 4).
+///
+/// A field graph must not be all-or-nothing: a radio group's /Kids can hold
+/// widgets on kept AND excluded pages, and rejecting the whole field (the old
+/// strict copy) dropped the group from the form — and, reached through a kept
+/// widget's /Parent, dropped that widget from its page too. Here only the
+/// individual /Kids entries whose widget sits on an excluded page are pruned;
+/// the field itself survives with the kept widgets still attached. Every other
+/// key is copied leniently: a dead /P or /A action costs that key, not the field.
+///
+/// Returns None only when the node genuinely has nothing left — a terminal
+/// field whose own page is excluded, or a node all of whose /Kids were pruned —
+/// in which case the caller drops it from /Kids or /AcroForm /Fields.
+fn copy_field_node(
+    src: &Document, field_id: ObjectId, out: &mut Document,
+    id_map: &mut HashMap<ObjectId, ObjectId>, ctx: &PruneCtx,
+) -> Option<ObjectId> {
+    // Already copied (or in progress, having been reached through a widget's
+    // /Parent): reuse it. That mapping is also what breaks the widget <-> field
+    // reference cycle.
+    if let Some(&new_id) = id_map.get(&field_id) {
+        return Some(new_id);
+    }
+    let Ok(dict) = src.get_dictionary(field_id) else {
+        // Not a dictionary: not a field after all. Generic copy.
+        return copy_object_id_pruned(src, field_id, out, id_map, ctx);
+    };
+    let kid_count = dict_array(src, dict, b"Kids").map_or(0, <[Object]>::len);
+    if kid_count == 0 {
+        // A terminal field with no /Kids IS its own widget annotation (ISO
+        // 32000 12.7.3.1, merged field/widget): it lives on exactly one page,
+        // so an excluded page takes it with it — nothing is lost that the page
+        // itself did not already take.
+        if let Some(p) = ctx.page_of_annot(src, field_id) {
+            if !ctx.keeps(p) {
+                return None;
+            }
+        }
+    }
+
+    let new_id = out.new_object_id();
+    id_map.insert(field_id, new_id); // before recursing: breaks reference cycles
+    let mut nd = Dictionary::new();
+    let mut kids_kept = 0usize;
+    for (k, v) in dict.iter() {
+        match k.as_slice() {
+            b"Kids" => {
+                let Some(kids) = dict_array(src, dict, b"Kids") else { continue };
+                let kept: Vec<Object> = kids
+                    .iter()
+                    .filter_map(|kid| copy_field_kid(src, kid, out, id_map, ctx))
+                    .collect();
+                kids_kept = kept.len();
+                nd.set(k.clone(), Object::Array(kept));
+            }
+            b"Parent" => match v.as_reference() {
+                Ok(pid) if !is_page_tree_node(src, pid) => {
+                    if let Some(nid) = copy_field_node(src, pid, out, id_map, ctx) {
+                        nd.set(k.clone(), Object::Reference(nid));
+                    }
+                }
+                _ => {}
+            },
+            // Lenient: a key that targets an excluded page (a non-terminal
+            // field carrying a stale /P, an /A action into a dropped page)
+            // costs the key, never the field and never its kept widgets.
+            _ => {
+                if let Some(cv) = deep_copy_pruned(src, v, out, id_map, ctx) {
+                    nd.set(k.clone(), cv);
+                }
+            }
+        }
+    }
+
+    if kid_count > 0 && kids_kept == 0 {
+        // Every widget of this field sat on an excluded page: the field has
+        // nothing left to be attached to. Undo the tentative mapping and let
+        // the caller drop it (from a parent's /Kids, or /AcroForm /Fields).
+        // The reserved id is simply left unset — nothing references it.
+        id_map.remove(&field_id);
+        return None;
+    }
+    out.set_object(new_id, Object::Dictionary(nd));
+    Some(new_id)
+}
+
+/// Copy one /Kids entry of a field: a leaf widget annotation (kept iff its page
+/// is), or an intermediate field node (recursed into, so IT is pruned partially
+/// rather than dropped whole). Returns None to prune the entry.
+fn copy_field_kid(
+    src: &Document, kid: &Object, out: &mut Document,
+    id_map: &mut HashMap<ObjectId, ObjectId>, ctx: &PruneCtx,
+) -> Option<Object> {
+    let Ok(kid_id) = kid.as_reference() else {
+        // Direct dictionary kid (not legal for widgets, which must be indirect
+        // to be referenced from /Annots, but copy it rather than lose it).
+        return deep_copy_pruned(src, kid, out, id_map, ctx);
+    };
+    let Ok(kd) = src.get_dictionary(kid_id) else {
+        return copy_ref_pruned(src, kid_id, out, id_map, ctx);
+    };
+    // /Subtype marks an annotation: this kid is a widget (possibly merged with
+    // its terminal field). Anything else is an intermediate field node.
+    if kd.has(b"Subtype") {
+        if let Some(p) = ctx.page_of_annot(src, kid_id) {
+            if !ctx.keeps(p) {
+                return None;
+            }
+        }
+        return Some(Object::Reference(copy_object_id_pruned(src, kid_id, out, id_map, ctx)?));
+    }
+    Some(Object::Reference(copy_field_node(src, kid_id, out, id_map, ctx)?))
+}
+
 fn copy_ref_pruned(
     src: &Document, old_id: ObjectId, out: &mut Document,
-    id_map: &mut HashMap<ObjectId, ObjectId>, pages: &PageSet,
+    id_map: &mut HashMap<ObjectId, ObjectId>, ctx: &PruneCtx,
 ) -> Option<Object> {
     // A reference into the page tree is special. A selected page is reused via
     // its pre-registered mapping (never re-copied — that would chase /Parent).
     // Any other page-tree node (an excluded page, or an intermediate /Pages
     // node) is dropped so nothing follows /Parent/#Kids into the page tree.
     if is_page_tree_node(src, old_id) {
-        if pages.contains(&old_id) {
+        if ctx.keeps(old_id) {
             return id_map.get(&old_id).map(|&n| Object::Reference(n));
         }
         return None;
     }
-    Some(Object::Reference(copy_object_id_pruned(src, old_id, out, id_map, pages)?))
+    Some(Object::Reference(copy_object_id_pruned(src, old_id, out, id_map, ctx)?))
 }
 
 fn copy_object_id_pruned(
     src: &Document, old_id: ObjectId, out: &mut Document,
-    id_map: &mut HashMap<ObjectId, ObjectId>, pages: &PageSet,
+    id_map: &mut HashMap<ObjectId, ObjectId>, ctx: &PruneCtx,
 ) -> Option<ObjectId> {
     if let Some(&new_id) = id_map.get(&old_id) {
         return Some(new_id);
@@ -495,7 +705,7 @@ fn copy_object_id_pruned(
     let new_id = out.new_object_id();
     id_map.insert(old_id, new_id); // before recursing: breaks reference cycles
     match src.get_object(old_id) {
-        Ok(obj) => match deep_copy_pruned(src, obj, out, id_map, pages) {
+        Ok(obj) => match deep_copy_pruned(src, obj, out, id_map, ctx) {
             Some(new_obj) => {
                 out.set_object(new_id, new_obj);
                 Some(new_id)
@@ -526,9 +736,8 @@ fn copy_object_id_pruned(
 /// /StructTreeRoot is deliberately NOT carried: its /K structure holds parent
 /// pointers into content and marked-content sequences we cannot guarantee stay
 /// consistent across an arbitrary page subset, so we drop it rather than emit a
-/// dangling/inconsistent tagging tree. Cross-document merging of these tables
-/// (multi-input merge) is also unsupported — see `merge`, which carries NONE of
-/// them for multi-input. Both are known limitations.
+/// dangling/inconsistent tagging tree. Known limitation. For a multi-input
+/// merge these same tables are combined instead — see `CatalogMerger`.
 const CARRIED_CATALOG_KEYS: &[&[u8]] = &[
     b"Names",
     b"Dests",
@@ -539,6 +748,11 @@ const CARRIED_CATALOG_KEYS: &[&[u8]] = &[
     b"PageLayout",
     b"PageMode",
 ];
+
+/// Catalog keys that are a single document-wide setting rather than a table of
+/// content: there is nothing to combine, so a multi-input merge takes the first
+/// input's (`/Lang` is handled separately — see `CatalogMerger::add_source`).
+const VIEWER_INTENT_KEYS: &[&[u8]] = &[b"ViewerPreferences", b"PageLayout", b"PageMode"];
 
 /// Deep-copy the carried document-level entries out of `src`'s catalog through
 /// the SAME `id_map` used for the pages, so their references (a named
@@ -552,18 +766,15 @@ const CARRIED_CATALOG_KEYS: &[&[u8]] = &[
 /// Must be called AFTER the pages have been copied, so selected page ids and
 /// their annotations/widgets are already in `id_map` and get reused.
 fn collect_carried_catalog(
-    src: &Document, id_map: &mut HashMap<ObjectId, ObjectId>, out: &mut Document, pages: &PageSet,
+    src: &Document, id_map: &mut HashMap<ObjectId, ObjectId>, out: &mut Document, ctx: &PruneCtx,
 ) -> Vec<(Vec<u8>, Object)> {
     let mut carried = Vec::new();
-    let Ok(root) = src.trailer.get(b"Root").and_then(Object::as_reference) else {
-        return carried;
-    };
-    let Ok(catalog) = src.get_dictionary(root) else {
+    let Some(catalog) = source_catalog(src) else {
         return carried;
     };
     for &key in CARRIED_CATALOG_KEYS {
         if let Ok(val) = catalog.get(key) {
-            if let Some(copied) = copy_catalog_value(src, key, val, out, id_map, pages) {
+            if let Some(copied) = copy_catalog_value(src, key, val, out, id_map, ctx) {
                 carried.push((key.to_vec(), copied));
             }
         }
@@ -571,23 +782,29 @@ fn collect_carried_catalog(
     carried
 }
 
+/// The source document's catalog dictionary, if the trailer names a usable one.
+fn source_catalog(src: &Document) -> Option<&Dictionary> {
+    let root = src.trailer.get(b"Root").and_then(Object::as_reference).ok()?;
+    src.get_dictionary(root).ok()
+}
+
 /// Copy one carried catalog entry, pruning page-tree references per table shape.
 /// Returns None to drop the whole key (e.g. a table that itself resolves to an
 /// excluded page, which should not happen for the keys we carry).
 fn copy_catalog_value(
     src: &Document, key: &[u8], val: &Object, out: &mut Document,
-    id_map: &mut HashMap<ObjectId, ObjectId>, pages: &PageSet,
+    id_map: &mut HashMap<ObjectId, ObjectId>, ctx: &PruneCtx,
 ) -> Option<Object> {
     match key {
         // Name-tree dictionary (/Dests, /AP, ...). Only /Dests holds page
         // destinations; the others simply never prune.
-        b"Names" => copy_names_dict(src, val, out, id_map, pages),
+        b"Names" => copy_names_dict(src, val, out, id_map, ctx),
         // Catalog /Dests: a flat dictionary mapping name -> destination.
-        b"Dests" => Some(copy_dests_dict(src, val, out, id_map, pages)),
-        b"AcroForm" => copy_acroform(src, val, out, id_map, pages),
+        b"Dests" => copy_dests_dict(src, val, out, id_map, ctx),
+        b"AcroForm" => copy_acroform(src, val, out, id_map, ctx),
         // /OCProperties, /Lang, /ViewerPreferences, /PageLayout, /PageMode do
         // not reference pages; a generic pruned copy is a no-op wrt pruning.
-        _ => deep_copy_pruned(src, val, out, id_map, pages),
+        _ => deep_copy_pruned(src, val, out, id_map, ctx),
     }
 }
 
@@ -615,98 +832,172 @@ fn place_catalog_dict(out: &mut Document, indirect: bool, dict: Dictionary) -> O
 /// sub-tree. If /Names is not a dictionary, fall back to a generic pruned copy.
 fn copy_names_dict(
     src: &Document, val: &Object, out: &mut Document,
-    id_map: &mut HashMap<ObjectId, ObjectId>, pages: &PageSet,
+    id_map: &mut HashMap<ObjectId, ObjectId>, ctx: &PruneCtx,
 ) -> Option<Object> {
     let Some((indirect, d)) = resolve_catalog_dict(src, val) else {
-        return deep_copy_pruned(src, val, out, id_map, pages);
+        return deep_copy_pruned(src, val, out, id_map, ctx);
     };
     let mut nd = Dictionary::new();
     for (k, v) in d.iter() {
-        nd.set(k.clone(), copy_name_tree(src, v, out, id_map, pages));
+        // A tree that kept nothing loses its key entirely rather than being
+        // emitted as an empty root.
+        if let Some(node) = copy_name_tree(src, v, out, id_map, ctx, true, 0) {
+            nd.set(k.clone(), node.object);
+        }
+    }
+    if nd.is_empty() {
+        return None;
     }
     Some(place_catalog_dict(out, indirect, nd))
 }
 
-/// Copy a name-tree node, dropping /Names key/value pairs whose destination
-/// targets an excluded page and recursing into /Kids. /Limits is intentionally
-/// NOT carried: after pruning, a stale [min,max] would be wrong, and omitting
-/// it only forces readers into a linear scan (spec-tolerant). Empty leaf nodes
-/// are harmless and left in place.
+/// Depth bound for the recursive name-tree walks. A real tree is a handful of
+/// levels deep (nodes hold many names each); a /Kids chain deeper than this is
+/// malformed or hostile — a /Kids cycle would otherwise recurse until the stack
+/// gives out. Bailing costs the entries below the bound in a file that is
+/// already broken.
+const NAME_TREE_MAX_DEPTH: u32 = 64;
+
+/// A rebuilt name-tree node plus the extent of the names that survived under it.
+struct NameTreeNode {
+    object: Object,
+    /// Least and greatest surviving name in this subtree, by byte order.
+    first: Vec<u8>,
+    last: Vec<u8>,
+}
+
+/// Copy a name-tree node, dropping /Names pairs whose destination targets an
+/// excluded page and recursing into /Kids. Returns None when the subtree kept
+/// nothing, so the caller PRUNES that child instead of leaving an empty node
+/// behind (a reader that trusts an empty child's /Limits would look for names
+/// in a node that no longer has any).
+///
+/// /Limits is REQUIRED on every non-root node (ISO 32000 7.9.6) — it is what a
+/// reader uses to pick the child that could contain a name, so a rebuilt tree
+/// without it (the previous behavior) can leave surviving destinations
+/// unresolvable. It is RECOMPUTED here from what actually survived: [first last]
+/// of the subtree, with names ordered by byte value as the spec requires. The
+/// root carries no /Limits.
+///
+/// A node that is not a dictionary at all is malformed beyond what a name tree
+/// can express (it holds no name we could account for): it is dropped too.
 fn copy_name_tree(
     src: &Document, val: &Object, out: &mut Document,
-    id_map: &mut HashMap<ObjectId, ObjectId>, pages: &PageSet,
-) -> Object {
-    let Some((indirect, d)) = resolve_catalog_dict(src, val) else {
-        // Not a dict (unexpected): best-effort generic copy, dropping if it
-        // targets an excluded page.
-        return deep_copy_pruned(src, val, out, id_map, pages).unwrap_or(Object::Null);
-    };
+    id_map: &mut HashMap<ObjectId, ObjectId>, ctx: &PruneCtx, is_root: bool, depth: u32,
+) -> Option<NameTreeNode> {
+    let (indirect, d) = resolve_catalog_dict(src, val)?;
+    if depth > NAME_TREE_MAX_DEPTH {
+        return None;
+    }
     let mut nd = Dictionary::new();
-    if let Ok(names) = d.get(b"Names").and_then(Object::as_array) {
-        // Flat [key1 dest1 key2 dest2 ...]; keep a pair only if its destination
-        // survives pruning.
+    let mut first: Option<Vec<u8>> = None;
+    let mut last: Option<Vec<u8>> = None;
+    let mut extend = |name: &[u8]| {
+        if first.as_deref().is_none_or(|f| name < f) {
+            first = Some(name.to_vec());
+        }
+        if last.as_deref().is_none_or(|l| name > l) {
+            last = Some(name.to_vec());
+        }
+    };
+
+    if let Some(names) = dict_array(src, &d, b"Names") {
+        // Flat [key1 value1 key2 value2 ...]; keep a pair only if its value
+        // survives pruning (a destination on a kept page).
         let mut arr = Vec::new();
         let mut i = 0;
         while i + 1 < names.len() {
-            if let Some(cd) = deep_copy_pruned(src, &names[i + 1], out, id_map, pages) {
+            if let Some(cv) = deep_copy_pruned(src, &names[i + 1], out, id_map, ctx) {
+                if let Ok(name) = names[i].as_str() {
+                    extend(name);
+                }
                 arr.push(names[i].clone());
-                arr.push(cd);
+                arr.push(cv);
             }
             i += 2;
         }
-        nd.set("Names", Object::Array(arr));
+        if !arr.is_empty() {
+            nd.set("Names", Object::Array(arr));
+        }
     }
-    if let Ok(kids) = d.get(b"Kids").and_then(Object::as_array) {
-        let new_kids: Vec<Object> = kids
-            .iter()
-            .map(|kid| copy_name_tree(src, kid, out, id_map, pages))
-            .collect();
-        nd.set("Kids", Object::Array(new_kids));
+    if let Some(kids) = dict_array(src, &d, b"Kids") {
+        let mut new_kids = Vec::new();
+        for kid in kids {
+            if let Some(node) = copy_name_tree(src, kid, out, id_map, ctx, false, depth + 1) {
+                extend(&node.first);
+                extend(&node.last);
+                new_kids.push(node.object);
+            }
+        }
+        if !new_kids.is_empty() {
+            nd.set("Kids", Object::Array(new_kids));
+        }
     }
-    place_catalog_dict(out, indirect, nd)
+
+    // Nothing under this node survived: prune it.
+    let (first, last) = (first?, last?);
+    if !is_root {
+        nd.set("Limits", name_limits(&first, &last));
+    }
+    Some(NameTreeNode { object: place_catalog_dict(out, indirect, nd), first, last })
+}
+
+/// The /Limits array of a name-tree node: [least greatest], as strings (name
+/// trees are keyed by strings — ISO 32000 7.9.6).
+fn name_limits(first: &[u8], last: &[u8]) -> Object {
+    Object::Array(vec![
+        Object::String(first.to_vec(), StringFormat::Literal),
+        Object::String(last.to_vec(), StringFormat::Literal),
+    ])
 }
 
 /// Copy the catalog /Dests dictionary (name -> destination), dropping any named
-/// destination whose target page is not in the selected set.
+/// destination whose target page is not in the selected set. None if nothing
+/// survived, so the key is dropped rather than emitted empty.
 fn copy_dests_dict(
     src: &Document, val: &Object, out: &mut Document,
-    id_map: &mut HashMap<ObjectId, ObjectId>, pages: &PageSet,
-) -> Object {
+    id_map: &mut HashMap<ObjectId, ObjectId>, ctx: &PruneCtx,
+) -> Option<Object> {
     let Some((indirect, d)) = resolve_catalog_dict(src, val) else {
-        return deep_copy_pruned(src, val, out, id_map, pages).unwrap_or(Object::Null);
+        return deep_copy_pruned(src, val, out, id_map, ctx);
     };
     let mut nd = Dictionary::new();
     for (k, v) in d.iter() {
-        if let Some(cv) = deep_copy_pruned(src, v, out, id_map, pages) {
+        if let Some(cv) = deep_copy_pruned(src, v, out, id_map, ctx) {
             nd.set(k.clone(), cv);
         }
         // else: destination points at an excluded page -> drop this name.
     }
-    place_catalog_dict(out, indirect, nd)
+    if nd.is_empty() {
+        return None;
+    }
+    Some(place_catalog_dict(out, indirect, nd))
 }
 
-/// Copy /AcroForm, dropping /Fields entries whose field (or a widget under it)
-/// targets an excluded page. A field is copied strictly: if any part of it —
-/// its /P, or a /Kids widget's /P — resolves to an excluded page, the whole
-/// field is skipped rather than emitted with a dangling page reference.
+/// Copy /AcroForm. Each /Fields entry is copied PARTIALLY (`copy_field_node`):
+/// a field spanning kept and excluded pages keeps its kept widgets and loses
+/// only the /Kids that sat on excluded pages. A field left with no surviving
+/// kid — or a terminal field whose own page went — is dropped from /Fields;
+/// it has no widget left to be attached to, so nothing on the kept pages
+/// references it.
 fn copy_acroform(
     src: &Document, val: &Object, out: &mut Document,
-    id_map: &mut HashMap<ObjectId, ObjectId>, pages: &PageSet,
+    id_map: &mut HashMap<ObjectId, ObjectId>, ctx: &PruneCtx,
 ) -> Option<Object> {
     let (indirect, d) = resolve_catalog_dict(src, val)?;
     let mut nd = Dictionary::new();
     for (k, v) in d.iter() {
         if k == b"Fields" {
-            if let Ok(fields) = v.as_array() {
+            if let Some(fields) = dict_array(src, &d, b"Fields") {
                 let kept: Vec<Object> = fields
                     .iter()
-                    .filter_map(|f| deep_copy_pruned(src, f, out, id_map, pages))
+                    .filter_map(|f| copy_form_field(src, f, out, id_map, ctx))
                     .collect();
                 nd.set(k.clone(), Object::Array(kept));
                 continue;
             }
         }
-        match deep_copy_pruned(src, v, out, id_map, pages) {
+        match deep_copy_pruned(src, v, out, id_map, ctx) {
             Some(cv) => {
                 nd.set(k.clone(), cv);
             }
@@ -714,6 +1005,584 @@ fn copy_acroform(
         }
     }
     Some(place_catalog_dict(out, indirect, nd))
+}
+
+/// Copy one /AcroForm /Fields entry (a root field). None to drop it.
+fn copy_form_field(
+    src: &Document, field: &Object, out: &mut Document,
+    id_map: &mut HashMap<ObjectId, ObjectId>, ctx: &PruneCtx,
+) -> Option<Object> {
+    match field.as_reference() {
+        Ok(id) => Some(Object::Reference(copy_field_node(src, id, out, id_map, ctx)?)),
+        // A direct field dictionary cannot own indirect widgets; copy as-is.
+        Err(_) => deep_copy_pruned(src, field, out, id_map, ctx),
+    }
+}
+
+// ---- multi-input catalog merging (finding 1) --------------------------------
+
+/// Accumulates the document-level tables of a MULTI-INPUT merge so the merged
+/// document keeps what its inputs registered above the page tree: interactive
+/// fields (/AcroForm /Fields), optional content and its visibility
+/// (/OCProperties), and named destinations (/Names, /Dests).
+///
+/// Everything held here is already copied into the output document (through the
+/// contributing input's id_map), i.e. output-space.
+///
+/// Where combining is well defined, we combine: /Fields concatenate, /OCGs
+/// union, destination names union with collisions suffixed and every reference
+/// to a renamed one rewritten. Where it is not, `add_source` fails the merge
+/// with `UnmergeableCatalog` rather than dropping the table: losing a form or a
+/// document's layers is not something the user should have to discover later.
+#[derive(Default)]
+struct CatalogMerger {
+    form: Option<FormAccum>,
+    oc: Option<OcAccum>,
+    /// Merged /Names /Dests and catalog /Dests entries.
+    tree_dests: NameEntries,
+    flat_dests: NameEntries,
+    /// Destination names already taken. The two dest tables share ONE
+    /// namespace: a /Dest naming a destination may be looked up in either, so a
+    /// name must mean the same thing whichever table ends up holding it.
+    dest_names: HashSet<Vec<u8>>,
+    /// The other /Names subtrees (/EmbeddedFiles, /JavaScript, ...), each with
+    /// its own name namespace.
+    name_trees: BTreeMap<Vec<u8>, NameSpace>,
+    /// The distinct /Lang values seen, None for an input that declares none.
+    langs: HashSet<Option<Vec<u8>>>,
+    /// Viewer-intent keys, from the first input that has each.
+    viewer: Dictionary,
+}
+
+/// Name-tree entries flattened out of their tree: (name, value), unordered.
+type NameEntries = Vec<(Vec<u8>, Object)>;
+
+/// One /Names subtree's merged entries and the names it has taken.
+#[derive(Default)]
+struct NameSpace {
+    entries: NameEntries,
+    taken: HashSet<Vec<u8>>,
+}
+
+/// Which input of a merge is being folded in, and the output id watermark from
+/// just before it contributed anything (see `rewrite_dest_names`).
+#[derive(Clone, Copy)]
+struct InputMark {
+    /// 0-based position in the input list.
+    index: usize,
+    id_floor: u32,
+}
+
+#[derive(Default)]
+struct FormAccum {
+    fields: Vec<Object>,
+    need_appearances: bool,
+    sig_flags: i64,
+    dr: Option<Dictionary>,
+    /// /DA, /Q, /CO ...: from the first input that has each.
+    extra: Dictionary,
+}
+
+#[derive(Default)]
+struct OcAccum {
+    ocgs: Vec<Object>,
+    seen: HashSet<ObjectId>,
+    off: Vec<Object>,
+    order: Vec<Object>,
+    rb_groups: Vec<Object>,
+    usage: Vec<Object>,
+    locked: Vec<Object>,
+    /// /Intent, /ListMode of the merged default config, first input wins.
+    extra: Dictionary,
+}
+
+impl CatalogMerger {
+    /// Fold one input's catalog into the accumulator. Must run AFTER that
+    /// input's pages are copied, so the tables' references (a destination's
+    /// page, a field's widgets) land on the copied pages. `id_floor` is
+    /// `out.max_id` from before this input contributed anything.
+    fn add_source(
+        &mut self, src: &Document, out: &mut Document, id_map: &mut HashMap<ObjectId, ObjectId>,
+        ctx: &PruneCtx, mark: InputMark,
+    ) -> Result<(), PageDocError> {
+        let Some(catalog) = source_catalog(src) else {
+            return Ok(());
+        };
+        if let Ok(val) = catalog.get(b"AcroForm") {
+            self.add_acroform(src, val, out, id_map, ctx)?;
+        }
+        if let Ok(val) = catalog.get(b"OCProperties") {
+            self.add_oc_properties(src, val, out, id_map, ctx)?;
+        }
+        self.add_destinations(src, catalog, out, id_map, ctx, mark);
+
+        // /Lang labels the WHOLE document. Inputs that disagree (or one that
+        // says nothing) have no common answer, so rather than mislabel another
+        // input's pages with the first input's language we keep it only if all
+        // inputs agree. Dropping it costs a default hint, not content: it is a
+        // fallback for content that does not declare its own language.
+        self.langs.insert(catalog.get(b"Lang").and_then(Object::as_str).ok().map(<[u8]>::to_vec));
+        for &key in VIEWER_INTENT_KEYS {
+            if self.viewer.has(key) {
+                continue;
+            }
+            if let Ok(val) = catalog.get(key) {
+                if let Some(copied) = deep_copy_pruned(src, val, out, id_map, ctx) {
+                    self.viewer.set(key.to_vec(), copied);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Concatenate one input's /AcroForm /Fields onto the merged form.
+    ///
+    /// Two inputs may both use a field name: per ISO 32000 12.7.3.2 fields with
+    /// the same fully qualified name ARE one field, so those two will share a
+    /// value in the merged document. Both fields survive and stay interactive —
+    /// unlike renaming them, which would break any /JavaScript or FDF naming
+    /// them — so the merge keeps the data and the caveat stays visible in the
+    /// output rather than being papered over.
+    fn add_acroform(
+        &mut self, src: &Document, val: &Object, out: &mut Document,
+        id_map: &mut HashMap<ObjectId, ObjectId>, ctx: &PruneCtx,
+    ) -> Result<(), PageDocError> {
+        let Some((_, d)) = resolve_catalog_dict(src, val) else {
+            return Ok(());
+        };
+        // An XFA form is an XML packet describing THIS document's form as a
+        // whole; two of them do not compose into one, and the packet — not the
+        // /Fields — is what an XFA reader renders. Refuse rather than emit a
+        // document whose form silently loses half its inputs.
+        if d.has(b"XFA") {
+            return Err(PageDocError::UnmergeableCatalog("an XFA form (/AcroForm /XFA)"));
+        }
+
+        let mut fields = Vec::new();
+        if let Some(list) = dict_array(src, &d, b"Fields") {
+            for f in list {
+                if let Some(copied) = copy_form_field(src, f, out, id_map, ctx) {
+                    fields.push(copied);
+                }
+            }
+        }
+        let dr = d
+            .get(b"DR")
+            .ok()
+            .and_then(|v| deep_copy_pruned(src, v, out, id_map, ctx))
+            .and_then(|v| resolve_out_dict(out, &v));
+
+        let acc = self.form.get_or_insert_with(FormAccum::default);
+        acc.fields.extend(fields);
+        for (k, v) in d.iter() {
+            match k.as_slice() {
+                // Handled above / below.
+                b"Fields" | b"DR" | b"XFA" => {}
+                // Any input needing appearances makes the merged form need them.
+                b"NeedAppearances" => acc.need_appearances |= v.as_bool().unwrap_or(false),
+                // Flags are a bit set: the union is the honest answer.
+                b"SigFlags" => acc.sig_flags |= v.as_i64().unwrap_or(0),
+                _ => {
+                    if !acc.extra.has(k) {
+                        if let Some(copied) = deep_copy_pruned(src, v, out, id_map, ctx) {
+                            acc.extra.set(k.clone(), copied);
+                        }
+                    }
+                }
+            }
+        }
+        if let Some(dr) = dr {
+            match acc.dr {
+                None => acc.dr = Some(dr),
+                Some(ref mut cur) => merge_resource_dict(out, cur, &dr),
+            }
+        }
+        Ok(())
+    }
+
+    /// Union one input's optional-content groups and fold its default
+    /// configuration into the merged one.
+    fn add_oc_properties(
+        &mut self, src: &Document, val: &Object, out: &mut Document,
+        id_map: &mut HashMap<ObjectId, ObjectId>, ctx: &PruneCtx,
+    ) -> Result<(), PageDocError> {
+        let Some((_, d)) = resolve_catalog_dict(src, val) else {
+            return Ok(());
+        };
+        // An alternate configuration states every OCG's state for ONE document;
+        // input A's configs say nothing about input B's groups, so no combined
+        // /Configs preserves what either input meant by them.
+        if dict_array(src, &d, b"Configs").is_some_and(|c| !c.is_empty()) {
+            return Err(PageDocError::UnmergeableCatalog(
+                "alternate optional-content configurations (/OCProperties /Configs)",
+            ));
+        }
+
+        let mut ocgs = Vec::new();
+        if let Some(list) = dict_array(src, &d, b"OCGs") {
+            for g in list {
+                if let Some(copied) = deep_copy_pruned(src, g, out, id_map, ctx) {
+                    ocgs.push(copied);
+                }
+            }
+        }
+        let cfg = d
+            .get(b"D")
+            .ok()
+            .and_then(|v| resolve_catalog_dict(src, v))
+            .map_or_else(Dictionary::default, |(_, c)| c);
+        let base_off = cfg.get(b"BaseState").and_then(Object::as_name).is_ok_and(|n| n == b"OFF");
+        let on = copy_oc_list(src, &cfg, b"ON", out, id_map, ctx);
+        let off = copy_oc_list(src, &cfg, b"OFF", out, id_map, ctx);
+        let order = copy_oc_list(src, &cfg, b"Order", out, id_map, ctx);
+        let rb_groups = copy_oc_list(src, &cfg, b"RBGroups", out, id_map, ctx);
+        let usage = copy_oc_list(src, &cfg, b"AS", out, id_map, ctx);
+        let locked = copy_oc_list(src, &cfg, b"Locked", out, id_map, ctx);
+
+        let acc = self.oc.get_or_insert_with(OcAccum::default);
+        for g in &ocgs {
+            match g.as_reference() {
+                // Ids are unique per output, so this only dedupes an input that
+                // lists the same group twice.
+                Ok(id) if !acc.seen.insert(id) => {}
+                _ => acc.ocgs.push(g.clone()),
+            }
+        }
+        // Visibility: the merged config states no /BaseState, i.e. the default
+        // /ON, and lists every initially-hidden group in /OFF. An input whose
+        // own config said /BaseState /OFF meant "hidden except /ON" — the same
+        // set of hidden groups, written the other way round.
+        if base_off {
+            let on_ids: HashSet<ObjectId> = on.iter().filter_map(|o| o.as_reference().ok()).collect();
+            for g in &ocgs {
+                match g.as_reference() {
+                    Ok(id) if on_ids.contains(&id) => {}
+                    _ => acc.off.push(g.clone()),
+                }
+            }
+        } else {
+            acc.off.extend(off);
+        }
+        // /Order is what the layers panel lists; a group missing from it is not
+        // shown there at all. So an input that states no order of its own
+        // contributes its groups flat instead of disappearing from a panel
+        // built out of another input's order.
+        if order.is_empty() {
+            acc.order.extend(ocgs);
+        } else {
+            acc.order.extend(order);
+        }
+        acc.rb_groups.extend(rb_groups);
+        acc.usage.extend(usage);
+        acc.locked.extend(locked);
+        for &key in &[b"Intent".as_slice(), b"ListMode"] {
+            if acc.extra.has(key) {
+                continue;
+            }
+            if let Ok(v) = cfg.get(key) {
+                if let Some(copied) = deep_copy_pruned(src, v, out, id_map, ctx) {
+                    acc.extra.set(key.to_vec(), copied);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Merge one input's two destination tables. A name another input already
+    /// took is suffixed, and every reference to the renamed destination in THIS
+    /// input's copied objects is rewritten, so its links keep pointing where
+    /// they did while the other input's keep their names.
+    fn add_destinations(
+        &mut self, src: &Document, catalog: &Dictionary, out: &mut Document,
+        id_map: &mut HashMap<ObjectId, ObjectId>, ctx: &PruneCtx, mark: InputMark,
+    ) {
+        let mut tree_dests = NameEntries::new();
+        let mut other_trees: Vec<(Vec<u8>, NameEntries)> = Vec::new();
+        if let Some((_, names)) = catalog.get(b"Names").ok().and_then(|v| resolve_catalog_dict(src, v)) {
+            for (k, v) in names.iter() {
+                let mut flat = Vec::new();
+                flatten_name_tree(src, v, out, id_map, ctx, 0, &mut flat);
+                if k == b"Dests" {
+                    tree_dests = flat;
+                } else {
+                    other_trees.push((k.clone(), flat));
+                }
+            }
+        }
+        let mut flat_dests = Vec::new();
+        if let Some((_, dests)) = catalog.get(b"Dests").ok().and_then(|v| resolve_catalog_dict(src, v)) {
+            for (k, v) in dests.iter() {
+                if let Some(copied) = deep_copy_pruned(src, v, out, id_map, ctx) {
+                    flat_dests.push((k.clone(), copied));
+                }
+            }
+        }
+
+        // One rename map for both tables: within an input a name means one
+        // destination whichever table it was found in, so it must be renamed
+        // the same way in both.
+        let mut renames: HashMap<Vec<u8>, Vec<u8>> = HashMap::new();
+        for (name, _) in tree_dests.iter().chain(flat_dests.iter()) {
+            if !renames.contains_key(name) {
+                let taken = alloc_name(&mut self.dest_names, name, mark.index);
+                renames.insert(name.clone(), taken);
+            }
+        }
+        for (name, value) in tree_dests {
+            self.tree_dests.push((renames[&name].clone(), value));
+        }
+        for (name, value) in flat_dests {
+            self.flat_dests.push((renames[&name].clone(), value));
+        }
+        // The other subtrees (/EmbeddedFiles, /JavaScript, ...) are keyed by
+        // names that are labels, not link targets: nothing inside the document
+        // resolves them, so a suffix on collision loses nothing.
+        for (key, flat) in other_trees {
+            let ns = self.name_trees.entry(key).or_default();
+            for (name, value) in flat {
+                let taken = alloc_name(&mut ns.taken, &name, mark.index);
+                ns.entries.push((taken, value));
+            }
+        }
+
+        renames.retain(|old, new| old != new);
+        if !renames.is_empty() {
+            rewrite_dest_names(out, mark.id_floor, &renames);
+        }
+    }
+
+    /// Emit the merged tables as catalog entries.
+    fn finish(self, out: &mut Document) -> Vec<(Vec<u8>, Object)> {
+        let mut carried = Vec::new();
+        if let Some(form) = self.form {
+            let mut d = form.extra;
+            d.set("Fields", Object::Array(form.fields));
+            if form.need_appearances {
+                d.set("NeedAppearances", true);
+            }
+            if form.sig_flags != 0 {
+                d.set("SigFlags", form.sig_flags);
+            }
+            if let Some(dr) = form.dr {
+                d.set("DR", Object::Dictionary(dr));
+            }
+            let id = out.add_object(Object::Dictionary(d));
+            carried.push((b"AcroForm".to_vec(), Object::Reference(id)));
+        }
+        if let Some(oc) = self.oc {
+            let mut cfg = oc.extra;
+            cfg.set("Name", Object::String(b"Default".to_vec(), StringFormat::Literal));
+            for (key, list) in [
+                (&b"OFF"[..], oc.off),
+                (&b"Order"[..], oc.order),
+                (&b"RBGroups"[..], oc.rb_groups),
+                (&b"AS"[..], oc.usage),
+                (&b"Locked"[..], oc.locked),
+            ] {
+                if !list.is_empty() {
+                    cfg.set(key.to_vec(), Object::Array(list));
+                }
+            }
+            let mut d = Dictionary::new();
+            d.set("OCGs", Object::Array(oc.ocgs));
+            d.set("D", Object::Dictionary(cfg));
+            let id = out.add_object(Object::Dictionary(d));
+            carried.push((b"OCProperties".to_vec(), Object::Reference(id)));
+        }
+
+        let mut names = Dictionary::new();
+        if !self.tree_dests.is_empty() {
+            names.set("Dests", build_name_tree_root(out, self.tree_dests));
+        }
+        for (key, ns) in self.name_trees {
+            if !ns.entries.is_empty() {
+                names.set(key, build_name_tree_root(out, ns.entries));
+            }
+        }
+        if !names.is_empty() {
+            let id = out.add_object(Object::Dictionary(names));
+            carried.push((b"Names".to_vec(), Object::Reference(id)));
+        }
+        if !self.flat_dests.is_empty() {
+            let mut d = Dictionary::new();
+            for (name, value) in self.flat_dests {
+                d.set(name, value);
+            }
+            let id = out.add_object(Object::Dictionary(d));
+            carried.push((b"Dests".to_vec(), Object::Reference(id)));
+        }
+
+        if self.langs.len() == 1 {
+            if let Some(Some(lang)) = self.langs.into_iter().next() {
+                carried.push((b"Lang".to_vec(), Object::String(lang, StringFormat::Literal)));
+            }
+        }
+        carried.extend(self.viewer);
+        carried
+    }
+}
+
+/// Merge one input's /AcroForm /DR (the resources a field's /DA names) into the
+/// accumulated one. Resource names are a per-document namespace, so a name two
+/// inputs both define can keep only one binding: first seen wins, the same rule
+/// the engine applies to every other resource-name collision. Widgets carry
+/// their own /AP streams, so at worst a later input's field regenerates its
+/// appearance with the first input's same-named font.
+fn merge_resource_dict(out: &Document, dst: &mut Dictionary, add: &Dictionary) {
+    for (k, v) in add.iter() {
+        let Some(cur) = dst.get(k).ok().cloned() else {
+            dst.set(k.clone(), v.clone());
+            continue;
+        };
+        // Both inputs define this resource category (/Font, /XObject, ...):
+        // union what is inside it, first input still winning per name.
+        if let (Some(mut merged), Some(add_sub)) = (resolve_out_dict(out, &cur), resolve_out_dict(out, v)) {
+            for (sk, sv) in add_sub.iter() {
+                if !merged.has(sk) {
+                    merged.set(sk.clone(), sv.clone());
+                }
+            }
+            dst.set(k.clone(), Object::Dictionary(merged));
+        }
+    }
+}
+
+/// Resolve an OUTPUT-space value (our own copies, which may be indirect) to a
+/// dictionary.
+fn resolve_out_dict(out: &Document, val: &Object) -> Option<Dictionary> {
+    match val {
+        Object::Reference(id) => out.get_dictionary(*id).ok().cloned(),
+        Object::Dictionary(d) => Some(d.clone()),
+        _ => None,
+    }
+}
+
+/// Copy an array-valued entry of an optional-content configuration.
+fn copy_oc_list(
+    src: &Document, cfg: &Dictionary, key: &[u8], out: &mut Document,
+    id_map: &mut HashMap<ObjectId, ObjectId>, ctx: &PruneCtx,
+) -> Vec<Object> {
+    let Some(items) = dict_array(src, cfg, key) else {
+        return Vec::new();
+    };
+    items.iter().filter_map(|o| deep_copy_pruned(src, o, out, id_map, ctx)).collect()
+}
+
+/// Flatten a name tree into its surviving (name, value) pairs, so the entries of
+/// several inputs can be unioned into one tree.
+fn flatten_name_tree(
+    src: &Document, val: &Object, out: &mut Document, id_map: &mut HashMap<ObjectId, ObjectId>,
+    ctx: &PruneCtx, depth: u32, into: &mut NameEntries,
+) {
+    let Some((_, d)) = resolve_catalog_dict(src, val) else {
+        return;
+    };
+    if depth > NAME_TREE_MAX_DEPTH {
+        return;
+    }
+    if let Some(names) = dict_array(src, &d, b"Names") {
+        let mut i = 0;
+        while i + 1 < names.len() {
+            if let Some(copied) = deep_copy_pruned(src, &names[i + 1], out, id_map, ctx) {
+                if let Ok(name) = names[i].as_str() {
+                    into.push((name.to_vec(), copied));
+                }
+            }
+            i += 2;
+        }
+    }
+    if let Some(kids) = dict_array(src, &d, b"Kids") {
+        for kid in kids {
+            flatten_name_tree(src, kid, out, id_map, ctx, depth + 1, into);
+        }
+    }
+}
+
+/// Emit merged name-tree entries as a single leaf ROOT node: sorted by name (a
+/// name tree is ordered by byte value — ISO 32000 7.9.6) and, being the root,
+/// carrying no /Limits.
+fn build_name_tree_root(out: &mut Document, mut entries: NameEntries) -> Object {
+    entries.sort_by(|a, b| a.0.cmp(&b.0));
+    let mut arr = Vec::with_capacity(entries.len() * 2);
+    for (name, value) in entries {
+        arr.push(Object::String(name, StringFormat::Literal));
+        arr.push(value);
+    }
+    let mut d = Dictionary::new();
+    d.set("Names", Object::Array(arr));
+    Object::Reference(out.add_object(Object::Dictionary(d)))
+}
+
+/// Take `name` in `taken`, suffixing it until it is free. `input` is 0-based, so
+/// the second input's colliding "toc" becomes "toc_2". An underscore keeps the
+/// result legal both as a name-tree string and as a catalog /Dests name.
+fn alloc_name(taken: &mut HashSet<Vec<u8>>, name: &[u8], input: usize) -> Vec<u8> {
+    if taken.insert(name.to_vec()) {
+        return name.to_vec();
+    }
+    let mut attempt = 0u32;
+    loop {
+        let suffix = if attempt == 0 {
+            format!("_{}", input + 1)
+        } else {
+            format!("_{}_{}", input + 1, attempt)
+        };
+        let mut candidate = name.to_vec();
+        candidate.extend_from_slice(suffix.as_bytes());
+        if taken.insert(candidate.clone()) {
+            return candidate;
+        }
+        attempt += 1;
+    }
+}
+
+/// Rewrite references to destinations renamed by collision resolution, in the
+/// objects one input contributed (everything with an id above `id_floor` —
+/// lopdf allocates ids by incrementing `max_id`, so that is exactly this
+/// input's copies).
+///
+/// A destination is named by a link annotation's /Dest or a /GoTo action's /D
+/// (ISO 32000 12.3.2.3, 12.6.4.2), as a string or — the PDF 1.1 form — a name.
+/// A remote destination (/GoToR, /GoToE) names an entry in ANOTHER file's
+/// tables and must not be touched.
+fn rewrite_dest_names(out: &mut Document, id_floor: u32, renames: &HashMap<Vec<u8>, Vec<u8>>) {
+    for (id, obj) in out.objects.iter_mut() {
+        if id.0 > id_floor {
+            rewrite_dest_names_obj(obj, renames);
+        }
+    }
+}
+
+fn rewrite_dest_names_obj(obj: &mut Object, renames: &HashMap<Vec<u8>, Vec<u8>>) {
+    match obj {
+        Object::Array(items) => items.iter_mut().for_each(|o| rewrite_dest_names_obj(o, renames)),
+        Object::Dictionary(d) => rewrite_dest_names_dict(d, renames),
+        Object::Stream(s) => rewrite_dest_names_dict(&mut s.dict, renames),
+        _ => {}
+    }
+}
+
+fn rewrite_dest_names_dict(d: &mut Dictionary, renames: &HashMap<Vec<u8>, Vec<u8>>) {
+    let local_goto = d.get(b"S").and_then(Object::as_name).is_ok_and(|s| s == b"GoTo");
+    for (k, v) in d.iter_mut() {
+        if k == b"Dest" || (local_goto && k == b"D") {
+            rewrite_dest_name_value(v, renames);
+        }
+        rewrite_dest_names_obj(v, renames);
+    }
+}
+
+/// Rewrite a destination reference that names a renamed destination. An array
+/// value is an explicit destination (no name involved) and is left alone.
+fn rewrite_dest_name_value(val: &mut Object, renames: &HashMap<Vec<u8>, Vec<u8>>) {
+    let renamed = match val {
+        Object::String(s, fmt) => renames.get(s.as_slice()).map(|n| Object::String(n.clone(), *fmt)),
+        Object::Name(n) => renames.get(n.as_slice()).map(|n| Object::Name(n.clone())),
+        _ => None,
+    };
+    if let Some(renamed) = renamed {
+        *val = renamed;
+    }
 }
 
 /// Build the /Pages tree node and /Catalog for the accumulated `kids`, wire
@@ -1168,8 +2037,27 @@ mod tests {
         path
     }
 
+    fn acroform_of(out: &Document) -> &Dictionary {
+        let acro = catalog_of(out).get(b"AcroForm").and_then(Object::as_reference).unwrap();
+        out.get_dictionary(acro).unwrap()
+    }
+
+    fn field_names(out: &Document) -> Vec<Vec<u8>> {
+        acroform_of(out)
+            .get(b"Fields")
+            .unwrap()
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|f| {
+                let d = out.get_dictionary(f.as_reference().unwrap()).unwrap();
+                d.get(b"T").unwrap().as_str().unwrap().to_vec()
+            })
+            .collect()
+    }
+
     #[test]
-    fn merge_multi_input_drops_acroform_without_dangling() {
+    fn merge_multi_input_merges_acroform_fields() {
         let mut a = build_acroform_doc(b"(a)");
         let mut b = build_acroform_doc(b"(b)");
         let pa = save_temp(&mut a, "pdfree_pagedoc_form_a.pdf");
@@ -1180,11 +2068,508 @@ mod tests {
         let _ = std::fs::remove_file(&pb);
 
         assert_eq!(out.get_pages().len(), 2, "merge must sum pages");
-        // Unmergeable across inputs: /AcroForm is dropped entirely so no
-        // input's widgets reference a form table that only holds another input.
-        assert!(catalog_of(&out).get(b"AcroForm").is_err(), "multi-input merge must drop /AcroForm");
-        // The widgets and their parent fields are still fully present (reached
-        // via the pages), so nothing dangles.
+        // BOTH inputs' fields are registered: a widget copied from input 2 that
+        // is not in /AcroForm /Fields is not an interactive field any more, and
+        // losing that silently is what this replaces.
+        assert_eq!(field_names(&out), vec![b"(a)".to_vec(), b"(b)".to_vec()]);
+        // A merged flag is the union: input B needing appearances must not be
+        // forgotten because input A did not.
+        assert_eq!(acroform_of(&out).get(b"NeedAppearances").unwrap().as_bool().unwrap(), true);
+
+        // Every field's widget is still the one on its own page.
+        let kids = kids_of(&out);
+        let fields = acroform_of(&out).get(b"Fields").unwrap().as_array().unwrap().to_vec();
+        for (field, page) in fields.iter().zip(kids.iter()) {
+            let fd = out.get_dictionary(field.as_reference().unwrap()).unwrap();
+            let widget_id = fd.get(b"Kids").unwrap().as_array().unwrap()[0].as_reference().unwrap();
+            let widget = out.get_dictionary(widget_id).unwrap();
+            assert_eq!(widget.get(b"P").unwrap().as_reference().unwrap(), *page);
+            assert_eq!(widget.get(b"Parent").unwrap().as_reference().unwrap(), field.as_reference().unwrap());
+            let annots = out.get_dictionary(*page).unwrap().get(b"Annots").unwrap().as_array().unwrap();
+            assert_eq!(annots[0].as_reference().unwrap(), widget_id, "widget stays on its page");
+        }
+        assert_no_dangling(&out);
+    }
+
+    /// A one-page doc with an /AcroForm carrying an /XFA packet.
+    fn build_xfa_doc() -> Document {
+        let mut doc = build_acroform_doc(b"(xfa)");
+        let acro = catalog_of(&doc).get(b"AcroForm").and_then(Object::as_reference).unwrap();
+        let xfa = doc.add_object(Stream::new(dictionary! {}, b"<xdp/>".to_vec()));
+        doc.get_dictionary_mut(acro).unwrap().set("XFA", Object::Reference(xfa));
+        doc
+    }
+
+    #[test]
+    fn merge_multi_input_rejects_xfa_form() {
+        let mut a = build_acroform_doc(b"(plain)");
+        let mut b = build_xfa_doc();
+        let pa = save_temp(&mut a, "pdfree_pagedoc_xfa_a.pdf");
+        let pb = save_temp(&mut b, "pdfree_pagedoc_xfa_b.pdf");
+
+        let err = merge(&[pa.clone(), pb.clone()]).unwrap_err();
+        let _ = std::fs::remove_file(&pa);
+        let _ = std::fs::remove_file(&pb);
+
+        // Honest refusal: an XFA form cannot be combined, so say so instead of
+        // emitting a document whose form quietly lost an input.
+        assert!(matches!(err, PageDocError::UnmergeableCatalog(what) if what.contains("XFA")), "got {err:?}");
+    }
+
+    // ---- finding 1: optional content survives a multi-input merge -----------
+
+    /// A one-page doc with one optional-content group. `hidden` puts it in the
+    /// input's own /D as initially invisible, via /BaseState /OFF (the form
+    /// that needs normalizing when merged with a /BaseState /ON input).
+    fn build_oc_doc(marker: &[u8], hidden: bool) -> Document {
+        let mut doc = Document::with_version("1.7");
+        let pages_id = doc.new_object_id();
+        let page_id = doc.new_object_id();
+        let c = doc.add_object(Stream::new(dictionary! {}, marker.to_vec()));
+        let ocg = doc.add_object(dictionary! {
+            "Type" => "OCG",
+            "Name" => Object::String(marker.to_vec(), lopdf::StringFormat::Literal),
+        });
+        doc.set_object(page_id, dictionary! {
+            "Type" => "Page",
+            "Parent" => Object::Reference(pages_id),
+            "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+            "Contents" => Object::Reference(c),
+            "Resources" => dictionary! {
+                "Properties" => dictionary! { "MC0" => Object::Reference(ocg) },
+            },
+        });
+        doc.set_object(pages_id, dictionary! {
+            "Type" => "Pages",
+            "Kids" => vec![Object::Reference(page_id)],
+            "Count" => 1,
+        });
+        let config = if hidden {
+            // "everything off except /ON", with nothing turned on.
+            dictionary! { "BaseState" => "OFF", "ON" => Object::Array(vec![]) }
+        } else {
+            dictionary! { "Order" => vec![Object::Reference(ocg)] }
+        };
+        let ocprops = doc.add_object(dictionary! {
+            "OCGs" => vec![Object::Reference(ocg)],
+            "D" => config,
+        });
+        let catalog_id = doc.add_object(dictionary! {
+            "Type" => "Catalog",
+            "Pages" => Object::Reference(pages_id),
+            "OCProperties" => Object::Reference(ocprops),
+        });
+        doc.trailer.set("Root", Object::Reference(catalog_id));
+        doc
+    }
+
+    #[test]
+    fn merge_multi_input_unions_ocgs_and_keeps_visibility() {
+        // Input A's group is visible; input B's is hidden by /BaseState /OFF.
+        let mut a = build_oc_doc(b"(a)", false);
+        let mut b = build_oc_doc(b"(b)", true);
+        let pa = save_temp(&mut a, "pdfree_pagedoc_oc_a.pdf");
+        let pb = save_temp(&mut b, "pdfree_pagedoc_oc_b.pdf");
+
+        let out = merge(&[pa.clone(), pb.clone()]).unwrap();
+        let _ = std::fs::remove_file(&pa);
+        let _ = std::fs::remove_file(&pb);
+
+        let ocp_ref = catalog_of(&out).get(b"OCProperties").and_then(Object::as_reference).unwrap();
+        let ocp = out.get_dictionary(ocp_ref).unwrap();
+        let ocgs = ocp.get(b"OCGs").unwrap().as_array().unwrap();
+        // Both inputs' groups are registered: an OCG missing from /OCProperties
+        // /OCGs is not optional content any more (its visibility is untouchable).
+        assert_eq!(ocgs.len(), 2, "both inputs' OCGs must be registered");
+
+        let cfg = ocp.get(b"D").unwrap().as_dict().unwrap();
+        assert!(cfg.get(b"BaseState").is_err(), "merged config uses the default /ON base state");
+        // B's group was hidden and stays hidden; A's stays visible.
+        let off = cfg.get(b"OFF").unwrap().as_array().unwrap();
+        assert_eq!(off.len(), 1, "only input B's group starts hidden");
+        let hidden = out.get_dictionary(off[0].as_reference().unwrap()).unwrap();
+        assert_eq!(hidden.get(b"Name").unwrap().as_str().unwrap(), b"(b)");
+        // Both are listed in the layers panel, including B, whose own config
+        // stated no /Order.
+        assert_eq!(cfg.get(b"Order").unwrap().as_array().unwrap().len(), 2);
+        assert_no_dangling(&out);
+    }
+
+    #[test]
+    fn merge_multi_input_rejects_alternate_oc_configs() {
+        let mut a = build_oc_doc(b"(a)", false);
+        let mut b = build_oc_doc(b"(b)", false);
+        // Give B an alternate configuration: it describes B's layers only, so
+        // there is no merged form of it that still means what B meant.
+        let ocp = catalog_of(&b).get(b"OCProperties").and_then(Object::as_reference).unwrap();
+        let alt = b.add_object(dictionary! { "Name" => Object::String(b"alt".to_vec(), lopdf::StringFormat::Literal) });
+        b.get_dictionary_mut(ocp).unwrap().set("Configs", vec![Object::Reference(alt)]);
+
+        let pa = save_temp(&mut a, "pdfree_pagedoc_occfg_a.pdf");
+        let pb = save_temp(&mut b, "pdfree_pagedoc_occfg_b.pdf");
+        let err = merge(&[pa.clone(), pb.clone()]).unwrap_err();
+        let _ = std::fs::remove_file(&pa);
+        let _ = std::fs::remove_file(&pb);
+
+        assert!(matches!(err, PageDocError::UnmergeableCatalog(what) if what.contains("Configs")), "got {err:?}");
+    }
+
+    // ---- finding 1: colliding named destinations are renamed, not dropped ---
+
+    /// A one-page doc with a named destination "toc" -> its page, and a link
+    /// annotation that reaches it BY NAME (/A /S /GoTo /D (toc)).
+    fn build_named_link_doc(marker: &[u8]) -> Document {
+        let mut doc = Document::with_version("1.7");
+        let pages_id = doc.new_object_id();
+        let page_id = doc.new_object_id();
+        let c = doc.add_object(Stream::new(dictionary! {}, marker.to_vec()));
+        let link = doc.add_object(dictionary! {
+            "Type" => "Annot",
+            "Subtype" => "Link",
+            "Rect" => vec![0.into(), 0.into(), 100.into(), 20.into()],
+            "A" => dictionary! {
+                "S" => "GoTo",
+                "D" => Object::String(b"toc".to_vec(), lopdf::StringFormat::Literal),
+            },
+        });
+        doc.set_object(page_id, dictionary! {
+            "Type" => "Page",
+            "Parent" => Object::Reference(pages_id),
+            "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+            "Contents" => Object::Reference(c),
+            "Annots" => vec![Object::Reference(link)],
+        });
+        doc.set_object(pages_id, dictionary! {
+            "Type" => "Pages",
+            "Kids" => vec![Object::Reference(page_id)],
+            "Count" => 1,
+        });
+        let dests = doc.add_object(dictionary! {
+            "Names" => vec![
+                Object::String(b"toc".to_vec(), lopdf::StringFormat::Literal),
+                Object::Array(vec![Object::Reference(page_id), "Fit".into()]),
+            ],
+        });
+        let names = doc.add_object(dictionary! { "Dests" => Object::Reference(dests) });
+        let catalog_id = doc.add_object(dictionary! {
+            "Type" => "Catalog",
+            "Pages" => Object::Reference(pages_id),
+            "Names" => Object::Reference(names),
+        });
+        doc.trailer.set("Root", Object::Reference(catalog_id));
+        doc
+    }
+
+    /// The merged /Names /Dests as (name, target page) pairs.
+    fn merged_dests(out: &Document) -> Vec<(Vec<u8>, ObjectId)> {
+        let names_ref = catalog_of(out).get(b"Names").and_then(Object::as_reference).unwrap();
+        let names = out.get_dictionary(names_ref).unwrap();
+        let dests_ref = names.get(b"Dests").and_then(Object::as_reference).unwrap();
+        let dests = out.get_dictionary(dests_ref).unwrap();
+        let arr = dests.get(b"Names").unwrap().as_array().unwrap();
+        assert!(dests.get(b"Limits").is_err(), "a name-tree ROOT must not carry /Limits");
+        arr.chunks(2)
+            .map(|p| {
+                let page = p[1].as_array().unwrap()[0].as_reference().unwrap();
+                (p[0].as_str().unwrap().to_vec(), page)
+            })
+            .collect()
+    }
+
+    /// The name a page's /A /S /GoTo link asks for.
+    fn goto_name(out: &Document, page: ObjectId) -> Vec<u8> {
+        let annots = out.get_dictionary(page).unwrap().get(b"Annots").unwrap().as_array().unwrap();
+        let annot = out.get_dictionary(annots[0].as_reference().unwrap()).unwrap();
+        let action = annot.get(b"A").unwrap().as_dict().unwrap();
+        action.get(b"D").unwrap().as_str().unwrap().to_vec()
+    }
+
+    #[test]
+    fn merge_multi_input_suffixes_colliding_dest_names() {
+        // Both inputs name a destination "toc". Neither may be dropped, and
+        // neither input's link may end up pointing at the other's page.
+        let mut a = build_named_link_doc(b"(a)");
+        let mut b = build_named_link_doc(b"(b)");
+        let pa = save_temp(&mut a, "pdfree_pagedoc_dest_a.pdf");
+        let pb = save_temp(&mut b, "pdfree_pagedoc_dest_b.pdf");
+
+        let out = merge(&[pa.clone(), pb.clone()]).unwrap();
+        let _ = std::fs::remove_file(&pa);
+        let _ = std::fs::remove_file(&pb);
+
+        let kids = kids_of(&out);
+        let dests = merged_dests(&out);
+        assert_eq!(dests.len(), 2, "both destinations must survive the collision");
+        // Input 1 keeps the name; input 2's is suffixed. Each still resolves to
+        // the page it was written for.
+        assert_eq!(dests[0], (b"toc".to_vec(), kids[0]));
+        assert_eq!(dests[1], (b"toc_2".to_vec(), kids[1]));
+        // ... and each input's link follows its own destination: the renamed
+        // one is rewritten only in the input that was renamed.
+        assert_eq!(goto_name(&out, kids[0]), b"toc".to_vec());
+        assert_eq!(goto_name(&out, kids[1]), b"toc_2".to_vec());
+        assert_no_dangling(&out);
+    }
+
+    // ---- finding 2: an INDIRECT /Annots array duplicates correctly ----------
+
+    /// Like `build_annotated_page_doc`, but /Annots is an INDIRECT reference to
+    /// the array — the shape a raw `as_array()` fails on.
+    fn build_indirect_annots_doc() -> Document {
+        let mut doc = Document::with_version("1.7");
+        let pages_id = doc.new_object_id();
+        let page_id = doc.new_object_id();
+        let c = doc.add_object(Stream::new(dictionary! {}, b"(x)".to_vec()));
+        let annot_id = doc.add_object(dictionary! {
+            "Type" => "Annot",
+            "Subtype" => "Link",
+            "Rect" => vec![0.into(), 0.into(), 100.into(), 20.into()],
+            "P" => Object::Reference(page_id),
+            "Dest" => vec![Object::Reference(page_id), "Fit".into()],
+        });
+        let annots_id = doc.add_object(Object::Array(vec![Object::Reference(annot_id)]));
+        doc.set_object(page_id, dictionary! {
+            "Type" => "Page",
+            "Parent" => Object::Reference(pages_id),
+            "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+            "Contents" => Object::Reference(c),
+            "Annots" => Object::Reference(annots_id),
+        });
+        doc.set_object(pages_id, dictionary! {
+            "Type" => "Pages",
+            "Kids" => vec![Object::Reference(page_id)],
+            "Count" => 1,
+        });
+        let catalog_id = doc.add_object(dictionary! {
+            "Type" => "Catalog",
+            "Pages" => Object::Reference(pages_id),
+        });
+        doc.trailer.set("Root", Object::Reference(catalog_id));
+        doc
+    }
+
+    #[test]
+    fn duplicated_page_with_indirect_annots_is_independent() {
+        let doc = build_indirect_annots_doc();
+        let out = extract_pages(&doc, "1,1").unwrap();
+
+        let kids = kids_of(&out);
+        assert_eq!(kids.len(), 2);
+        assert_ne!(kids[0], kids[1], "the two page objects must be distinct");
+
+        // Each page owns its annots array and its annotation objects: the
+        // duplicate must not reuse the canonical page's already-copied array
+        // (whose annots' /P point at the FIRST copy).
+        let mut annot_ids = Vec::new();
+        for &kid in &kids {
+            let page = out.get_dictionary(kid).unwrap();
+            let annots = page.get(b"Annots").unwrap().as_array().unwrap();
+            assert_eq!(annots.len(), 1);
+            let annot_id = annots[0].as_reference().unwrap();
+            annot_ids.push(annot_id);
+            let annot = out.get_dictionary(annot_id).unwrap();
+            assert_eq!(annot.get(b"P").unwrap().as_reference().unwrap(), kid, "/P must parent to own page");
+            let dest = annot.get(b"Dest").unwrap().as_array().unwrap()[0].as_reference().unwrap();
+            assert_eq!(dest, kid, "self /Dest must follow the duplicate");
+        }
+        assert_ne!(annot_ids[0], annot_ids[1], "annotations must be independent objects");
+        assert_no_dangling(&out);
+    }
+
+    // ---- finding 3: rebuilt name trees carry recomputed /Limits -------------
+
+    /// Three-page doc with a TWO-LEVEL /Dests name tree: a root with /Kids ->
+    /// two leaves that each carry /Limits and /Names. Leaf A holds "a" -> p1
+    /// (kept) and "b" -> p3 (excluded); leaf B holds only names on p3.
+    fn build_two_level_dest_tree_doc() -> Document {
+        let mut doc = Document::with_version("1.7");
+        let pages_id = doc.new_object_id();
+        let p1 = doc.new_object_id();
+        let p2 = doc.new_object_id();
+        let p3 = doc.new_object_id();
+        for (id, body) in [(p1, &b"(one)"[..]), (p2, &b"(two)"[..]), (p3, &b"(three)"[..])] {
+            let c = doc.add_object(Stream::new(dictionary! {}, body.to_vec()));
+            doc.set_object(id, dictionary! {
+                "Type" => "Page",
+                "Parent" => Object::Reference(pages_id),
+                "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+                "Contents" => Object::Reference(c),
+            });
+        }
+        doc.set_object(pages_id, dictionary! {
+            "Type" => "Pages",
+            "Kids" => vec![Object::Reference(p1), Object::Reference(p2), Object::Reference(p3)],
+            "Count" => 3,
+        });
+        let lit = |s: &[u8]| Object::String(s.to_vec(), lopdf::StringFormat::Literal);
+        let leaf_a = doc.add_object(dictionary! {
+            "Limits" => vec![lit(b"a"), lit(b"b")],
+            "Names" => vec![
+                lit(b"a"), Object::Array(vec![Object::Reference(p1), "Fit".into()]),
+                lit(b"b"), Object::Array(vec![Object::Reference(p3), "Fit".into()]),
+            ],
+        });
+        let leaf_b = doc.add_object(dictionary! {
+            "Limits" => vec![lit(b"c"), lit(b"d")],
+            "Names" => vec![
+                lit(b"c"), Object::Array(vec![Object::Reference(p3), "Fit".into()]),
+                lit(b"d"), Object::Array(vec![Object::Reference(p3), "Fit".into()]),
+            ],
+        });
+        let root = doc.add_object(dictionary! {
+            "Kids" => vec![Object::Reference(leaf_a), Object::Reference(leaf_b)],
+        });
+        let names_id = doc.add_object(dictionary! { "Dests" => Object::Reference(root) });
+        let catalog_id = doc.add_object(dictionary! {
+            "Type" => "Catalog",
+            "Pages" => Object::Reference(pages_id),
+            "Names" => Object::Reference(names_id),
+        });
+        doc.trailer.set("Root", Object::Reference(catalog_id));
+        doc
+    }
+
+    #[test]
+    fn pruned_name_tree_recomputes_limits_and_prunes_empty_kids() {
+        let doc = build_two_level_dest_tree_doc();
+        let out = extract_pages(&doc, "1").unwrap();
+        let kept_page = kids_of(&out)[0];
+
+        let names_ref = catalog_of(&out).get(b"Names").and_then(Object::as_reference).unwrap();
+        let names = out.get_dictionary(names_ref).unwrap();
+        let root_ref = names.get(b"Dests").and_then(Object::as_reference).unwrap();
+        let root = out.get_dictionary(root_ref).unwrap();
+        // The ROOT of a name tree must not carry /Limits (ISO 32000 7.9.6).
+        assert!(root.get(b"Limits").is_err(), "root must have no /Limits");
+
+        // Leaf B kept nothing (all its dests were on the excluded page): it is
+        // pruned, not left behind as an empty child.
+        let kids = root.get(b"Kids").unwrap().as_array().unwrap();
+        assert_eq!(kids.len(), 1, "the child that kept no names must be pruned");
+
+        // Leaf A kept only "a", so its /Limits is recomputed to ["a" "a"] —
+        // a stale ["a" "b"] would send a reader looking for "b" into a node
+        // that no longer has it, and no /Limits at all is not legal here.
+        let leaf = out.get_dictionary(kids[0].as_reference().unwrap()).unwrap();
+        let limits = leaf.get(b"Limits").unwrap().as_array().unwrap();
+        assert_eq!(limits[0].as_str().unwrap(), b"a");
+        assert_eq!(limits[1].as_str().unwrap(), b"a");
+
+        // ... and the surviving destination still resolves to the kept page.
+        let entries = leaf.get(b"Names").unwrap().as_array().unwrap();
+        assert_eq!(entries.len(), 2, "only the surviving name/dest pair remains");
+        assert_eq!(entries[0].as_str().unwrap(), b"a");
+        assert_eq!(entries[1].as_array().unwrap()[0].as_reference().unwrap(), kept_page);
+
+        assert_eq!(count_page_objects(&out), 1, "excluded pages must not be re-embedded");
+        assert_no_dangling(&out);
+    }
+
+    // ---- finding 4: a field spanning pages keeps its surviving widgets ------
+
+    /// Two-page doc with a radio group whose /Kids holds two widgets, placed on
+    /// the (1-based) pages given. `[1, 2]` is the shape that used to lose the
+    /// whole field on a split; `[2, 2]` leaves nothing behind when page 1 is
+    /// the one kept.
+    fn build_radio_doc(widget_pages: [usize; 2]) -> Document {
+        let mut doc = Document::with_version("1.7");
+        let pages_id = doc.new_object_id();
+        let pages = [doc.new_object_id(), doc.new_object_id()];
+        let field_id = doc.new_object_id();
+
+        let widgets: Vec<ObjectId> = widget_pages
+            .iter()
+            .map(|&p| {
+                doc.add_object(dictionary! {
+                    "Type" => "Annot",
+                    "Subtype" => "Widget",
+                    "Rect" => vec![0.into(), 0.into(), 20.into(), 20.into()],
+                    "P" => Object::Reference(pages[p - 1]),
+                    "Parent" => Object::Reference(field_id),
+                    "AS" => "Off",
+                })
+            })
+            .collect();
+        doc.set_object(field_id, dictionary! {
+            "FT" => "Btn",
+            "Ff" => 32768,  // radio button group
+            "T" => Object::String(b"choice".to_vec(), lopdf::StringFormat::Literal),
+            "V" => "Off",
+            "Kids" => widgets.iter().map(|&w| Object::Reference(w)).collect::<Vec<_>>(),
+        });
+        for (i, &page) in pages.iter().enumerate() {
+            let c = doc.add_object(Stream::new(dictionary! {}, b"(x)".to_vec()));
+            let annots: Vec<Object> = widgets
+                .iter()
+                .zip(widget_pages.iter())
+                .filter(|(_, p)| **p == i + 1)
+                .map(|(w, _)| Object::Reference(*w))
+                .collect();
+            doc.set_object(page, dictionary! {
+                "Type" => "Page",
+                "Parent" => Object::Reference(pages_id),
+                "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+                "Contents" => Object::Reference(c),
+                "Annots" => annots,
+            });
+        }
+        doc.set_object(pages_id, dictionary! {
+            "Type" => "Pages",
+            "Kids" => pages.iter().map(|&p| Object::Reference(p)).collect::<Vec<_>>(),
+            "Count" => 2,
+        });
+        let acroform_id = doc.add_object(dictionary! { "Fields" => vec![Object::Reference(field_id)] });
+        let catalog_id = doc.add_object(dictionary! {
+            "Type" => "Catalog",
+            "Pages" => Object::Reference(pages_id),
+            "AcroForm" => Object::Reference(acroform_id),
+        });
+        doc.trailer.set("Root", Object::Reference(catalog_id));
+        doc
+    }
+
+    #[test]
+    fn split_keeps_field_with_widgets_on_several_pages() {
+        let doc = build_radio_doc([1, 2]);
+        let out = extract_pages(&doc, "1").unwrap();
+        let page = kids_of(&out)[0];
+
+        // The field survives: rejecting the whole graph because ONE kid sat on
+        // page 2 used to drop the group from the form entirely.
+        assert_eq!(field_names(&out), vec![b"choice".to_vec()]);
+        let field_id = acroform_of(&out).get(b"Fields").unwrap().as_array().unwrap()[0]
+            .as_reference()
+            .unwrap();
+        let field = out.get_dictionary(field_id).unwrap();
+
+        // Only the page-1 widget remains in /Kids; the page-2 one is pruned.
+        let kids = field.get(b"Kids").unwrap().as_array().unwrap();
+        assert_eq!(kids.len(), 1, "only the kept page's widget stays in /Kids");
+        let widget_id = kids[0].as_reference().unwrap();
+        let widget = out.get_dictionary(widget_id).unwrap();
+        assert_eq!(widget.get(b"P").unwrap().as_reference().unwrap(), page);
+        // The widget is still ON the page, and parented to the copied field:
+        // following /Parent must never delete a kept page's widget.
+        let annots = out.get_dictionary(page).unwrap().get(b"Annots").unwrap().as_array().unwrap();
+        assert_eq!(annots.len(), 1, "the widget must stay on its page");
+        assert_eq!(annots[0].as_reference().unwrap(), widget_id);
+        assert_eq!(widget.get(b"Parent").unwrap().as_reference().unwrap(), field_id);
+
+        assert_eq!(count_page_objects(&out), 1, "page 2 must not be re-embedded");
+        assert_no_dangling(&out);
+    }
+
+    #[test]
+    fn split_drops_field_whose_widgets_all_went() {
+        // Both widgets sit on page 2; keeping page 1 leaves the field with no
+        // kid to be attached to, so it is dropped from /Fields rather than left
+        // registered (and pointing at widgets that are not in the document).
+        let doc = build_radio_doc([2, 2]);
+        let out = extract_pages(&doc, "1").unwrap();
+
+        let fields = acroform_of(&out).get(b"Fields").unwrap().as_array().unwrap();
+        assert!(fields.is_empty(), "a field with no surviving widget must be dropped");
+        assert_eq!(count_page_objects(&out), 1);
         assert_no_dangling(&out);
     }
 
