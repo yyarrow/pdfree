@@ -105,6 +105,25 @@ pub(crate) fn replace_run_reflow(
         }
     }
 
+    // Paint-order contiguity: if a NON-run segment was painted between two of
+    // the edited run's segments, collapsing the run to one show would flip
+    // its stacking order — refuse. (Overlapping colored/annotation overlays.)
+    let run_lo = run_segs.iter().map(|&i| (segs[i].op_idx, segs[i].str_idx)).min().unwrap();
+    let run_hi = run_segs.iter().map(|&i| (segs[i].op_idx, segs[i].str_idx)).max().unwrap();
+    for (i, s) in segs.iter().enumerate() {
+        let pos = (s.op_idx, s.str_idx);
+        if pos > run_lo && pos < run_hi && !run_segs.contains(&i) {
+            return Err(ReplaceError::NeedsReflow);
+        }
+    }
+
+    // Non-UTF-8 font names: Seg.font is a lossy String, so a resource name
+    // with non-UTF-8 bytes round-trips to replacement characters and would
+    // name a nonexistent /Font. Refuse rather than emit a broken Tf.
+    if line_segs.iter().any(|&si| segs[si].font.contains('\u{FFFD}')) {
+        return Err(ReplaceError::NeedsReflow);
+    }
+
     // CTM-uniformity guard: regenerated ops are all spliced at the first
     // show position, so they execute under ONE live CTM. If the line's
     // chunks were drawn under different CTMs (cm/q between them), that's
@@ -265,6 +284,13 @@ pub(crate) fn replace_run_reflow(
     let new_w = (plan.adv_em / 1000.0 * plan.size + n_codes * sp.char_spacing + n_spaces * sp.word_spacing)
         * sp.h_scale
         * x_scale;
+    // Our CID advance is a fabricated chars*1000/em placeholder, not the
+    // descendant font's real /W metrics — a proportional Type0 font would
+    // shift following runs by the wrong distance. Refuse CID reflow until
+    // /W parsing lands (same-length CID never computes a delta, so it's safe).
+    if plan.cid {
+        return Err(ReplaceError::NeedsReflow);
+    }
     let delta = new_w - old_w;
 
     let line_end: f32 = mline.bbox[2];
