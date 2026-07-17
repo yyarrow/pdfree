@@ -92,6 +92,20 @@ enum Cmd {
         #[arg(long)]
         order: String,
     },
+    /// Concatenate the pages of several PDFs into one, in argument order.
+    Merge {
+        output: String,
+        #[arg(required = true, num_args = 1..)]
+        inputs: Vec<String>,
+    },
+    /// Write a new PDF containing only the selected pages.
+    Split {
+        input: String,
+        output: String,
+        /// 1-based page range spec, e.g. "1-3,5,8-10".
+        #[arg(long)]
+        pages: String,
+    },
 }
 
 fn main() {
@@ -238,6 +252,20 @@ fn run(cli: Cli) -> Result<String, Box<dyn std::error::Error>> {
             Ok(serde_json::to_string(&serde_json::json!({
                 "order": order_list,
             }))?)
+        }
+        Cmd::Merge { output, inputs } => {
+            let paths: Vec<std::path::PathBuf> = inputs.iter().map(std::path::PathBuf::from).collect();
+            let mut doc = pdfree_core::merge(&paths)?;
+            doc.save(&output)?;
+            let pages = doc.get_pages().len();
+            Ok(serde_json::to_string(&serde_json::json!({ "pages": pages }))?)
+        }
+        Cmd::Split { input, output, pages } => {
+            let doc = pdfree_core::load_with_salvage(std::path::Path::new(&input))?;
+            let mut out = pdfree_core::extract_pages(&doc, &pages)?;
+            out.save(&output)?;
+            let n = out.get_pages().len();
+            Ok(serde_json::to_string(&serde_json::json!({ "pages": n }))?)
         }
     }
 }
