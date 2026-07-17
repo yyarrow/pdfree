@@ -6,6 +6,7 @@
 
 pub mod edit;
 mod matrix;
+pub mod metadata;
 pub mod model;
 pub mod reflow;
 pub mod replace;
@@ -18,6 +19,7 @@ pub mod walk;
 
 pub use edit::replace_run_text;
 pub use lopdf;
+pub use metadata::{read_info, set_info, MetadataError};
 pub use model::{build_page_model, MBlock};
 pub use replace::{replace_text, ReplaceError, ReplaceReport};
 pub use salvage::{load_with_salvage, load_with_salvage_bytes};

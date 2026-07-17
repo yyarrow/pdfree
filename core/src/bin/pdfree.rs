@@ -48,6 +48,23 @@ enum Cmd {
         #[arg(long)]
         fallback_font: Option<String>,
     },
+    /// Print the /Info document metadata dictionary as JSON.
+    Info { input: String },
+    /// Set fields on /Info, leaving unspecified fields untouched.
+    SetInfo {
+        input: String,
+        output: String,
+        #[arg(long)]
+        title: Option<String>,
+        #[arg(long)]
+        author: Option<String>,
+        #[arg(long)]
+        subject: Option<String>,
+        #[arg(long)]
+        keywords: Option<String>,
+        #[arg(long)]
+        creator: Option<String>,
+    },
 }
 
 fn main() {
@@ -118,6 +135,40 @@ fn run(cli: Cli) -> Result<String, Box<dyn std::error::Error>> {
             let report = pdfree_core::replace_text(&mut doc, page, &find, &with_text, ttf.as_ref())?;
             doc.save(&output)?;
             Ok(serde_json::to_string(&report)?)
+        }
+        Cmd::Info { input } => {
+            let doc = pdfree_core::load_with_salvage(std::path::Path::new(&input))?;
+            Ok(serde_json::to_string(&pdfree_core::read_info(&doc))?)
+        }
+        Cmd::SetInfo {
+            input,
+            output,
+            title,
+            author,
+            subject,
+            keywords,
+            creator,
+        } => {
+            let mut fields: Vec<(&str, &str)> = Vec::new();
+            if let Some(v) = &title {
+                fields.push(("Title", v));
+            }
+            if let Some(v) = &author {
+                fields.push(("Author", v));
+            }
+            if let Some(v) = &subject {
+                fields.push(("Subject", v));
+            }
+            if let Some(v) = &keywords {
+                fields.push(("Keywords", v));
+            }
+            if let Some(v) = &creator {
+                fields.push(("Creator", v));
+            }
+            let mut doc = pdfree_core::load_with_salvage(std::path::Path::new(&input))?;
+            pdfree_core::set_info(&mut doc, &fields)?;
+            doc.save(&output)?;
+            Ok(serde_json::to_string(&pdfree_core::read_info(&doc))?)
         }
     }
 }
