@@ -50,6 +50,39 @@ pub struct Seg {
     pub horizontal: bool,
     #[serde(skip)]
     pub glyphs: Vec<Glyph>,
+    /// Full text-rendering matrix (Tm x CTM) at the segment's start — the
+    /// anchor for regenerating this segment's ops with absolute positions.
+    #[serde(skip)]
+    pub trm: [f32; 6],
+    /// CTM at the segment, for converting user-space targets back to Tm.
+    #[serde(skip)]
+    pub ctm: [f32; 6],
+    /// Text line matrix AFTER this segment's op completed — the state the
+    /// following operations' Td/TD/T* derive from.
+    #[serde(skip)]
+    pub tlm_after: [f32; 6],
+    /// Text-spacing state active for this segment (needed to reproduce its
+    /// exact advance when regenerating): char spacing, word spacing,
+    /// horizontal scale (Tz/100).
+    #[serde(skip)]
+    pub char_spacing: f32,
+    #[serde(skip)]
+    pub word_spacing: f32,
+    #[serde(skip)]
+    pub h_scale: f32,
+    /// True when the fill color came from a pattern/separation space we
+    /// only approximated (scn with a name operand) — such runs can't be
+    /// faithfully re-emitted as rg.
+    pub pattern_fill: bool,
+    /// Text rendering mode (Tr): fill/stroke/clip. Regeneration must not
+    /// change it, so lines with mixed Tr refuse.
+    #[serde(skip)]
+    pub render_mode: i64,
+    /// The exact nonstroking-color operator + numeric operands active for
+    /// this segment (e.g. ("g",[0.0]) or ("rg",[1,0,0])), so regeneration
+    /// replays the ORIGINAL color space instead of flattening to rg.
+    #[serde(skip)]
+    pub fill_op: (String, Vec<f32>),
 }
 
 /// Graphics state saved/restored by q/Q — the CTM plus the text state set
@@ -65,6 +98,13 @@ struct GfxState {
     h_scale: f32,
     render_mode: i64,
     fill_color: [f32; 3],
+    pattern_fill: bool,
+    /// True while the nonstroking color space (set by `cs`) is a plain
+    /// device space we can reproduce with rg/g/k. Separation/DeviceN/Pattern/
+    /// ICC set this false, so any scn under them is flagged unreproducible.
+    fill_device_cs: bool,
+    /// Original nonstroking-color operator + operands, for faithful replay.
+    fill_op: (String, Vec<f32>),
 }
 
 impl GfxState {
@@ -79,6 +119,9 @@ impl GfxState {
             h_scale: 1.0,
             render_mode: 0,
             fill_color: [0.0, 0.0, 0.0],
+            pattern_fill: false,
+            fill_device_cs: true,
+            fill_op: ("g".to_string(), vec![0.0]), // initial nonstroking color is black
         }
     }
 }
@@ -470,6 +513,7 @@ pub fn walk_page(doc: &Document, page_id: lopdf::ObjectId, page_no: u32) -> lopd
 
     for (op_idx, op) in content.operations.iter().enumerate() {
         let ops = &op.operands;
+        let segs_before_op = segs.len();
         match op.operator.as_str() {
             "q" => gs_stack.push(gs.clone()),
             "Q" => {
@@ -512,22 +556,63 @@ pub fn walk_page(doc: &Document, page_id: lopdf::ObjectId, page_no: u32) -> lopd
             }
             // Fill color (approximated to RGB; stroke color doesn't matter
             // for the text model).
-            "rg" if ops.len() == 3 => gs.fill_color = [op_f32(&ops[0]), op_f32(&ops[1]), op_f32(&ops[2])],
+            "rg" if ops.len() == 3 => {
+                gs.fill_color = [op_f32(&ops[0]), op_f32(&ops[1]), op_f32(&ops[2])];
+                gs.pattern_fill = false;
+                gs.fill_device_cs = true;
+                gs.fill_op = ("rg".into(), vec![op_f32(&ops[0]), op_f32(&ops[1]), op_f32(&ops[2])]);
+            }
             "g" if ops.len() == 1 => {
                 let v = op_f32(&ops[0]);
                 gs.fill_color = [v, v, v];
+                gs.pattern_fill = false;
+                gs.fill_device_cs = true;
+                gs.fill_op = ("g".into(), vec![v]);
             }
             "k" if ops.len() == 4 => {
                 gs.fill_color = cmyk_to_rgb(op_f32(&ops[0]), op_f32(&ops[1]), op_f32(&ops[2]), op_f32(&ops[3]));
+                gs.pattern_fill = false;
+                gs.fill_device_cs = true;
+                gs.fill_op = ("k".into(), ops.iter().map(op_f32).collect());
             }
-            "cs" => gs.fill_color = [0.0, 0.0, 0.0], // new colorspace resets to its initial color
+            "cs" => {
+                gs.fill_color = [0.0, 0.0, 0.0]; // new colorspace resets to its initial color
+                // Only the named device spaces are safe to reproduce as
+                // rg/g/k; Separation, DeviceN, ICCBased, Indexed, Pattern and
+                // resource-named spaces are not (numeric scn under them is a
+                // tint, not device components). The INITIAL color under a
+                // non-device space is likewise unreproducible, so flag now.
+                let name = ops.first().and_then(|o| o.as_name().ok()).unwrap_or(b"");
+                gs.fill_device_cs = matches!(name, b"DeviceRGB" | b"DeviceGray" | b"DeviceCMYK");
+                gs.pattern_fill = !gs.fill_device_cs;
+                // Record the initial-color fill_op in the SELECTED space, not
+                // always "g 0" — regenerating "g" under a DeviceRGB line would
+                // switch the space to DeviceGray for following content.
+                gs.fill_op = match name {
+                    b"DeviceRGB" => ("rg".into(), vec![0.0, 0.0, 0.0]),
+                    b"DeviceCMYK" => ("k".into(), vec![0.0, 0.0, 0.0, 1.0]),
+                    _ => ("g".into(), vec![0.0]),
+                };
+            }
             "sc" | "scn" => {
-                // Component count tells the colorspace family well enough.
+                // Pattern (trailing name) or a non-device color space means a
+                // fill we can only approximate — flag it so reflow refuses.
+                let has_name = ops.last().map(|o| o.as_name().is_ok()).unwrap_or(false);
+                gs.pattern_fill = has_name || !gs.fill_device_cs;
                 let nums: Vec<f32> = ops.iter().filter_map(|o| o.as_float().ok()).collect();
                 match nums.len() {
-                    1 => gs.fill_color = [nums[0], nums[0], nums[0]],
-                    3 => gs.fill_color = [nums[0], nums[1], nums[2]],
-                    4 => gs.fill_color = cmyk_to_rgb(nums[0], nums[1], nums[2], nums[3]),
+                    1 => {
+                        gs.fill_color = [nums[0], nums[0], nums[0]];
+                        gs.fill_op = ("g".into(), vec![nums[0]]);
+                    }
+                    3 => {
+                        gs.fill_color = [nums[0], nums[1], nums[2]];
+                        gs.fill_op = ("rg".into(), nums.clone());
+                    }
+                    4 => {
+                        gs.fill_color = cmyk_to_rgb(nums[0], nums[1], nums[2], nums[3]);
+                        gs.fill_op = ("k".into(), nums.clone());
+                    }
                     _ => {}
                 }
             }
@@ -589,6 +674,11 @@ pub fn walk_page(doc: &Document, page_id: lopdf::ObjectId, page_no: u32) -> lopd
                 }
             }
             _ => {}
+        }
+        // Backfill: segments emitted by this op record the text line matrix
+        // as it stands once the op is done — what following Td/T* build on.
+        for seg in &mut segs[segs_before_op..] {
+            seg.tlm_after = tlm.0;
         }
     }
 
@@ -681,6 +771,15 @@ fn show_string(
             color: gs.fill_color,
             horizontal,
             glyphs,
+            trm: trm.0,
+            ctm: gs.ctm.0,
+            tlm_after: [0.0; 6], // filled in by walk_page once the op ends
+            char_spacing: gs.char_spacing,
+            word_spacing: gs.word_spacing,
+            h_scale: gs.h_scale,
+            pattern_fill: gs.pattern_fill,
+            render_mode: gs.render_mode,
+            fill_op: gs.fill_op.clone(),
         });
     }
 

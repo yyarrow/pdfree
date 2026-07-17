@@ -50,6 +50,12 @@ function loadEngine(): Promise<Engine> {
   enginePromise ??= (async () => {
     const mod = await import(/* webpackIgnore: true */ "/wasm/pdfree_wasm.js" as string);
     await mod.default({ module_or_path: "/wasm/pdfree_wasm_bg.wasm" });
+    // The wasm is fetched at runtime while the page bundle may be a stale
+    // browser-cached copy from an earlier deploy — surface the mismatch as
+    // a refresh hint instead of a cryptic missing-function error.
+    if (typeof (mod as { DocSession?: unknown }).DocSession !== "function") {
+      throw new Error("页面已更新，请强制刷新后重试（Cmd+Shift+R）");
+    }
     return mod as unknown as Engine;
   })();
   return enginePromise;
@@ -69,8 +75,8 @@ function friendlyError(msg: string): string {
   if (msg.includes("cannot represent")) {
     return "字体缺少所需字形且兜底失败，这段暂时改不了";
   }
-  if (msg.includes("reflow")) {
-    return "目前只支持等长替换（字数相同）；增删字数需要重排功能，正在开发中";
+  if (msg.includes("reflow") || msg.includes("length differs")) {
+    return "改完这一行放不下了（超出段落或页面宽度）；段内自动换行还在开发中";
   }
   if (msg.includes("not found")) {
     return "没有定位到这段文字，可能刚被改过，请重试";

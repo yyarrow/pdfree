@@ -55,7 +55,11 @@ pub(crate) fn reject_encrypted(doc: &Document) -> Result<(), ReplaceError> {
     Ok(())
 }
 
-/// How many places in the document reference `target`.
+/// Document-wide count of references to `target`. Page /Contents is not the
+/// only possible referrer — an appearance stream, Form XObject, or any other
+/// reachable dictionary can share the object — so the full object graph is
+/// scanned. Called only on the copy-on-write reuse path, so the cost is
+/// incidental to an edit, not per-op.
 fn reference_count(doc: &Document, target: ObjectId) -> usize {
     fn count_in(obj: &Object, target: ObjectId) -> usize {
         match obj {
@@ -497,11 +501,21 @@ fn finish_swap(
     if visual_ratio > 1.0 {
         bbox[2] = bbox[0] + (bbox[2] - bbox[0]) * visual_ratio;
     }
-    // A larger calibrated size can also render taller than the original box.
-    if swap_size > seg.font_size && seg.font_size > 0.0 {
-        let grow = (bbox[3] - bbox[1]) * (swap_size / seg.font_size - 1.0) * 0.5;
-        bbox[1] -= grow;
-        bbox[3] += grow;
+    // A calibrated size renders with OUR font's metrics, not the original's.
+    // swap_size is a Tf (text-space) value — map the vertical extent through
+    // the text rendering matrix so scaled/rotated text gets a correct box.
+    // Symmetric ±1.15em because a y-flipped matrix (Skia negative-d) makes
+    // our normal font extend the opposite way from the baseline.
+    if (swap_size - seg.font_size).abs() > 0.01 {
+        let trm = crate::matrix::Mat(seg.trm);
+        let ext = 1.15 * swap_size;
+        // Baseline origin and the ±extent, all through the matrix.
+        let (bx, by) = trm.apply(0.0, 0.0);
+        let (_, uy) = trm.apply(0.0, ext);
+        let (_, ly) = trm.apply(0.0, -ext);
+        let _ = bx;
+        bbox[1] = bbox[1].min(by.min(uy).min(ly));
+        bbox[3] = bbox[3].max(by.max(uy).max(ly));
     }
     Ok(ReplaceReport {
         page: page_no,
@@ -514,7 +528,7 @@ fn finish_swap(
 /// Register `font_id` under a fresh name in the page's /Resources /Font,
 /// creating dictionaries as needed. Handles both inline and referenced
 /// Resources/Font dicts (adding a key to a shared dict is harmless).
-fn add_font_resource(doc: &mut Document, page_id: ObjectId, font_id: ObjectId) -> Result<String, ReplaceError> {
+pub(crate) fn add_font_resource(doc: &mut Document, page_id: ObjectId, font_id: ObjectId) -> Result<String, ReplaceError> {
     enum Loc {
         Inline,
         Ref(ObjectId),
