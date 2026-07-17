@@ -42,8 +42,12 @@ pub fn merge(inputs: &[PathBuf]) -> Result<Document, PageDocError> {
     let mut out = Document::with_version("1.7");
     let pages_id = out.new_object_id();
     let mut kids = Vec::new();
+    // Document-level catalog data (named dests, AcroForm, ...) to carry over.
+    // Cross-document merging of these tables is a known limitation, so we only
+    // keep the FIRST input's; for a single input this preserves everything.
+    let mut extra_catalog: Vec<(Vec<u8>, Object)> = Vec::new();
 
-    for path in inputs {
+    for (idx, path) in inputs.iter().enumerate() {
         let src = crate::load_with_salvage(path).map_err(|e| PageDocError::Load(path.clone(), e))?;
         check_not_encrypted(&src)?;
 
@@ -51,16 +55,32 @@ pub fn merge(inputs: &[PathBuf]) -> Result<Document, PageDocError> {
         // source file, and this also lets pages from the same source that
         // share a Resources/font dict dedupe onto the same copied object.
         let mut id_map = HashMap::new();
-        for (_, page_id) in src.get_pages() {
-            let new_id = copy_page(&src, page_id, &mut out, &mut id_map)?;
+        let pages = src.get_pages();
+
+        // Pre-register every source page id -> a fresh output id BEFORE copying
+        // anything. A page reached transitively while another page is being
+        // deep-copied (e.g. a Link/annotation /Dest pointing at it) then
+        // resolves to the SAME object that lands in /Kids, instead of an
+        // orphaned early duplicate that later gets stranded off the page tree.
+        for (_, &page_id) in &pages {
+            let new_id = out.new_object_id();
+            id_map.insert(page_id, new_id);
+        }
+        for (_, &page_id) in &pages {
+            let new_id = id_map[&page_id];
+            copy_page_into(&src, page_id, new_id, &mut out, &mut id_map)?;
             if let Ok(dict) = out.get_object_mut(new_id).and_then(Object::as_dict_mut) {
                 dict.set("Parent", Object::Reference(pages_id));
             }
             kids.push(Object::Reference(new_id));
         }
+
+        if idx == 0 {
+            extra_catalog = collect_carried_catalog(&src, &mut id_map, &mut out);
+        }
     }
 
-    finish_document(out, pages_id, kids)
+    finish_document(out, pages_id, kids, extra_catalog)
 }
 
 /// Write a new document containing only the pages of `doc` selected by
@@ -76,16 +96,41 @@ pub fn extract_pages(doc: &Document, spec: &str) -> Result<Document, PageDocErro
     let mut kids = Vec::new();
     let mut id_map = HashMap::new();
 
-    for p in selected {
+    // Pre-register a canonical output id for each DISTINCT selected page id
+    // before copying, so transitive cross-page links resolve to the page
+    // object that actually lands in /Kids rather than an orphan duplicate.
+    for &p in &selected {
         let &page_id = pages.get(&p).ok_or(PageDocError::PageOutOfRange(p, pages.len()))?;
-        let new_id = copy_page(doc, page_id, &mut out, &mut id_map)?;
+        id_map.entry(page_id).or_insert_with(|| out.new_object_id());
+    }
+
+    let mut filled: HashSet<ObjectId> = HashSet::new();
+    for &p in &selected {
+        let &page_id = pages.get(&p).ok_or(PageDocError::PageOutOfRange(p, pages.len()))?;
+        let canonical = id_map[&page_id];
+        let new_id = if filled.insert(page_id) {
+            // First (canonical) copy of this page: fill its pre-registered id.
+            copy_page_into(doc, page_id, canonical, &mut out, &mut id_map)?;
+            canonical
+        } else {
+            // Same page selected more than once (duplicates are allowed): emit
+            // a distinct page object so /Kids never lists one object twice. It
+            // shares content/resource streams with the canonical copy via
+            // id_map, and the canonical mapping is left untouched so cross-page
+            // links keep resolving to the first copy.
+            let dup = out.new_object_id();
+            copy_page_into(doc, page_id, dup, &mut out, &mut id_map)?;
+            dup
+        };
         if let Ok(dict) = out.get_object_mut(new_id).and_then(Object::as_dict_mut) {
             dict.set("Parent", Object::Reference(pages_id));
         }
         kids.push(Object::Reference(new_id));
     }
 
-    finish_document(out, pages_id, kids)
+    // Single input: carry over the whole document-level catalog data set.
+    let extra_catalog = collect_carried_catalog(doc, &mut id_map, &mut out);
+    finish_document(out, pages_id, kids, extra_catalog)
 }
 
 /// Parse "1-3,5,8-10" into an ordered, 1-based page number list. Ranges must
@@ -104,22 +149,28 @@ fn parse_page_spec(spec: &str, page_count: usize) -> Result<Vec<u32>, PageDocErr
             if a == 0 || b == 0 || a > b {
                 return Err(PageDocError::BadRangeSpec(spec.to_string()));
             }
+            // Bounds-check BEFORE materializing the range. A spec like
+            // "1-4294967295" on a small document must be rejected here, not
+            // after `Vec::extend` has already tried to allocate billions of
+            // entries (DoS/OOM). Since a <= b, checking the upper endpoint
+            // covers every page number the range would produce.
+            if b as usize > page_count {
+                return Err(PageDocError::PageOutOfRange(b, page_count));
+            }
             out.extend(a..=b);
         } else {
             let p: u32 = part.parse().map_err(|_| PageDocError::BadRangeSpec(spec.to_string()))?;
             if p == 0 {
                 return Err(PageDocError::BadRangeSpec(spec.to_string()));
             }
+            if p as usize > page_count {
+                return Err(PageDocError::PageOutOfRange(p, page_count));
+            }
             out.push(p);
         }
     }
     if out.is_empty() {
         return Err(PageDocError::EmptySelection);
-    }
-    for &p in &out {
-        if p as usize > page_count {
-            return Err(PageDocError::PageOutOfRange(p, page_count));
-        }
     }
     Ok(out)
 }
@@ -176,23 +227,26 @@ fn resolve_inherited(doc: &Document, page_id: ObjectId) -> Result<Dictionary, Pa
 }
 
 /// Deep-copy one page (with inherited attributes materialized) from `src`
-/// into `out`, returning its new object id. /Parent is dropped here; the
-/// caller sets it to point at the new document's Pages root.
-fn copy_page(
-    src: &Document, page_id: ObjectId, out: &mut Document, id_map: &mut HashMap<ObjectId, ObjectId>,
-) -> Result<ObjectId, PageDocError> {
+/// into the caller-supplied, pre-allocated output id `new_id`. /Parent is
+/// dropped here; the caller re-points it at the new document's Pages root.
+///
+/// `new_id` MUST already be registered in `id_map` as the mapping for
+/// `page_id` (the caller pre-registers every page id up front). That keeps
+/// self-references (an Annot's /P) and transitive cross-page links (another
+/// page's /Dest pointing here) resolving to THIS object — the one placed in
+/// /Kids — instead of spawning an orphaned duplicate. It also breaks
+/// reference cycles: the id is mapped before we recurse into the content.
+fn copy_page_into(
+    src: &Document, page_id: ObjectId, new_id: ObjectId, out: &mut Document,
+    id_map: &mut HashMap<ObjectId, ObjectId>,
+) -> Result<(), PageDocError> {
     let mut page_dict = resolve_inherited(src, page_id)?;
     page_dict.remove(b"Parent");
     page_dict.set("Type", Object::Name(b"Page".to_vec()));
 
-    // Register the new id before recursing: an Annot's /P (or similar
-    // self-reference back to the page) must resolve to the copy, not
-    // trigger a second copy or infinite recursion.
-    let new_id = out.new_object_id();
-    id_map.insert(page_id, new_id);
     let new_dict = deep_copy_dict(src, &page_dict, out, id_map);
     out.set_object(new_id, Object::Dictionary(new_dict));
-    Ok(new_id)
+    Ok(())
 }
 
 /// Deep-copy an arbitrary object graph reachable from `obj`, translating
@@ -247,11 +301,65 @@ fn copy_object_id(
     new_id
 }
 
+/// Document-level catalog keys carried over from a source catalog so features
+/// that live above the page tree keep working after merge/split: named
+/// destinations (/Names, /Dests), interactive form (/AcroForm), optional
+/// content (/OCProperties), document language (/Lang), and viewer intent
+/// (/ViewerPreferences, /PageLayout, /PageMode).
+///
+/// /StructTreeRoot is deliberately NOT carried: its /K structure holds parent
+/// pointers into content and marked-content sequences we cannot guarantee
+/// stay consistent across an arbitrary page subset, so we drop it rather than
+/// emit a dangling/inconsistent tagging tree. Cross-document merging of these
+/// tables (multi-input merge) is also unsupported — see `merge`, which only
+/// carries the first input's entries. Both are known limitations.
+const CARRIED_CATALOG_KEYS: &[&[u8]] = &[
+    b"Names",
+    b"Dests",
+    b"AcroForm",
+    b"OCProperties",
+    b"Lang",
+    b"ViewerPreferences",
+    b"PageLayout",
+    b"PageMode",
+];
+
+/// Deep-copy the carried document-level entries out of `src`'s catalog through
+/// the SAME `id_map` used for the pages, so their references (e.g. a named
+/// destination's page reference, an AcroForm field's /P and widget) resolve
+/// onto the freshly copied page objects instead of dangling. Returns the
+/// copied (key, value) pairs for `finish_document` to place on the new catalog.
+///
+/// Must be called AFTER the pages have been copied, so page ids and their
+/// annotations/widgets are already present in `id_map` and get reused rather
+/// than duplicated.
+fn collect_carried_catalog(
+    src: &Document, id_map: &mut HashMap<ObjectId, ObjectId>, out: &mut Document,
+) -> Vec<(Vec<u8>, Object)> {
+    let mut carried = Vec::new();
+    let Ok(root) = src.trailer.get(b"Root").and_then(Object::as_reference) else {
+        return carried;
+    };
+    let Ok(catalog) = src.get_dictionary(root) else {
+        return carried;
+    };
+    for &key in CARRIED_CATALOG_KEYS {
+        if let Ok(val) = catalog.get(key) {
+            let copied = deep_copy(src, val, out, id_map);
+            carried.push((key.to_vec(), copied));
+        }
+    }
+    carried
+}
+
 /// Build the /Pages tree node and /Catalog for the accumulated `kids`, wire
-/// up the trailer's /Root, and return the finished document. /Count and
-/// /Size are set here (writer.rs fills /Size from max_id on save too, but we
-/// set it defensively in case that changes).
-fn finish_document(mut out: Document, pages_id: ObjectId, kids: Vec<Object>) -> Result<Document, PageDocError> {
+/// up the trailer's /Root, and return the finished document. `extra_catalog`
+/// carries document-level entries (named dests, AcroForm, ...) copied from the
+/// source catalog. /Count and /Size are set here (writer.rs fills /Size from
+/// max_id on save too, but we set it defensively in case that changes).
+fn finish_document(
+    mut out: Document, pages_id: ObjectId, kids: Vec<Object>, extra_catalog: Vec<(Vec<u8>, Object)>,
+) -> Result<Document, PageDocError> {
     if kids.is_empty() {
         return Err(PageDocError::EmptySelection);
     }
@@ -265,10 +373,203 @@ fn finish_document(mut out: Document, pages_id: ObjectId, kids: Vec<Object>) -> 
     let mut catalog = Dictionary::new();
     catalog.set("Type", Object::Name(b"Catalog".to_vec()));
     catalog.set("Pages", Object::Reference(pages_id));
+    for (key, val) in extra_catalog {
+        catalog.set(key, val);
+    }
     let catalog_id = out.add_object(Object::Dictionary(catalog));
 
     out.trailer.set("Root", Object::Reference(catalog_id));
     out.trailer.set("Size", (out.max_id + 1) as i64);
 
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use lopdf::{dictionary, Stream};
+
+    // ---- finding 1: range bounds checked before expansion -----------------
+
+    #[test]
+    fn huge_range_rejected_before_expansion() {
+        // Would attempt a multi-gigabyte Vec if the range were materialized
+        // before the bounds check. Must return quickly with PageOutOfRange.
+        let err = parse_page_spec("1-4294967295", 3).unwrap_err();
+        assert!(matches!(err, PageDocError::PageOutOfRange(4294967295, 3)), "got {err:?}");
+    }
+
+    #[test]
+    fn single_page_out_of_range_rejected() {
+        let err = parse_page_spec("9", 3).unwrap_err();
+        assert!(matches!(err, PageDocError::PageOutOfRange(9, 3)), "got {err:?}");
+    }
+
+    #[test]
+    fn valid_spec_keeps_order_and_duplicates() {
+        assert_eq!(parse_page_spec("1-3,2", 3).unwrap(), vec![1, 2, 3, 2]);
+    }
+
+    // ---- finding 2: cross-page link maps to the canonical /Kids page -------
+
+    /// Two-page doc where page 1 carries a Link annotation whose /Dest points
+    /// (by indirect reference) at page 2. Copying page 1 therefore reaches
+    /// page 2 transitively before page 2's own turn.
+    fn build_cross_linked_doc() -> Document {
+        let mut doc = Document::with_version("1.7");
+        let pages_id = doc.new_object_id();
+        let page1_id = doc.new_object_id();
+        let page2_id = doc.new_object_id();
+
+        let c1 = doc.add_object(Stream::new(dictionary! {}, b"BT /F1 12 Tf (one) Tj ET".to_vec()));
+        let c2 = doc.add_object(Stream::new(dictionary! {}, b"BT /F1 12 Tf (two) Tj ET".to_vec()));
+
+        let link_id = doc.add_object(dictionary! {
+            "Type" => "Annot",
+            "Subtype" => "Link",
+            "Rect" => vec![0.into(), 0.into(), 100.into(), 20.into()],
+            "Dest" => vec![Object::Reference(page2_id), "Fit".into()],
+        });
+
+        doc.set_object(page1_id, dictionary! {
+            "Type" => "Page",
+            "Parent" => Object::Reference(pages_id),
+            "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+            "Contents" => Object::Reference(c1),
+            "Annots" => vec![Object::Reference(link_id)],
+        });
+        doc.set_object(page2_id, dictionary! {
+            "Type" => "Page",
+            "Parent" => Object::Reference(pages_id),
+            "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+            "Contents" => Object::Reference(c2),
+        });
+        doc.set_object(pages_id, dictionary! {
+            "Type" => "Pages",
+            "Kids" => vec![Object::Reference(page1_id), Object::Reference(page2_id)],
+            "Count" => 2,
+        });
+        let catalog_id = doc.add_object(dictionary! {
+            "Type" => "Catalog",
+            "Pages" => Object::Reference(pages_id),
+        });
+        doc.trailer.set("Root", Object::Reference(catalog_id));
+        doc
+    }
+
+    fn kids_of(out: &Document) -> Vec<ObjectId> {
+        let root = out.trailer.get(b"Root").and_then(Object::as_reference).unwrap();
+        let catalog = out.get_dictionary(root).unwrap();
+        let pages_ref = catalog.get(b"Pages").and_then(Object::as_reference).unwrap();
+        let pages = out.get_dictionary(pages_ref).unwrap();
+        pages
+            .get(b"Kids")
+            .unwrap()
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|o| o.as_reference().unwrap())
+            .collect()
+    }
+
+    fn assert_link_resolves_to_kids(out: &Document) {
+        let kids = kids_of(out);
+        assert_eq!(kids.len(), 2);
+
+        let page1 = out.get_dictionary(kids[0]).unwrap();
+        let annots = page1.get(b"Annots").unwrap().as_array().unwrap();
+        let annot = out.get_dictionary(annots[0].as_reference().unwrap()).unwrap();
+        let dest = annot.get(b"Dest").unwrap().as_array().unwrap();
+        let dest_page = dest[0].as_reference().unwrap();
+
+        // The link must point at the second kid — the real page-2 object that
+        // is in /Kids — not an orphaned duplicate copied out of turn.
+        assert_eq!(dest_page, kids[1], "link /Dest must resolve to the page in /Kids");
+        assert!(out.get_dictionary(dest_page).is_ok());
+        // And that page must be wired back into the new page tree.
+        let dp = out.get_dictionary(dest_page).unwrap();
+        assert!(dp.get(b"Parent").and_then(Object::as_reference).is_ok());
+    }
+
+    #[test]
+    fn extract_preserves_cross_page_link() {
+        let doc = build_cross_linked_doc();
+        let out = extract_pages(&doc, "1-2").unwrap();
+        assert_link_resolves_to_kids(&out);
+    }
+
+    #[test]
+    fn merge_single_preserves_cross_page_link() {
+        // Write the constructed doc to a temp file and merge it (single input).
+        let mut doc = build_cross_linked_doc();
+        let path = std::env::temp_dir().join("pdfree_pagedoc_crosslink.pdf");
+        doc.save(&path).unwrap();
+        let out = merge(&[path.clone()]).unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert_link_resolves_to_kids(&out);
+    }
+
+    // ---- finding 3: document-level catalog data survives -------------------
+
+    #[test]
+    fn extract_carries_named_dests() {
+        let mut doc = Document::with_version("1.7");
+        let pages_id = doc.new_object_id();
+        let page1_id = doc.new_object_id();
+        let c1 = doc.add_object(Stream::new(dictionary! {}, b" ".to_vec()));
+        doc.set_object(page1_id, dictionary! {
+            "Type" => "Page",
+            "Parent" => Object::Reference(pages_id),
+            "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+            "Contents" => Object::Reference(c1),
+        });
+        doc.set_object(pages_id, dictionary! {
+            "Type" => "Pages",
+            "Kids" => vec![Object::Reference(page1_id)],
+            "Count" => 1,
+        });
+        // A /Dests name tree whose destination points at page 1.
+        let dests_id = doc.add_object(dictionary! {
+            "Names" => vec![
+                Object::String(b"target".to_vec(), lopdf::StringFormat::Literal),
+                Object::Array(vec![Object::Reference(page1_id), "Fit".into()]),
+            ],
+        });
+        let names_id = doc.add_object(dictionary! { "Dests" => Object::Reference(dests_id) });
+        let catalog_id = doc.add_object(dictionary! {
+            "Type" => "Catalog",
+            "Pages" => Object::Reference(pages_id),
+            "Names" => Object::Reference(names_id),
+            "Lang" => Object::String(b"en-US".to_vec(), lopdf::StringFormat::Literal),
+        });
+        doc.trailer.set("Root", Object::Reference(catalog_id));
+
+        let out = extract_pages(&doc, "1").unwrap();
+
+        let root = out.trailer.get(b"Root").and_then(Object::as_reference).unwrap();
+        let catalog = out.get_dictionary(root).unwrap();
+        assert!(catalog.get(b"Lang").is_ok(), "/Lang must survive");
+        let names_ref = catalog.get(b"Names").and_then(Object::as_reference).unwrap();
+        let names = out.get_dictionary(names_ref).unwrap();
+        let dests_ref = names.get(b"Dests").and_then(Object::as_reference).unwrap();
+        let dests = out.get_dictionary(dests_ref).unwrap();
+        let arr = dests.get(b"Names").unwrap().as_array().unwrap();
+        let dest_val = arr[1].as_array().unwrap();
+        let dest_page = dest_val[0].as_reference().unwrap();
+
+        // The named destination must resolve to the page that is in /Kids.
+        let kids = {
+            let pages_ref = catalog.get(b"Pages").and_then(Object::as_reference).unwrap();
+            let pages = out.get_dictionary(pages_ref).unwrap();
+            pages
+                .get(b"Kids")
+                .unwrap()
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|o| o.as_reference().unwrap())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(dest_page, kids[0], "named dest must point at the copied page in /Kids");
+    }
 }
