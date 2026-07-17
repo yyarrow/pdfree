@@ -65,6 +65,33 @@ enum Cmd {
         #[arg(long)]
         creator: Option<String>,
     },
+    /// Rotate selected pages by a multiple of 90 degrees (added to current rotation).
+    Rotate {
+        input: String,
+        output: String,
+        /// 1-based page spec, e.g. "1-2,4".
+        #[arg(long)]
+        pages: String,
+        /// One of 90, 180, 270, -90.
+        #[arg(long, allow_negative_numbers = true)]
+        degrees: i64,
+    },
+    /// Delete selected pages from the document.
+    DeletePages {
+        input: String,
+        output: String,
+        /// 1-based page spec, e.g. "1-2,4".
+        #[arg(long)]
+        pages: String,
+    },
+    /// Reorder pages to a given permutation.
+    Reorder {
+        input: String,
+        output: String,
+        /// 1-based permutation of 1..=N, e.g. "3,1,2".
+        #[arg(long)]
+        order: String,
+    },
 }
 
 fn main() {
@@ -169,6 +196,48 @@ fn run(cli: Cli) -> Result<String, Box<dyn std::error::Error>> {
             pdfree_core::set_info(&mut doc, &fields)?;
             doc.save(&output)?;
             Ok(serde_json::to_string(&pdfree_core::read_info(&doc))?)
+        }
+        Cmd::Rotate {
+            input,
+            output,
+            pages,
+            degrees,
+        } => {
+            if ![90, 180, 270, -90].contains(&degrees) {
+                return Err("degrees must be one of 90, 180, 270, -90".into());
+            }
+            let mut doc = pdfree_core::load_with_salvage(std::path::Path::new(&input))?;
+            let num_pages = doc.get_pages().len() as u32;
+            let page_list = pdfree_core::parse_page_spec(&pages, num_pages)?;
+            pdfree_core::rotate_pages(&mut doc, &page_list, degrees)?;
+            doc.save(&output)?;
+            Ok(serde_json::to_string(&serde_json::json!({
+                "pages_rotated": page_list,
+                "degrees": degrees,
+            }))?)
+        }
+        Cmd::DeletePages { input, output, pages } => {
+            let mut doc = pdfree_core::load_with_salvage(std::path::Path::new(&input))?;
+            let num_pages_before = doc.get_pages().len() as u32;
+            let page_list = pdfree_core::parse_page_spec(&pages, num_pages_before)?;
+            pdfree_core::delete_pages(&mut doc, &page_list)?;
+            let num_pages_after = doc.get_pages().len() as u32;
+            doc.save(&output)?;
+            Ok(serde_json::to_string(&serde_json::json!({
+                "pages_deleted": page_list,
+                "pages_before": num_pages_before,
+                "pages_after": num_pages_after,
+            }))?)
+        }
+        Cmd::Reorder { input, output, order } => {
+            let mut doc = pdfree_core::load_with_salvage(std::path::Path::new(&input))?;
+            let num_pages = doc.get_pages().len() as u32;
+            let order_list = pdfree_core::parse_order_spec(&order, num_pages)?;
+            pdfree_core::reorder_pages(&mut doc, &order_list)?;
+            doc.save(&output)?;
+            Ok(serde_json::to_string(&serde_json::json!({
+                "order": order_list,
+            }))?)
         }
     }
 }
