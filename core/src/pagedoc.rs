@@ -113,7 +113,7 @@ pub fn merge(inputs: &[PathBuf]) -> Result<Document, PageDocError> {
     }
 
     if !single_input {
-        extra_catalog = merger.finish(&mut out);
+        extra_catalog = merger.finish(&mut out)?;
     }
     finish_document(out, pages_id, kids, extra_catalog)
 }
@@ -429,10 +429,7 @@ fn copy_duplicate_page(
     for (k, v) in page_dict.iter() {
         if k == b"Annots" {
             if let Some(items) = dict_array(src, &page_dict, b"Annots") {
-                let kept: Vec<Object> = items
-                    .iter()
-                    .filter_map(|a| copy_dup_annot(src, a, canonical_id, dup_id, out, id_map, ctx))
-                    .collect();
+                let kept = copy_dup_annots(src, items, canonical_id, dup_id, out, id_map, ctx);
                 nd.set(k.clone(), Object::Array(kept));
                 continue;
             }
@@ -448,31 +445,171 @@ fn copy_duplicate_page(
     Ok(())
 }
 
-/// Copy one annotation of a duplicated page into a FRESH object (not shared
-/// with the canonical copy) and re-target it at the duplicate. The annotation's
-/// inner structure (/AP appearance streams, resources) is still shared via
-/// `id_map`. Any reference that pruned copying resolved to the canonical page
-/// (the annot's own /P, a self-referential link /Dest or /A /D) is rewritten to
-/// the duplicate so the two instances are independent. Returns None if the
-/// annotation targets an excluded page (dropped, like on the canonical copy).
-fn copy_dup_annot(
-    src: &Document, annot: &Object, canonical_id: ObjectId, dup_id: ObjectId,
+/// Per-dup-page context for copying a duplicated page's annotation set into
+/// fresh, self-contained objects.
+#[derive(Clone, Copy)]
+struct DupAnnots<'a> {
+    /// Source annotation ids listed on THIS page. A reference from one annotation
+    /// to another in this set (/IRT in-reply-to, /Popup, a popup's /Parent back
+    /// to its markup annotation) is retargeted to the dup's OWN fresh copy rather
+    /// than resolved — through the shared id_map — to the canonical page's copy.
+    set: &'a HashSet<ObjectId>,
+    /// The canonical page's output id and this duplicate's output id: a reference
+    /// that resolves to the (shared) canonical page — an annot's /P, a
+    /// self-referential /Dest — is redirected to the duplicate.
+    canonical_id: ObjectId,
+    dup_id: ObjectId,
+}
+
+/// Copy the /Annots of a page selected more than once into FRESH objects that do
+/// not share their annotation graph with the canonical copy (finding: a
+/// duplicated reply/popup used to point at the first copy's annotations). Each
+/// annotation is copied into a fresh id kept in a per-dup `local` map; a nested
+/// reference to another annotation of THIS page (in `set`) is copied through
+/// `local` too, so the two page instances are fully independent. References that
+/// leave the set — shared /AP streams, a widget's form-field /Parent — still
+/// dedupe via `id_map` exactly as on the canonical copy.
+fn copy_dup_annots(
+    src: &Document, items: &[Object], canonical_id: ObjectId, dup_id: ObjectId,
     out: &mut Document, id_map: &mut HashMap<ObjectId, ObjectId>, ctx: &PruneCtx,
-) -> Option<Object> {
-    let annot_dict = match annot {
-        Object::Reference(id) => src.get_dictionary(*id).ok()?,
-        Object::Dictionary(d) => d,
-        _ => return None,
+) -> Vec<Object> {
+    let set: HashSet<ObjectId> = items.iter().filter_map(|a| a.as_reference().ok()).collect();
+    let dup = DupAnnots { set: &set, canonical_id, dup_id };
+    let mut local: HashMap<ObjectId, ObjectId> = HashMap::new();
+    let mut kept = Vec::new();
+    for a in items {
+        match a.as_reference() {
+            Ok(id) => {
+                if let Some(nid) = copy_dup_annot_id(src, id, dup, out, id_map, &mut local, ctx) {
+                    kept.push(Object::Reference(nid));
+                }
+            }
+            // A direct (inline) annotation dictionary: copy it standalone, still
+            // retargeting page references and any intra-set links.
+            Err(_) => {
+                if let Some(mut obj) = deep_copy_dup(src, a, dup, out, id_map, &mut local, ctx) {
+                    retarget_object(&mut obj, canonical_id, dup_id);
+                    kept.push(obj);
+                }
+            }
+        }
+    }
+    kept
+}
+
+/// Copy one annotation of a duplicated page into a FRESH object registered in
+/// the per-dup `local` map (NOT `id_map`, so the canonical copy keeps its own).
+/// Returns None if the annotation targets an excluded page.
+fn copy_dup_annot_id(
+    src: &Document, id: ObjectId, dup: DupAnnots, out: &mut Document,
+    id_map: &mut HashMap<ObjectId, ObjectId>, local: &mut HashMap<ObjectId, ObjectId>, ctx: &PruneCtx,
+) -> Option<ObjectId> {
+    if let Some(&nid) = local.get(&id) {
+        return Some(nid);
+    }
+    let Ok(dict) = src.get_dictionary(id) else {
+        return None;
     };
-    // Copy the annotation's contents into a fresh dictionary WITHOUT registering
-    // the source annotation id in id_map, so the canonical copy keeps its own
-    // annotation object. Shared substructure (/AP etc.) still dedupes via id_map.
-    let mut copied = deep_copy_dict_pruned(src, annot_dict, out, id_map, ctx)?;
-    // pruned copy mapped every reference to the annot's own (canonical) page to
-    // `canonical_id`; redirect those to the duplicate. Covers /P and any
-    // self-referential destination.
-    retarget_dict(&mut copied, canonical_id, dup_id);
-    Some(Object::Reference(out.add_object(Object::Dictionary(copied))))
+    let new_id = out.new_object_id();
+    local.insert(id, new_id); // before recursing: breaks annot <-> popup cycles
+    match deep_copy_dup_dict(src, dict, dup, out, id_map, local, ctx) {
+        Some(mut nd) => {
+            // Every reference that resolved to the annot's own (canonical) page —
+            // its /P, a self-referential /Dest or /A /D — becomes the duplicate's.
+            retarget_dict(&mut nd, dup.canonical_id, dup.dup_id);
+            out.set_object(new_id, Object::Dictionary(nd));
+            Some(new_id)
+        }
+        None => {
+            local.remove(&id);
+            None
+        }
+    }
+}
+
+/// Deep-copy a duplicated annotation's dictionary. Intra-set references resolve
+/// to the dup's own copies; everything else shares via `id_map`. The markup
+/// back-links /IRT and /Popup are dropped (key only) if their target cannot be
+/// resolved within the set, rather than left pointing at the canonical page.
+fn deep_copy_dup_dict(
+    src: &Document, d: &Dictionary, dup: DupAnnots, out: &mut Document,
+    id_map: &mut HashMap<ObjectId, ObjectId>, local: &mut HashMap<ObjectId, ObjectId>, ctx: &PruneCtx,
+) -> Option<Dictionary> {
+    let mut nd = Dictionary::new();
+    for (k, v) in d.iter() {
+        // /Parent: a popup's back-link to its markup annotation is intra-set and
+        // follows the dup; a widget's form-field parent leaves the set (shared
+        // via id_map); a page-tree parent is dropped.
+        if k == b"Parent" {
+            if let Ok(pid) = v.as_reference() {
+                if dup.set.contains(&pid) {
+                    if let Some(nid) = copy_dup_annot_id(src, pid, dup, out, id_map, local, ctx) {
+                        nd.set(k.clone(), Object::Reference(nid));
+                    }
+                    continue;
+                }
+                if is_page_tree_node(src, pid) {
+                    continue;
+                }
+                if let Some(nid) = copy_field_node(src, pid, out, id_map, ctx) {
+                    nd.set(k.clone(), Object::Reference(nid));
+                }
+                continue;
+            }
+        }
+        match deep_copy_dup(src, v, dup, out, id_map, local, ctx) {
+            Some(cv) => {
+                nd.set(k.clone(), cv);
+            }
+            // /IRT and /Popup are intra-set back-links: if the target could not be
+            // reproduced in this dup, drop just the key. Any other unresolved key
+            // targets an excluded page and takes the annotation with it.
+            None => {
+                if k != b"IRT" && k != b"Popup" {
+                    return None;
+                }
+            }
+        }
+    }
+    Some(nd)
+}
+
+/// Deep-copy one value of a duplicated annotation. A reference to another
+/// annotation of the same page (in `dup.set`) is copied into the dup's own set;
+/// any other reference shares the canonical copy via `id_map`.
+fn deep_copy_dup(
+    src: &Document, obj: &Object, dup: DupAnnots, out: &mut Document,
+    id_map: &mut HashMap<ObjectId, ObjectId>, local: &mut HashMap<ObjectId, ObjectId>, ctx: &PruneCtx,
+) -> Option<Object> {
+    match obj {
+        Object::Reference(old_id) => {
+            if dup.set.contains(old_id) {
+                Some(Object::Reference(copy_dup_annot_id(src, *old_id, dup, out, id_map, local, ctx)?))
+            } else {
+                copy_ref_pruned(src, *old_id, out, id_map, ctx)
+            }
+        }
+        Object::Array(items) => {
+            let mut arr = Vec::with_capacity(items.len());
+            for it in items {
+                arr.push(deep_copy_dup(src, it, dup, out, id_map, local, ctx)?);
+            }
+            Some(Object::Array(arr))
+        }
+        Object::Dictionary(d) => {
+            Some(Object::Dictionary(deep_copy_dup_dict(src, d, dup, out, id_map, local, ctx)?))
+        }
+        Object::Stream(s) => {
+            let dict = deep_copy_dup_dict(src, &s.dict, dup, out, id_map, local, ctx)?;
+            Some(Object::Stream(lopdf::Stream {
+                dict,
+                content: s.content.clone(),
+                allows_compression: s.allows_compression,
+                start_position: None,
+            }))
+        }
+        other => Some(other.clone()),
+    }
 }
 
 /// Rewrite every indirect reference to `from` into a reference to `to`,
@@ -1052,6 +1189,17 @@ struct CatalogMerger {
     langs: HashSet<Option<Vec<u8>>>,
     /// Viewer-intent keys, from the first input that has each.
     viewer: Dictionary,
+    /// Fully-qualified /AcroForm field names taken so far. A name two inputs both
+    /// use makes an ambiguous form namespace (the same fully qualified name is
+    /// one field per ISO 32000 12.7.3.2, but the two came from independent
+    /// documents) — the merge is refused rather than silently misrouted.
+    field_names: HashSet<Vec<u8>>,
+    /// Any input carried a JavaScript action (finding 5): if a destination is
+    /// also renamed for a collision, JS that names dests by opaque string cannot
+    /// be rewritten to match, so the merge is refused.
+    has_javascript: bool,
+    /// A destination was renamed to resolve a name collision (see `has_javascript`).
+    dest_renamed: bool,
 }
 
 /// Name-tree entries flattened out of their tree: (name, value), unordered.
@@ -1081,6 +1229,11 @@ struct FormAccum {
     dr: Option<Dictionary>,
     /// /DA, /Q, /CO ...: from the first input that has each.
     extra: Dictionary,
+    /// The first form input's default appearance (/DA) and quadding (/Q), kept to
+    /// compare against later inputs (finding 3): a later input that disagrees has
+    /// no common default, so the merge is refused rather than clobbering one.
+    da: Option<Vec<u8>>,
+    q: Option<i64>,
 }
 
 #[derive(Default)]
@@ -1114,7 +1267,10 @@ impl CatalogMerger {
         if let Ok(val) = catalog.get(b"OCProperties") {
             self.add_oc_properties(src, val, out, id_map, ctx)?;
         }
-        self.add_destinations(src, catalog, out, id_map, ctx, mark);
+        // Finding 5: note JS before merging destinations, so a rename in any input
+        // combined with JS in any input can be refused at `finish`.
+        self.has_javascript |= source_has_javascript(src);
+        self.add_destinations(src, catalog, out, id_map, ctx, mark)?;
 
         // /Lang labels the WHOLE document. Inputs that disagree (or one that
         // says nothing) have no common answer, so rather than mislabel another
@@ -1137,12 +1293,17 @@ impl CatalogMerger {
 
     /// Concatenate one input's /AcroForm /Fields onto the merged form.
     ///
-    /// Two inputs may both use a field name: per ISO 32000 12.7.3.2 fields with
-    /// the same fully qualified name ARE one field, so those two will share a
-    /// value in the merged document. Both fields survive and stay interactive —
-    /// unlike renaming them, which would break any /JavaScript or FDF naming
-    /// them — so the merge keeps the data and the caveat stays visible in the
-    /// output rather than being papered over.
+    /// Two independent inputs that both use a fully-qualified field name (both
+    /// `total`) cannot be merged: per ISO 32000 12.7.3.2 that name is ONE field,
+    /// so concatenating both roots makes an ambiguous namespace whose value is
+    /// undefined, and renaming a field would break the /JavaScript or FDF that
+    /// names it. So a cross-input name collision refuses the merge (finding 2);
+    /// non-colliding fields still concatenate and stay interactive.
+    ///
+    /// The calculation order (/CO) and default appearance (/DA//Q) that live on
+    /// the form as a whole are likewise refused when later inputs disagree
+    /// (finding 3): there is no single order or default that means what each
+    /// input meant, and taking the first input's would silently clobber the rest.
     fn add_acroform(
         &mut self, src: &Document, val: &Object, out: &mut Document,
         id_map: &mut HashMap<ObjectId, ObjectId>, ctx: &PruneCtx,
@@ -1158,6 +1319,16 @@ impl CatalogMerger {
             return Err(PageDocError::UnmergeableCatalog("an XFA form (/AcroForm /XFA)"));
         }
 
+        // Finding 2: a fully-qualified field name shared with an EARLIER input is
+        // unmergeable. Names within THIS input collide only with themselves (per
+        // spec they are one field already), so check against the accumulated set
+        // before folding this input's names in.
+        let incoming = collect_field_names(src, &d);
+        if incoming.iter().any(|n| self.field_names.contains(n)) {
+            return Err(PageDocError::UnmergeableCatalog("AcroForm fields with duplicate names"));
+        }
+        self.field_names.extend(incoming);
+
         let mut fields = Vec::new();
         if let Some(list) = dict_array(src, &d, b"Fields") {
             for f in list {
@@ -1172,8 +1343,27 @@ impl CatalogMerger {
             .and_then(|v| deep_copy_pruned(src, v, out, id_map, ctx))
             .and_then(|v| resolve_out_dict(out, &v));
 
+        // Finding 3: /CO, /DA, /Q are document-wide form settings. The first form
+        // input sets the baseline; a later input that carries /CO, or a /DA//Q
+        // that disagrees, has no common answer -> refuse.
+        let is_first_form = self.form.is_none();
+        let src_da = d.get(b"DA").and_then(Object::as_str).ok().map(<[u8]>::to_vec);
+        let src_q = d.get(b"Q").and_then(Object::as_i64).ok();
+        if !is_first_form {
+            let acc = self.form.as_ref().expect("form set once seen");
+            if d.has(b"CO") || src_da.is_some() && src_da != acc.da || src_q.is_some() && src_q != acc.q {
+                return Err(PageDocError::UnmergeableCatalog(
+                    "AcroForm calculation order / default appearance cannot be merged",
+                ));
+            }
+        }
+
         let acc = self.form.get_or_insert_with(FormAccum::default);
         acc.fields.extend(fields);
+        if is_first_form {
+            acc.da = src_da;
+            acc.q = src_q;
+        }
         for (k, v) in d.iter() {
             match k.as_slice() {
                 // Handled above / below.
@@ -1182,6 +1372,8 @@ impl CatalogMerger {
                 b"NeedAppearances" => acc.need_appearances |= v.as_bool().unwrap_or(false),
                 // Flags are a bit set: the union is the honest answer.
                 b"SigFlags" => acc.sig_flags |= v.as_i64().unwrap_or(0),
+                // /CO, /DA, /Q and everything else: first form input wins (later
+                // inputs that disagree were already refused above).
                 _ => {
                     if !acc.extra.has(k) {
                         if let Some(copied) = deep_copy_pruned(src, v, out, id_map, ctx) {
@@ -1295,7 +1487,7 @@ impl CatalogMerger {
     fn add_destinations(
         &mut self, src: &Document, catalog: &Dictionary, out: &mut Document,
         id_map: &mut HashMap<ObjectId, ObjectId>, ctx: &PruneCtx, mark: InputMark,
-    ) {
+    ) -> Result<(), PageDocError> {
         let mut tree_dests = NameEntries::new();
         let mut other_trees: Vec<(Vec<u8>, NameEntries)> = Vec::new();
         if let Some((_, names)) = catalog.get(b"Names").ok().and_then(|v| resolve_catalog_dict(src, v)) {
@@ -1336,8 +1528,22 @@ impl CatalogMerger {
         }
         // The other subtrees (/EmbeddedFiles, /JavaScript, ...) are keyed by
         // names that are labels, not link targets: nothing inside the document
-        // resolves them, so a suffix on collision loses nothing.
+        // resolves them by lookup, so a suffix on collision usually loses
+        // nothing. /EmbeddedFiles is the exception (finding 4): a GoToE action
+        // selects an embedded file by this exact name, and suffixing a colliding
+        // one would leave the action pointing at nothing — so colliding embedded
+        // file names refuse the merge instead.
         for (key, flat) in other_trees {
+            if key.as_slice() == b"EmbeddedFiles" {
+                let taken = self.name_trees.get(key.as_slice()).map(|ns| &ns.taken);
+                if let Some(taken) = taken {
+                    if flat.iter().any(|(name, _)| taken.contains(name)) {
+                        return Err(PageDocError::UnmergeableCatalog(
+                            "colliding embedded-file names referenced by GoToE",
+                        ));
+                    }
+                }
+            }
             let ns = self.name_trees.entry(key).or_default();
             for (name, value) in flat {
                 let taken = alloc_name(&mut ns.taken, &name, mark.index);
@@ -1347,12 +1553,26 @@ impl CatalogMerger {
 
         renames.retain(|old, new| old != new);
         if !renames.is_empty() {
+            // Finding 5: record that a destination was renamed. If any input also
+            // carries JavaScript (which names dests by opaque string we cannot
+            // rewrite), `finish` refuses the merge.
+            self.dest_renamed = true;
             rewrite_dest_names(out, mark.id_floor, &renames);
         }
+        Ok(())
     }
 
     /// Emit the merged tables as catalog entries.
-    fn finish(self, out: &mut Document) -> Vec<(Vec<u8>, Object)> {
+    fn finish(self, out: &mut Document) -> Result<Vec<(Vec<u8>, Object)>, PageDocError> {
+        // Finding 5: a renamed destination plus JavaScript anywhere is
+        // unmergeable — JS references named destinations by opaque string
+        // (`this.gotoNamedDest("toc")`) that we cannot follow and rewrite, so a
+        // rename would silently misroute it. Refuse rather than misbehave.
+        if self.dest_renamed && self.has_javascript {
+            return Err(PageDocError::UnmergeableCatalog(
+                "named-destination collision with JavaScript present",
+            ));
+        }
         let mut carried = Vec::new();
         if let Some(form) = self.form {
             let mut d = form.extra;
@@ -1418,8 +1638,98 @@ impl CatalogMerger {
             }
         }
         carried.extend(self.viewer);
-        carried
+        Ok(carried)
     }
+}
+
+/// Depth bound for the /AcroForm field-tree walk that collects fully-qualified
+/// names — a /Kids cycle or a pathologically deep tree would otherwise recurse
+/// until the stack gives out. A real field tree is a handful of levels deep.
+const FIELD_TREE_MAX_DEPTH: u32 = 64;
+
+/// Collect the fully-qualified names (ISO 32000 12.7.3.2: partial /T names of a
+/// field and its ancestors joined by '.') of every named node in one input's
+/// /AcroForm /Fields, so a merge can detect a name two inputs both use.
+fn collect_field_names(src: &Document, acroform: &Dictionary) -> HashSet<Vec<u8>> {
+    let mut names = HashSet::new();
+    if let Some(fields) = dict_array(src, acroform, b"Fields") {
+        for f in fields {
+            collect_field_names_rec(src, f, &[], &mut names, 0);
+        }
+    }
+    names
+}
+
+fn collect_field_names_rec(
+    src: &Document, field: &Object, prefix: &[u8], names: &mut HashSet<Vec<u8>>, depth: u32,
+) {
+    if depth > FIELD_TREE_MAX_DEPTH {
+        return;
+    }
+    let Ok(id) = field.as_reference() else {
+        return;
+    };
+    let Ok(d) = src.get_dictionary(id) else {
+        return;
+    };
+    // A pure widget annotation (a /Subtype with no /T of its own) is not a field
+    // and contributes no name; a node with /T extends the qualified name.
+    let fqn = d.get(b"T").and_then(Object::as_str).ok().map(|t| {
+        let mut n = prefix.to_vec();
+        if !n.is_empty() {
+            n.push(b'.');
+        }
+        n.extend_from_slice(t);
+        n
+    });
+    if let Some(ref n) = fqn {
+        names.insert(n.clone());
+    }
+    let child_prefix = fqn.as_deref().unwrap_or(prefix);
+    if let Some(kids) = dict_array(src, d, b"Kids") {
+        for kid in kids {
+            // Only recurse into field kids, not the leaf widget annotations that
+            // share the terminal field's page (they carry no /T of their own).
+            let is_widget = kid
+                .as_reference()
+                .ok()
+                .and_then(|kid_id| src.get_dictionary(kid_id).ok())
+                .is_some_and(|kd| kd.has(b"Subtype") && !kd.has(b"T"));
+            if !is_widget {
+                collect_field_names_rec(src, kid, child_prefix, names, depth + 1);
+            }
+        }
+    }
+}
+
+/// Whether one input carries any JavaScript action (finding 5): document-level
+/// named JavaScript (/Names /JavaScript), or a /S /JavaScript action anywhere
+/// (/OpenAction, an /AA additional-action, a field or annotation /A).
+fn source_has_javascript(src: &Document) -> bool {
+    if let Some(cat) = source_catalog(src) {
+        if let Some((_, names)) = cat.get(b"Names").ok().and_then(|v| resolve_catalog_dict(src, v)) {
+            if names.has(b"JavaScript") {
+                return true;
+            }
+        }
+    }
+    src.objects.values().any(object_has_js_action)
+}
+
+fn object_has_js_action(obj: &Object) -> bool {
+    match obj {
+        Object::Dictionary(d) => dict_has_js_action(d),
+        Object::Stream(s) => dict_has_js_action(&s.dict),
+        Object::Array(a) => a.iter().any(object_has_js_action),
+        _ => false,
+    }
+}
+
+fn dict_has_js_action(d: &Dictionary) -> bool {
+    if d.get(b"S").and_then(Object::as_name).is_ok_and(|s| s == b"JavaScript") {
+        return true;
+    }
+    d.iter().any(|(_, v)| object_has_js_action(v))
 }
 
 /// Merge one input's /AcroForm /DR (the resources a field's /DA names) into the
@@ -2584,6 +2894,307 @@ mod tests {
         let acro = out.get_dictionary(acro_ref.unwrap()).unwrap();
         let fields = acro.get(b"Fields").unwrap().as_array().unwrap();
         assert_eq!(fields.len(), 1, "single-input merge keeps the form field");
+        assert_no_dangling(&out);
+    }
+
+    // ---- F1: a duplicated page's reply/popup links retarget to the dup -------
+
+    /// One-page doc whose page carries a markup Text annotation, its Popup, and a
+    /// reply Text annotation, wired together by /Popup, /Parent and /IRT. On a
+    /// duplicate selection these back-links must follow the duplicate, not the
+    /// canonical copy.
+    fn build_reply_popup_doc() -> Document {
+        let mut doc = Document::with_version("1.7");
+        let pages_id = doc.new_object_id();
+        let page_id = doc.new_object_id();
+        let markup_id = doc.new_object_id();
+        let popup_id = doc.new_object_id();
+        let reply_id = doc.new_object_id();
+        let c = doc.add_object(Stream::new(dictionary! {}, b"(x)".to_vec()));
+        doc.set_object(markup_id, dictionary! {
+            "Type" => "Annot",
+            "Subtype" => "Text",
+            "Rect" => vec![0.into(), 0.into(), 20.into(), 20.into()],
+            "P" => Object::Reference(page_id),
+            "Popup" => Object::Reference(popup_id),
+        });
+        doc.set_object(popup_id, dictionary! {
+            "Type" => "Annot",
+            "Subtype" => "Popup",
+            "Rect" => vec![20.into(), 20.into(), 120.into(), 120.into()],
+            "P" => Object::Reference(page_id),
+            "Parent" => Object::Reference(markup_id),
+        });
+        doc.set_object(reply_id, dictionary! {
+            "Type" => "Annot",
+            "Subtype" => "Text",
+            "Rect" => vec![0.into(), 0.into(), 20.into(), 20.into()],
+            "P" => Object::Reference(page_id),
+            "IRT" => Object::Reference(markup_id),
+            "RT" => "R",
+        });
+        doc.set_object(page_id, dictionary! {
+            "Type" => "Page",
+            "Parent" => Object::Reference(pages_id),
+            "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+            "Contents" => Object::Reference(c),
+            "Annots" => vec![
+                Object::Reference(markup_id),
+                Object::Reference(popup_id),
+                Object::Reference(reply_id),
+            ],
+        });
+        doc.set_object(pages_id, dictionary! {
+            "Type" => "Pages",
+            "Kids" => vec![Object::Reference(page_id)],
+            "Count" => 1,
+        });
+        let catalog_id = doc.add_object(dictionary! {
+            "Type" => "Catalog",
+            "Pages" => Object::Reference(pages_id),
+        });
+        doc.trailer.set("Root", Object::Reference(catalog_id));
+        doc
+    }
+
+    #[test]
+    fn duplicated_page_retargets_reply_and_popup_within_the_dup() {
+        let doc = build_reply_popup_doc();
+        let out = extract_pages(&doc, "1,1").unwrap();
+
+        let kids = kids_of(&out);
+        assert_eq!(kids.len(), 2);
+        assert_ne!(kids[0], kids[1]);
+
+        let mut per_page: Vec<Vec<ObjectId>> = Vec::new();
+        for &kid in &kids {
+            let page = out.get_dictionary(kid).unwrap();
+            let annots: Vec<ObjectId> = page
+                .get(b"Annots")
+                .unwrap()
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|o| o.as_reference().unwrap())
+                .collect();
+            assert_eq!(annots.len(), 3);
+            let (markup, popup, reply) = (annots[0], annots[1], annots[2]);
+
+            // The markup annotation's /Popup and /P belong to THIS page instance.
+            let md = out.get_dictionary(markup).unwrap();
+            assert_eq!(md.get(b"P").unwrap().as_reference().unwrap(), kid);
+            assert_eq!(md.get(b"Popup").unwrap().as_reference().unwrap(), popup, "/Popup follows the dup");
+            // The popup's /Parent points back at THIS page's markup annotation.
+            let pd = out.get_dictionary(popup).unwrap();
+            assert_eq!(pd.get(b"P").unwrap().as_reference().unwrap(), kid);
+            assert_eq!(pd.get(b"Parent").unwrap().as_reference().unwrap(), markup, "popup /Parent follows the dup");
+            // The reply's /IRT points at THIS page's markup annotation.
+            let rd = out.get_dictionary(reply).unwrap();
+            assert_eq!(rd.get(b"P").unwrap().as_reference().unwrap(), kid);
+            assert_eq!(rd.get(b"IRT").unwrap().as_reference().unwrap(), markup, "reply /IRT follows the dup");
+
+            per_page.push(annots);
+        }
+        // The two duplicates share no annotation object at all.
+        for a in &per_page[0] {
+            assert!(!per_page[1].contains(a), "duplicates must not share annotation objects");
+        }
+        assert_no_dangling(&out);
+    }
+
+    // ---- F2: two inputs with a shared field name are unmergeable -------------
+
+    #[test]
+    fn merge_multi_input_rejects_duplicate_field_names() {
+        // Both inputs have a field named "(shared)": one ambiguous namespace.
+        let mut a = build_acroform_doc(b"(shared)");
+        let mut b = build_acroform_doc(b"(shared)");
+        let pa = save_temp(&mut a, "pdfree_pagedoc_dupfield_a.pdf");
+        let pb = save_temp(&mut b, "pdfree_pagedoc_dupfield_b.pdf");
+        let err = merge(&[pa.clone(), pb.clone()]).unwrap_err();
+        let _ = std::fs::remove_file(&pa);
+        let _ = std::fs::remove_file(&pb);
+        assert!(
+            matches!(err, PageDocError::UnmergeableCatalog(what) if what.contains("duplicate names")),
+            "got {err:?}"
+        );
+    }
+
+    // ---- F3: a later input's /CO makes the form unmergeable -----------------
+
+    #[test]
+    fn merge_multi_input_rejects_later_calculation_order() {
+        let mut a = build_acroform_doc(b"(a)");
+        let mut b = build_acroform_doc(b"(b)");
+        // Give input B a /CO (calculation order): merging two orders is undefined.
+        let acro = catalog_of(&b).get(b"AcroForm").and_then(Object::as_reference).unwrap();
+        let field = {
+            let acro_d = b.get_dictionary(acro).unwrap();
+            acro_d.get(b"Fields").unwrap().as_array().unwrap()[0].as_reference().unwrap()
+        };
+        b.get_dictionary_mut(acro).unwrap().set("CO", vec![Object::Reference(field)]);
+
+        let pa = save_temp(&mut a, "pdfree_pagedoc_co_a.pdf");
+        let pb = save_temp(&mut b, "pdfree_pagedoc_co_b.pdf");
+        let err = merge(&[pa.clone(), pb.clone()]).unwrap_err();
+        let _ = std::fs::remove_file(&pa);
+        let _ = std::fs::remove_file(&pb);
+        assert!(
+            matches!(err, PageDocError::UnmergeableCatalog(what) if what.contains("calculation order")),
+            "got {err:?}"
+        );
+    }
+
+    // ---- F4: colliding /EmbeddedFiles names are unmergeable ------------------
+
+    /// One-page doc whose catalog /Names /EmbeddedFiles names one embedded file.
+    fn build_embedded_file_doc(fname: &[u8]) -> Document {
+        let mut doc = Document::with_version("1.7");
+        let pages_id = doc.new_object_id();
+        let page_id = doc.new_object_id();
+        let c = doc.add_object(Stream::new(dictionary! {}, b"(x)".to_vec()));
+        doc.set_object(page_id, dictionary! {
+            "Type" => "Page",
+            "Parent" => Object::Reference(pages_id),
+            "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+            "Contents" => Object::Reference(c),
+        });
+        doc.set_object(pages_id, dictionary! {
+            "Type" => "Pages",
+            "Kids" => vec![Object::Reference(page_id)],
+            "Count" => 1,
+        });
+        let ef_stream = doc.add_object(Stream::new(dictionary! { "Type" => "EmbeddedFile" }, b"data".to_vec()));
+        let filespec = doc.add_object(dictionary! {
+            "Type" => "Filespec",
+            "F" => Object::String(fname.to_vec(), lopdf::StringFormat::Literal),
+            "EF" => dictionary! { "F" => Object::Reference(ef_stream) },
+        });
+        let ef_tree = doc.add_object(dictionary! {
+            "Names" => vec![
+                Object::String(fname.to_vec(), lopdf::StringFormat::Literal),
+                Object::Reference(filespec),
+            ],
+        });
+        let names = doc.add_object(dictionary! { "EmbeddedFiles" => Object::Reference(ef_tree) });
+        let catalog_id = doc.add_object(dictionary! {
+            "Type" => "Catalog",
+            "Pages" => Object::Reference(pages_id),
+            "Names" => Object::Reference(names),
+        });
+        doc.trailer.set("Root", Object::Reference(catalog_id));
+        doc
+    }
+
+    #[test]
+    fn merge_multi_input_rejects_colliding_embedded_files() {
+        let mut a = build_embedded_file_doc(b"data.bin");
+        let mut b = build_embedded_file_doc(b"data.bin");
+        let pa = save_temp(&mut a, "pdfree_pagedoc_ef_a.pdf");
+        let pb = save_temp(&mut b, "pdfree_pagedoc_ef_b.pdf");
+        let err = merge(&[pa.clone(), pb.clone()]).unwrap_err();
+        let _ = std::fs::remove_file(&pa);
+        let _ = std::fs::remove_file(&pb);
+        assert!(
+            matches!(err, PageDocError::UnmergeableCatalog(what) if what.contains("embedded-file")),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn merge_multi_input_merges_distinct_embedded_files() {
+        let mut a = build_embedded_file_doc(b"a.bin");
+        let mut b = build_embedded_file_doc(b"b.bin");
+        let pa = save_temp(&mut a, "pdfree_pagedoc_ef2_a.pdf");
+        let pb = save_temp(&mut b, "pdfree_pagedoc_ef2_b.pdf");
+        let out = merge(&[pa.clone(), pb.clone()]).unwrap();
+        let _ = std::fs::remove_file(&pa);
+        let _ = std::fs::remove_file(&pb);
+
+        let names_ref = catalog_of(&out).get(b"Names").and_then(Object::as_reference).unwrap();
+        let names = out.get_dictionary(names_ref).unwrap();
+        let ef_ref = names.get(b"EmbeddedFiles").and_then(Object::as_reference).unwrap();
+        let ef = out.get_dictionary(ef_ref).unwrap();
+        let arr = ef.get(b"Names").unwrap().as_array().unwrap();
+        assert_eq!(arr.len(), 4, "both named embedded files survive (2 name/value pairs)");
+        assert_no_dangling(&out);
+    }
+
+    // ---- F5: a dest rename plus JavaScript is unmergeable --------------------
+
+    /// One-page doc with a named destination and a document /OpenAction that runs
+    /// JavaScript naming a destination by opaque string.
+    fn build_named_dest_js_doc(dest: &[u8]) -> Document {
+        let mut doc = Document::with_version("1.7");
+        let pages_id = doc.new_object_id();
+        let page_id = doc.new_object_id();
+        let c = doc.add_object(Stream::new(dictionary! {}, b"(x)".to_vec()));
+        doc.set_object(page_id, dictionary! {
+            "Type" => "Page",
+            "Parent" => Object::Reference(pages_id),
+            "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+            "Contents" => Object::Reference(c),
+        });
+        doc.set_object(pages_id, dictionary! {
+            "Type" => "Pages",
+            "Kids" => vec![Object::Reference(page_id)],
+            "Count" => 1,
+        });
+        let dests = doc.add_object(dictionary! {
+            "Names" => vec![
+                Object::String(dest.to_vec(), lopdf::StringFormat::Literal),
+                Object::Array(vec![Object::Reference(page_id), "Fit".into()]),
+            ],
+        });
+        let names = doc.add_object(dictionary! { "Dests" => Object::Reference(dests) });
+        let open_action = doc.add_object(dictionary! {
+            "S" => "JavaScript",
+            "JS" => Object::String(b"this.gotoNamedDest('toc');".to_vec(), lopdf::StringFormat::Literal),
+        });
+        let catalog_id = doc.add_object(dictionary! {
+            "Type" => "Catalog",
+            "Pages" => Object::Reference(pages_id),
+            "Names" => Object::Reference(names),
+            "OpenAction" => Object::Reference(open_action),
+        });
+        doc.trailer.set("Root", Object::Reference(catalog_id));
+        doc
+    }
+
+    #[test]
+    fn merge_multi_input_rejects_dest_collision_with_javascript() {
+        // Both name a destination "toc" (a rename is forced) AND both carry JS
+        // that could reference it by string: unmergeable.
+        let mut a = build_named_dest_js_doc(b"toc");
+        let mut b = build_named_dest_js_doc(b"toc");
+        let pa = save_temp(&mut a, "pdfree_pagedoc_js_a.pdf");
+        let pb = save_temp(&mut b, "pdfree_pagedoc_js_b.pdf");
+        let err = merge(&[pa.clone(), pb.clone()]).unwrap_err();
+        let _ = std::fs::remove_file(&pa);
+        let _ = std::fs::remove_file(&pb);
+        assert!(
+            matches!(err, PageDocError::UnmergeableCatalog(what) if what.contains("JavaScript")),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn merge_multi_input_merges_distinct_dests_with_javascript() {
+        // JS present in both, but the dest names differ: no rename, so the merge
+        // is safe and proceeds.
+        let mut a = build_named_dest_js_doc(b"home");
+        let mut b = build_named_dest_js_doc(b"toc");
+        let pa = save_temp(&mut a, "pdfree_pagedoc_js2_a.pdf");
+        let pb = save_temp(&mut b, "pdfree_pagedoc_js2_b.pdf");
+        let out = merge(&[pa.clone(), pb.clone()]).unwrap();
+        let _ = std::fs::remove_file(&pa);
+        let _ = std::fs::remove_file(&pb);
+
+        assert_eq!(out.get_pages().len(), 2, "distinct dests + JS still merge");
+        let dests = merged_dests(&out);
+        assert_eq!(dests.len(), 2, "both destinations survive unrenamed");
+        let names: Vec<Vec<u8>> = dests.iter().map(|(n, _)| n.clone()).collect();
+        assert!(names.contains(&b"home".to_vec()) && names.contains(&b"toc".to_vec()));
         assert_no_dangling(&out);
     }
 }
