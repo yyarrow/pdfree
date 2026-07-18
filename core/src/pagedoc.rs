@@ -956,6 +956,24 @@ fn resolve_catalog_dict(src: &Document, val: &Object) -> Option<(bool, Dictionar
     }
 }
 
+/// Dereference `d[key]` and read it as a string (e.g. /DA), distinguishing
+/// "absent" (`Ok(None)` — the spec default applies) from "present but
+/// unresolvable or not the expected type" (`Err(())` — the caller must
+/// refuse rather than silently substitute a default; see round-6 finding 1).
+fn deref_str_field(src: &Document, d: &Dictionary, key: &[u8]) -> Result<Option<Vec<u8>>, ()> {
+    let Ok(raw) = d.get(key) else { return Ok(None) };
+    let (_, obj) = src.dereference(raw).map_err(|_| ())?;
+    obj.as_str().map(<[u8]>::to_vec).map(Some).map_err(|_| ())
+}
+
+/// Dereference `d[key]` and read it as an integer (e.g. /Q). See
+/// `deref_str_field` for the absent-vs-unresolvable distinction.
+fn deref_i64_field(src: &Document, d: &Dictionary, key: &[u8]) -> Result<Option<i64>, ()> {
+    let Ok(raw) = d.get(key) else { return Ok(None) };
+    let (_, obj) = src.dereference(raw).map_err(|_| ())?;
+    obj.as_i64().map(Some).map_err(|_| ())
+}
+
 /// Place a rebuilt dictionary back, indirectly if the source was indirect.
 fn place_catalog_dict(out: &mut Document, indirect: bool, dict: Dictionary) -> Object {
     if indirect {
@@ -1346,9 +1364,23 @@ impl CatalogMerger {
         // Finding 3: /CO, /DA, /Q are document-wide form settings. The first form
         // input sets the baseline; a later input that carries /CO, or a /DA//Q
         // that disagrees, has no common answer -> refuse.
+        // Round-6 finding 1: /DA and /Q may legally be indirect references
+        // (ISO 32000 7.3.10, "indirect objects"); the round-5 code read them
+        // with `as_str`/`as_i64` on the raw value, so an indirect /Q failed
+        // to parse and fell back to `unwrap_or(0)` on BOTH sides, silently
+        // treating two disagreeing indirect /Q values as equal. Dereference
+        // first, then extract. A /DA or /Q that is present but does not
+        // resolve to the right type refuses the merge (it is unmergeable,
+        // not "default") rather than being silently swallowed by the
+        // `.ok()` that used to sit here; an ABSENT /DA or /Q is unaffected
+        // and still means the spec default.
         let is_first_form = self.form.is_none();
-        let src_da = d.get(b"DA").and_then(Object::as_str).ok().map(<[u8]>::to_vec);
-        let src_q = d.get(b"Q").and_then(Object::as_i64).ok();
+        let src_da = deref_str_field(src, &d, b"DA").map_err(|()| {
+            PageDocError::UnmergeableCatalog("AcroForm /DA is present but not a resolvable string")
+        })?;
+        let src_q = deref_i64_field(src, &d, b"Q").map_err(|()| {
+            PageDocError::UnmergeableCatalog("AcroForm /Q is present but not a resolvable integer")
+        })?;
         if !is_first_form {
             let acc = self.form.as_ref().expect("form set once seen");
             // Round-5 finding 2: compare EFFECTIVE defaults symmetrically. An absent /Q
@@ -1701,14 +1733,30 @@ fn collect_field_names_rec(
     // SAME name; comparing raw bytes would miss that collision and concatenate
     // both roots into an ambiguous namespace. `decode_text_string` (the helper
     // metadata.rs uses) normalizes PDFDocEncoding / UTF-16BE / UTF-8 to one form.
-    let fqn = d.get(b"T").ok().and_then(|t| decode_text_string(t).ok()).map(|t| {
-        let mut n = prefix.to_vec();
-        if !n.is_empty() {
-            n.push(b'.');
-        }
-        n.extend_from_slice(t.as_bytes());
-        n
-    });
+    //
+    // Round-6 finding 2: /T may legally be an indirect reference (ISO 32000
+    // 7.3.10); the round-5 code called `decode_text_string` on the raw value,
+    // so an indirect /T failed to decode and contributed no name at all,
+    // letting two inputs that both indirectly named `total` slip past the
+    // collision check. Dereference first. Also strip a leading UTF-8 BOM
+    // (U+FEFF, `EF BB BF` in PDF 2.0's UTF-8 string encoding): lopdf 0.43's
+    // `decode_text_string` leaves it in the decoded `String` (see
+    // `metadata.rs`), so a BOM'd `total` and a plain `total` would otherwise
+    // compare unequal and miss a real collision.
+    let fqn = d
+        .get(b"T")
+        .ok()
+        .and_then(|t| src.dereference(t).ok())
+        .and_then(|(_, t)| decode_text_string(t).ok())
+        .map(|t| t.strip_prefix('\u{FEFF}').map(str::to_string).unwrap_or(t))
+        .map(|t| {
+            let mut n = prefix.to_vec();
+            if !n.is_empty() {
+                n.push(b'.');
+            }
+            n.extend_from_slice(t.as_bytes());
+            n
+        });
     if let Some(ref n) = fqn {
         names.insert(n.clone());
     }
@@ -1741,30 +1789,48 @@ fn source_has_javascript(src: &Document) -> bool {
             }
         }
     }
-    src.objects.values().any(object_has_js_action)
+    src.objects.values().any(|obj| object_has_js_action(src, obj))
 }
 
-fn object_has_js_action(obj: &Object) -> bool {
+fn object_has_js_action(src: &Document, obj: &Object) -> bool {
     match obj {
-        Object::Dictionary(d) => dict_has_js_action(d),
-        Object::Stream(s) => dict_has_js_action(&s.dict),
-        Object::Array(a) => a.iter().any(object_has_js_action),
+        Object::Dictionary(d) => dict_has_js_action(src, d),
+        Object::Stream(s) => dict_has_js_action(src, &s.dict),
+        Object::Array(a) => a.iter().any(|o| object_has_js_action(src, o)),
         _ => false,
     }
 }
 
-fn dict_has_js_action(d: &Dictionary) -> bool {
-    if let Ok(s) = d.get(b"S").and_then(Object::as_name) {
-        // A JavaScript action is JS outright. A rendition action (round-5 finding
-        // 4) also carries JavaScript in its /JS entry (ISO 32000 12.6.4.13), so a
-        // `<< /S /Rendition ... /JS (...) >>` names destinations by opaque
-        // string just as a JS action does; treat it as JavaScript so a
-        // destination rename with such an action present is correctly refused.
-        if s == b"JavaScript" || (s == b"Rendition" && d.has(b"JS")) {
-            return true;
+/// Round-6 finding 3: /S may legally be an indirect reference (ISO 32000
+/// 7.3.10); the round-5 code compared it with `as_name` on the raw value, so
+/// an action with indirect /S was never recognized as JavaScript/Rendition,
+/// its JS went undetected, and a forced destination rename could leave an
+/// opaque `gotoNamedDest("...")` string stale. Dereference /S first. If /S is
+/// present but does not resolve (or resolves to something other than a
+/// name), we cannot rule out that it is JavaScript, so — per the guiding
+/// rule of erring toward refusal rather than a silent default — conservatively
+/// treat it as JS.
+fn dict_has_js_action(src: &Document, d: &Dictionary) -> bool {
+    if let Ok(raw) = d.get(b"S") {
+        match src.dereference(raw) {
+            Ok((_, obj)) => {
+                if let Ok(s) = obj.as_name() {
+                    // A JavaScript action is JS outright. A rendition action (round-5
+                    // finding 4) also carries JavaScript in its /JS entry (ISO 32000
+                    // 12.6.4.13), so a `<< /S /Rendition ... /JS (...) >>` names
+                    // destinations by opaque string just as a JS action does; treat it
+                    // as JavaScript so a destination rename with such an action present
+                    // is correctly refused.
+                    if s == b"JavaScript" || (s == b"Rendition" && d.has(b"JS")) {
+                        return true;
+                    }
+                }
+            }
+            // Present but unresolvable: conservatively treat as JS.
+            Err(_) => return true,
         }
     }
-    d.iter().any(|(_, v)| object_has_js_action(v))
+    d.iter().any(|(_, v)| object_has_js_action(src, v))
 }
 
 /// Merge one input's /AcroForm /DR (the resources a field's /DA names) into the
@@ -1873,7 +1939,22 @@ fn scan_for_gotoe(src: &Document, obj: &Object, names: &mut HashSet<Vec<u8>>, de
         }
         _ => return,
     };
-    if d.get(b"S").and_then(Object::as_name).is_ok_and(|s| s == b"GoToE") {
+    // Round-6 finding 4: /S may legally be an indirect reference (ISO 32000
+    // 7.3.10); the round-5 code compared it with `as_name` on the raw value,
+    // so an indirect /S pointing at /GoToE was never recognized, its /T /N
+    // target name was never collected, and a colliding attachment could be
+    // silently suffixed while the action still named the old file.
+    // Dereference /S first. If /S is present but does not resolve, we cannot
+    // rule out that it names /GoToE, so — same rule as finding 3 — err
+    // toward treating it as one rather than silently skipping it.
+    let is_gotoe = match d.get(b"S") {
+        Ok(raw) => match src.dereference(raw) {
+            Ok((_, obj)) => obj.as_name().is_ok_and(|s| s == b"GoToE"),
+            Err(_) => true,
+        },
+        Err(_) => false,
+    };
+    if is_gotoe {
         if let Some((_, target)) = d.get(b"T").ok().and_then(|t| resolve_catalog_dict(src, t)) {
             if let Ok(n) = target.get(b"N").and_then(|v| src.dereference(v).map(|(_, o)| o)).and_then(Object::as_str) {
                 names.insert(n.to_vec());
@@ -3482,6 +3563,409 @@ mod tests {
         let _ = std::fs::remove_file(&pa);
         let _ = std::fs::remove_file(&pb);
         assert_eq!(out.get_pages().len(), 2, "dest collision without JS still merges");
+        assert_no_dangling(&out);
+    }
+
+    // ---- round 6: dereference before inspecting dictionary values, refuse
+    //      (don't default) on a present-but-unresolvable value -------------
+
+    // ---- F1: /DA and /Q may be indirect references -----------------------
+
+    #[test]
+    fn merge_multi_input_rejects_indirect_quadding_conflict() {
+        // The round-5 code read /Q with `as_i64` on the raw (unresolved) value.
+        // An indirect /Q always fails `as_i64`, so BOTH sides fell back to
+        // `unwrap_or(0)` and compared equal -- silently missing a real conflict
+        // between indirect /Q 1 and indirect /Q 2. Dereferencing first must
+        // catch it.
+        let mut a = build_acroform_doc(b"(a)");
+        let mut b = build_acroform_doc(b"(b)");
+        let q1 = a.add_object(Object::Integer(1));
+        let acro_a = catalog_of(&a).get(b"AcroForm").and_then(Object::as_reference).unwrap();
+        a.get_dictionary_mut(acro_a).unwrap().set("Q", Object::Reference(q1));
+        let q2 = b.add_object(Object::Integer(2));
+        let acro_b = catalog_of(&b).get(b"AcroForm").and_then(Object::as_reference).unwrap();
+        b.get_dictionary_mut(acro_b).unwrap().set("Q", Object::Reference(q2));
+        let pa = save_temp(&mut a, "pdfree_pagedoc_indq_a.pdf");
+        let pb = save_temp(&mut b, "pdfree_pagedoc_indq_b.pdf");
+        let err = merge(&[pa.clone(), pb.clone()]).unwrap_err();
+        let _ = std::fs::remove_file(&pa);
+        let _ = std::fs::remove_file(&pb);
+        assert!(
+            matches!(err, PageDocError::UnmergeableCatalog(what) if what.contains("default appearance")),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn merge_multi_input_merges_matching_indirect_quadding() {
+        // Guards against over-refusing: two forms whose indirect /Q both
+        // resolve to 1 agree and must still merge, with the resolved value
+        // making it into the output.
+        let mut a = build_acroform_doc(b"(a)");
+        let mut b = build_acroform_doc(b"(b)");
+        let q1 = a.add_object(Object::Integer(1));
+        let acro_a = catalog_of(&a).get(b"AcroForm").and_then(Object::as_reference).unwrap();
+        a.get_dictionary_mut(acro_a).unwrap().set("Q", Object::Reference(q1));
+        let q2 = b.add_object(Object::Integer(1));
+        let acro_b = catalog_of(&b).get(b"AcroForm").and_then(Object::as_reference).unwrap();
+        b.get_dictionary_mut(acro_b).unwrap().set("Q", Object::Reference(q2));
+        let pa = save_temp(&mut a, "pdfree_pagedoc_indqm_a.pdf");
+        let pb = save_temp(&mut b, "pdfree_pagedoc_indqm_b.pdf");
+        let out = merge(&[pa.clone(), pb.clone()]).unwrap();
+        let _ = std::fs::remove_file(&pa);
+        let _ = std::fs::remove_file(&pb);
+        let q_obj = acroform_of(&out).get(b"Q").unwrap().clone();
+        let (_, resolved) = out.dereference(&q_obj).unwrap();
+        assert_eq!(resolved.as_i64().unwrap(), 1);
+        assert_eq!(field_names(&out).len(), 2, "both distinct fields merge");
+    }
+
+    #[test]
+    fn merge_multi_input_rejects_unresolvable_quadding() {
+        // /Q is PRESENT (an indirect reference) but points at no object in the
+        // document -- unresolvable, not absent. Must refuse rather than
+        // silently treat it as the spec default 0.
+        let mut a = build_acroform_doc(b"(a)");
+        let mut b = build_acroform_doc(b"(b)");
+        let acro_a = catalog_of(&a).get(b"AcroForm").and_then(Object::as_reference).unwrap();
+        a.get_dictionary_mut(acro_a).unwrap().set("Q", Object::Reference((999_999, 0)));
+        let pa = save_temp(&mut a, "pdfree_pagedoc_badq_a.pdf");
+        let pb = save_temp(&mut b, "pdfree_pagedoc_badq_b.pdf");
+        let err = merge(&[pa.clone(), pb.clone()]).unwrap_err();
+        let _ = std::fs::remove_file(&pa);
+        let _ = std::fs::remove_file(&pb);
+        assert!(
+            matches!(err, PageDocError::UnmergeableCatalog(what) if what.contains("not a resolvable")),
+            "got {err:?}"
+        );
+    }
+
+    // ---- F2: /T may be an indirect reference, and lopdf leaves a UTF-8 BOM
+    //      (U+FEFF) in the decoded string -----------------------------------
+
+    /// As `build_acroform_doc`, but /T is a standalone indirect string object
+    /// (ISO 32000 7.3.10) rather than inline.
+    fn build_acroform_doc_indirect_t(marker: &[u8]) -> Document {
+        let mut doc = Document::with_version("1.7");
+        let pages_id = doc.new_object_id();
+        let page_id = doc.new_object_id();
+        let field_id = doc.new_object_id();
+        let c = doc.add_object(Stream::new(dictionary! {}, marker.to_vec()));
+        let widget_id = doc.add_object(dictionary! {
+            "Type" => "Annot",
+            "Subtype" => "Widget",
+            "Rect" => vec![0.into(), 0.into(), 100.into(), 20.into()],
+            "P" => Object::Reference(page_id),
+            "Parent" => Object::Reference(field_id),
+        });
+        let t_id = doc.add_object(Object::String(marker.to_vec(), lopdf::StringFormat::Literal));
+        doc.set_object(field_id, dictionary! {
+            "FT" => "Tx",
+            "T" => Object::Reference(t_id),
+            "Kids" => vec![Object::Reference(widget_id)],
+            "P" => Object::Reference(page_id),
+        });
+        doc.set_object(page_id, dictionary! {
+            "Type" => "Page",
+            "Parent" => Object::Reference(pages_id),
+            "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+            "Contents" => Object::Reference(c),
+            "Annots" => vec![Object::Reference(widget_id)],
+        });
+        doc.set_object(pages_id, dictionary! {
+            "Type" => "Pages",
+            "Kids" => vec![Object::Reference(page_id)],
+            "Count" => 1,
+        });
+        let acroform_id = doc.add_object(dictionary! {
+            "Fields" => vec![Object::Reference(field_id)],
+        });
+        let catalog_id = doc.add_object(dictionary! {
+            "Type" => "Catalog",
+            "Pages" => Object::Reference(pages_id),
+            "AcroForm" => Object::Reference(acroform_id),
+        });
+        doc.trailer.set("Root", Object::Reference(catalog_id));
+        doc
+    }
+
+    #[test]
+    fn merge_multi_input_rejects_duplicate_field_names_with_indirect_t() {
+        // Both inputs name their field "total" via an INDIRECT /T. The round-5
+        // code called `decode_text_string` on the raw (unresolved) value, so an
+        // indirect /T always failed to decode and contributed no name -- two
+        // independent "total" fields would concatenate into one ambiguous
+        // namespace instead of being refused.
+        let mut a = build_acroform_doc_indirect_t(b"total");
+        let mut b = build_acroform_doc_indirect_t(b"total");
+        let pa = save_temp(&mut a, "pdfree_pagedoc_indt_a.pdf");
+        let pb = save_temp(&mut b, "pdfree_pagedoc_indt_b.pdf");
+        let err = merge(&[pa.clone(), pb.clone()]).unwrap_err();
+        let _ = std::fs::remove_file(&pa);
+        let _ = std::fs::remove_file(&pb);
+        assert!(
+            matches!(err, PageDocError::UnmergeableCatalog(what) if what.contains("duplicate names")),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn merge_multi_input_merges_distinct_indirect_field_names() {
+        // Guards against over-refusing: two DIFFERENT indirect field names still
+        // merge cleanly.
+        let mut a = build_acroform_doc_indirect_t(b"alpha");
+        let mut b = build_acroform_doc_indirect_t(b"beta");
+        let pa = save_temp(&mut a, "pdfree_pagedoc_indt2_a.pdf");
+        let pb = save_temp(&mut b, "pdfree_pagedoc_indt2_b.pdf");
+        let out = merge(&[pa.clone(), pb.clone()]).unwrap();
+        let _ = std::fs::remove_file(&pa);
+        let _ = std::fs::remove_file(&pb);
+        assert_eq!(
+            acroform_of(&out).get(b"Fields").unwrap().as_array().unwrap().len(),
+            2,
+            "both distinct fields merge"
+        );
+        assert_no_dangling(&out);
+    }
+
+    #[test]
+    fn merge_multi_input_rejects_duplicate_field_names_utf8_bom_vs_plain() {
+        // lopdf 0.43's `decode_text_string` leaves the UTF-8 BOM's U+FEFF in the
+        // decoded PDF-2.0 string (see metadata.rs). Without stripping it,
+        // BOM-prefixed "total" and plain "total" compare unequal and a real
+        // collision is missed.
+        let bom_total = {
+            let mut v = b"\xEF\xBB\xBF".to_vec();
+            v.extend_from_slice(b"total");
+            v
+        };
+        let mut a = build_acroform_doc(&bom_total);
+        let mut b = build_acroform_doc(b"total");
+        let pa = save_temp(&mut a, "pdfree_pagedoc_bom_a.pdf");
+        let pb = save_temp(&mut b, "pdfree_pagedoc_bom_b.pdf");
+        let err = merge(&[pa.clone(), pb.clone()]).unwrap_err();
+        let _ = std::fs::remove_file(&pa);
+        let _ = std::fs::remove_file(&pb);
+        assert!(
+            matches!(err, PageDocError::UnmergeableCatalog(what) if what.contains("duplicate names")),
+            "got {err:?}"
+        );
+    }
+
+    // ---- F3: an action's /S may be an indirect reference -------------------
+
+    /// As `build_named_dest_js_doc`, but /S is an indirect reference to the
+    /// name object (ISO 32000 7.3.10) instead of inline.
+    fn build_named_dest_indirect_s_doc(dest: &[u8], s: &[u8], extra: &[(&str, Object)]) -> Document {
+        let mut doc = Document::with_version("1.7");
+        let pages_id = doc.new_object_id();
+        let page_id = doc.new_object_id();
+        let c = doc.add_object(Stream::new(dictionary! {}, b"(x)".to_vec()));
+        doc.set_object(page_id, dictionary! {
+            "Type" => "Page",
+            "Parent" => Object::Reference(pages_id),
+            "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+            "Contents" => Object::Reference(c),
+        });
+        doc.set_object(pages_id, dictionary! {
+            "Type" => "Pages",
+            "Kids" => vec![Object::Reference(page_id)],
+            "Count" => 1,
+        });
+        let dests = doc.add_object(dictionary! {
+            "Names" => vec![
+                Object::String(dest.to_vec(), lopdf::StringFormat::Literal),
+                Object::Array(vec![Object::Reference(page_id), "Fit".into()]),
+            ],
+        });
+        let names = doc.add_object(dictionary! { "Dests" => Object::Reference(dests) });
+        let s_id = doc.add_object(Object::Name(s.to_vec()));
+        let mut action = Dictionary::new();
+        action.set("S", Object::Reference(s_id));
+        for (k, v) in extra {
+            action.set(*k, v.clone());
+        }
+        let open_action = doc.add_object(action);
+        let catalog_id = doc.add_object(dictionary! {
+            "Type" => "Catalog",
+            "Pages" => Object::Reference(pages_id),
+            "Names" => Object::Reference(names),
+            "OpenAction" => Object::Reference(open_action),
+        });
+        doc.trailer.set("Root", Object::Reference(catalog_id));
+        doc
+    }
+
+    #[test]
+    fn merge_multi_input_rejects_dest_collision_with_indirect_javascript_s() {
+        // The round-5 code read /S with `as_name` on the raw value, so an
+        // action with an indirect /S was never recognized as JavaScript --
+        // its opaque `gotoNamedDest` string would go stale after a forced
+        // rename instead of refusing the merge.
+        let js = Object::String(b"this.gotoNamedDest('toc');".to_vec(), lopdf::StringFormat::Literal);
+        let mut a = build_named_dest_indirect_s_doc(b"toc", b"JavaScript", &[("JS", js.clone())]);
+        let mut b = build_named_dest_indirect_s_doc(b"toc", b"JavaScript", &[("JS", js)]);
+        let pa = save_temp(&mut a, "pdfree_pagedoc_indjs_a.pdf");
+        let pb = save_temp(&mut b, "pdfree_pagedoc_indjs_b.pdf");
+        let err = merge(&[pa.clone(), pb.clone()]).unwrap_err();
+        let _ = std::fs::remove_file(&pa);
+        let _ = std::fs::remove_file(&pb);
+        assert!(
+            matches!(err, PageDocError::UnmergeableCatalog(what) if what.contains("JavaScript")),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn merge_multi_input_rejects_dest_collision_with_indirect_rendition_js() {
+        // Same, but via a Rendition action's /JS entry (round-5 finding 4) with
+        // an indirect /S /Rendition.
+        let js = Object::String(b"this.gotoNamedDest('toc');".to_vec(), lopdf::StringFormat::Literal);
+        let mut a = build_named_dest_indirect_s_doc(b"toc", b"Rendition", &[("JS", js.clone())]);
+        let mut b = build_named_dest_indirect_s_doc(b"toc", b"Rendition", &[("JS", js)]);
+        let pa = save_temp(&mut a, "pdfree_pagedoc_indrend_a.pdf");
+        let pb = save_temp(&mut b, "pdfree_pagedoc_indrend_b.pdf");
+        let err = merge(&[pa.clone(), pb.clone()]).unwrap_err();
+        let _ = std::fs::remove_file(&pa);
+        let _ = std::fs::remove_file(&pb);
+        assert!(
+            matches!(err, PageDocError::UnmergeableCatalog(what) if what.contains("JavaScript")),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn merge_multi_input_rejects_dest_collision_with_unresolvable_action_s() {
+        // /S is PRESENT (an indirect reference) but unresolvable. We cannot rule
+        // out that it names JavaScript, so it must be treated conservatively as
+        // JS and the dest collision refused rather than silently merged.
+        let mut a = Document::with_version("1.7");
+        let pages_id = a.new_object_id();
+        let page_id = a.new_object_id();
+        let c = a.add_object(Stream::new(dictionary! {}, b"(x)".to_vec()));
+        a.set_object(page_id, dictionary! {
+            "Type" => "Page",
+            "Parent" => Object::Reference(pages_id),
+            "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+            "Contents" => Object::Reference(c),
+        });
+        a.set_object(pages_id, dictionary! {
+            "Type" => "Pages",
+            "Kids" => vec![Object::Reference(page_id)],
+            "Count" => 1,
+        });
+        let dests = a.add_object(dictionary! {
+            "Names" => vec![
+                Object::String(b"toc".to_vec(), lopdf::StringFormat::Literal),
+                Object::Array(vec![Object::Reference(page_id), "Fit".into()]),
+            ],
+        });
+        let names = a.add_object(dictionary! { "Dests" => Object::Reference(dests) });
+        let open_action = a.add_object(dictionary! { "S" => Object::Reference((999_999, 0)) });
+        let catalog_id = a.add_object(dictionary! {
+            "Type" => "Catalog",
+            "Pages" => Object::Reference(pages_id),
+            "Names" => Object::Reference(names),
+            "OpenAction" => Object::Reference(open_action),
+        });
+        a.trailer.set("Root", Object::Reference(catalog_id));
+
+        let mut b = build_named_dest_js_doc(b"toc");
+        let pa = save_temp(&mut a, "pdfree_pagedoc_badjs_a.pdf");
+        let pb = save_temp(&mut b, "pdfree_pagedoc_badjs_b.pdf");
+        let err = merge(&[pa.clone(), pb.clone()]).unwrap_err();
+        let _ = std::fs::remove_file(&pa);
+        let _ = std::fs::remove_file(&pb);
+        assert!(
+            matches!(err, PageDocError::UnmergeableCatalog(what) if what.contains("JavaScript")),
+            "got {err:?}"
+        );
+    }
+
+    // ---- F4: a GoToE action's /S may be an indirect reference --------------
+
+    /// As `build_embedded_file_doc_with_gotoe`, but /S is an indirect
+    /// reference to the /GoToE name object instead of inline.
+    fn build_embedded_file_doc_with_indirect_gotoe(fname: &[u8], target: &[u8]) -> Document {
+        let mut doc = build_embedded_file_doc(fname);
+        let s_id = doc.add_object(Object::Name(b"GoToE".to_vec()));
+        let gotoe = doc.add_object(dictionary! {
+            "S" => Object::Reference(s_id),
+            "D" => Object::Array(vec![0.into(), "Fit".into()]),
+            "T" => dictionary! {
+                "R" => "C",
+                "N" => Object::String(target.to_vec(), lopdf::StringFormat::Literal),
+            },
+        });
+        let root = doc.trailer.get(b"Root").and_then(Object::as_reference).unwrap();
+        doc.get_dictionary_mut(root).unwrap().set("OpenAction", Object::Reference(gotoe));
+        doc
+    }
+
+    #[test]
+    fn merge_multi_input_rejects_colliding_embedded_files_referenced_by_indirect_gotoe() {
+        // The round-5 code compared /S with `as_name` on the raw value, so an
+        // indirect /S pointing at /GoToE was never recognized -- the colliding
+        // attachment would be silently suffixed while the action still names
+        // the OTHER input's file.
+        let mut a = build_embedded_file_doc(b"data.bin");
+        let mut b = build_embedded_file_doc_with_indirect_gotoe(b"data.bin", b"data.bin");
+        let pa = save_temp(&mut a, "pdfree_pagedoc_indefg_a.pdf");
+        let pb = save_temp(&mut b, "pdfree_pagedoc_indefg_b.pdf");
+        let err = merge(&[pa.clone(), pb.clone()]).unwrap_err();
+        let _ = std::fs::remove_file(&pa);
+        let _ = std::fs::remove_file(&pb);
+        assert!(
+            matches!(err, PageDocError::UnmergeableCatalog(what) if what.contains("embedded-file")),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn merge_multi_input_rejects_colliding_embedded_files_referenced_by_unresolvable_s_action() {
+        // /S is PRESENT but unresolvable, so we cannot rule out it names
+        // /GoToE; conservatively treat it as one rather than silently
+        // suffixing a name it may target.
+        let mut a = build_embedded_file_doc(b"data.bin");
+        let mut b = build_embedded_file_doc(b"data.bin");
+        let gotoe = b.add_object(dictionary! {
+            "S" => Object::Reference((999_999, 0)),
+            "T" => dictionary! {
+                "R" => "C",
+                "N" => Object::String(b"data.bin".to_vec(), lopdf::StringFormat::Literal),
+            },
+        });
+        let root = b.trailer.get(b"Root").and_then(Object::as_reference).unwrap();
+        b.get_dictionary_mut(root).unwrap().set("OpenAction", Object::Reference(gotoe));
+        let pa = save_temp(&mut a, "pdfree_pagedoc_badgotoe_a.pdf");
+        let pb = save_temp(&mut b, "pdfree_pagedoc_badgotoe_b.pdf");
+        let err = merge(&[pa.clone(), pb.clone()]).unwrap_err();
+        let _ = std::fs::remove_file(&pa);
+        let _ = std::fs::remove_file(&pb);
+        assert!(
+            matches!(err, PageDocError::UnmergeableCatalog(what) if what.contains("embedded-file")),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn merge_multi_input_merges_colliding_embedded_files_without_gotoe_or_bad_s() {
+        // Boundary: an /S that is simply ABSENT (not present-but-unresolvable)
+        // is not a GoToE action at all, so a name collision with no GoToE
+        // still merges with a suffix rather than being over-refused.
+        let mut a = build_embedded_file_doc(b"data.bin");
+        let mut b = build_embedded_file_doc(b"data.bin");
+        let action = b.add_object(dictionary! { "D" => Object::Array(vec![0.into(), "Fit".into()]) });
+        let root = b.trailer.get(b"Root").and_then(Object::as_reference).unwrap();
+        b.get_dictionary_mut(root).unwrap().set("OpenAction", Object::Reference(action));
+        let pa = save_temp(&mut a, "pdfree_pagedoc_nogotoe_a.pdf");
+        let pb = save_temp(&mut b, "pdfree_pagedoc_nogotoe_b.pdf");
+        let out = merge(&[pa.clone(), pb.clone()]).unwrap();
+        let _ = std::fs::remove_file(&pa);
+        let _ = std::fs::remove_file(&pb);
+        let names = embedded_file_names(&out);
+        assert_eq!(names.len(), 2, "both attachments survive");
         assert_no_dangling(&out);
     }
 }
