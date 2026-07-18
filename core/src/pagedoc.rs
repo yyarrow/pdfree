@@ -4,7 +4,7 @@
 //! Written purely against ISO 32000 (7.7.3 "Document Catalog"/"Page Tree")
 //! and the lopdf (MIT) API; no GPL/AGPL PDF source was consulted.
 
-use lopdf::{Dictionary, Document, Object, ObjectId, StringFormat};
+use lopdf::{decode_text_string, Dictionary, Document, Object, ObjectId, StringFormat};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
 
@@ -1351,7 +1351,16 @@ impl CatalogMerger {
         let src_q = d.get(b"Q").and_then(Object::as_i64).ok();
         if !is_first_form {
             let acc = self.form.as_ref().expect("form set once seen");
-            if d.has(b"CO") || src_da.is_some() && src_da != acc.da || src_q.is_some() && src_q != acc.q {
+            // Round-5 finding 2: compare EFFECTIVE defaults symmetrically. An absent /Q
+            // means the spec default 0 (ISO 32000 12.7.4.3), an absent /DA means
+            // no form-wide default (empty). So "first input /Q 1, later omits /Q"
+            // is a conflict: keeping /Q 1 would silently re-justify the later
+            // input's fields that relied on the implicit default 0. Only two
+            // forms whose effective /Q and /DA agree (both equal, or both the
+            // default) merge; any disagreement — in either direction — refuses.
+            let q_conflict = src_q.unwrap_or(0) != acc.q.unwrap_or(0);
+            let da_conflict = src_da.clone().unwrap_or_default() != acc.da.clone().unwrap_or_default();
+            if d.has(b"CO") || da_conflict || q_conflict {
                 return Err(PageDocError::UnmergeableCatalog(
                     "AcroForm calculation order / default appearance cannot be merged",
                 ));
@@ -1529,18 +1538,30 @@ impl CatalogMerger {
         // The other subtrees (/EmbeddedFiles, /JavaScript, ...) are keyed by
         // names that are labels, not link targets: nothing inside the document
         // resolves them by lookup, so a suffix on collision usually loses
-        // nothing. /EmbeddedFiles is the exception (finding 4): a GoToE action
-        // selects an embedded file by this exact name, and suffixing a colliding
-        // one would leave the action pointing at nothing — so colliding embedded
-        // file names refuse the merge instead.
+        // nothing. /EmbeddedFiles needs one extra check (round-5 finding 3): a GoToE
+        // action can select an embedded file by this exact name-tree key
+        // (/T ... /N), and if THIS input carries such an action for a colliding
+        // name, suffixing the file would leave the action resolving to the OTHER
+        // input's attachment. So a collision refuses ONLY when a GoToE in this
+        // input targets the collided name; otherwise both attachments are kept,
+        // the later one suffixed. (A GoToE in an already-merged input names its
+        // own, un-renamed file and is unaffected — the first to take a name keeps
+        // it, only the later collider is renamed.)
         for (key, flat) in other_trees {
             if key.as_slice() == b"EmbeddedFiles" {
-                let taken = self.name_trees.get(key.as_slice()).map(|ns| &ns.taken);
-                if let Some(taken) = taken {
-                    if flat.iter().any(|(name, _)| taken.contains(name)) {
-                        return Err(PageDocError::UnmergeableCatalog(
-                            "colliding embedded-file names referenced by GoToE",
-                        ));
+                if let Some(taken) = self.name_trees.get(key.as_slice()).map(|ns| &ns.taken) {
+                    let collisions: Vec<&[u8]> = flat
+                        .iter()
+                        .map(|(name, _)| name.as_slice())
+                        .filter(|name| taken.contains(*name))
+                        .collect();
+                    if !collisions.is_empty() {
+                        let targeted = gotoe_target_names(src);
+                        if collisions.iter().any(|name| targeted.contains(*name)) {
+                            return Err(PageDocError::UnmergeableCatalog(
+                                "colliding embedded-file names referenced by GoToE",
+                            ));
+                        }
                     }
                 }
             }
@@ -1674,12 +1695,18 @@ fn collect_field_names_rec(
     };
     // A pure widget annotation (a /Subtype with no /T of its own) is not a field
     // and contributes no name; a node with /T extends the qualified name.
-    let fqn = d.get(b"T").and_then(Object::as_str).ok().map(|t| {
+    //
+    // Round-5 finding 1: decode /T before folding it in. A partial field name is
+    // a text string, so `(total)` and UTF-16BE `<FEFF0074006F00740061006C>` are the
+    // SAME name; comparing raw bytes would miss that collision and concatenate
+    // both roots into an ambiguous namespace. `decode_text_string` (the helper
+    // metadata.rs uses) normalizes PDFDocEncoding / UTF-16BE / UTF-8 to one form.
+    let fqn = d.get(b"T").ok().and_then(|t| decode_text_string(t).ok()).map(|t| {
         let mut n = prefix.to_vec();
         if !n.is_empty() {
             n.push(b'.');
         }
-        n.extend_from_slice(t);
+        n.extend_from_slice(t.as_bytes());
         n
     });
     if let Some(ref n) = fqn {
@@ -1703,8 +1730,9 @@ fn collect_field_names_rec(
 }
 
 /// Whether one input carries any JavaScript action (finding 5): document-level
-/// named JavaScript (/Names /JavaScript), or a /S /JavaScript action anywhere
-/// (/OpenAction, an /AA additional-action, a field or annotation /A).
+/// named JavaScript (/Names /JavaScript), or a /S /JavaScript action — or a
+/// /S /Rendition action with a /JS entry (round-5 finding 4) — anywhere (/OpenAction,
+/// an /AA additional-action, a field or annotation /A).
 fn source_has_javascript(src: &Document) -> bool {
     if let Some(cat) = source_catalog(src) {
         if let Some((_, names)) = cat.get(b"Names").ok().and_then(|v| resolve_catalog_dict(src, v)) {
@@ -1726,8 +1754,15 @@ fn object_has_js_action(obj: &Object) -> bool {
 }
 
 fn dict_has_js_action(d: &Dictionary) -> bool {
-    if d.get(b"S").and_then(Object::as_name).is_ok_and(|s| s == b"JavaScript") {
-        return true;
+    if let Ok(s) = d.get(b"S").and_then(Object::as_name) {
+        // A JavaScript action is JS outright. A rendition action (round-5 finding
+        // 4) also carries JavaScript in its /JS entry (ISO 32000 12.6.4.13), so a
+        // `<< /S /Rendition ... /JS (...) >>` names destinations by opaque
+        // string just as a JS action does; treat it as JavaScript so a
+        // destination rename with such an action present is correctly refused.
+        if s == b"JavaScript" || (s == b"Rendition" && d.has(b"JS")) {
+            return true;
+        }
     }
     d.iter().any(|(_, v)| object_has_js_action(v))
 }
@@ -1805,6 +1840,48 @@ fn flatten_name_tree(
         for kid in kids {
             flatten_name_tree(src, kid, out, id_map, ctx, depth + 1, into);
         }
+    }
+}
+
+/// Embedded-file name-tree keys that a /GoToE action in this input selects
+/// (round-5 finding 3). A GoToE names an embedded file of the current document by
+/// /N of its /T target dictionary (ISO 32000 12.6.4.4); a collision on such a
+/// name would misroute the action after a rename, so those names are collected
+/// to refuse the merge. Only the first-level /N is a key in THIS document's
+/// /EmbeddedFiles tree (a nested /T descends into another file's own tree), so
+/// only that is collected — matching deeper /N against this tree would refuse
+/// safe merges. Actions may be indirect objects or inline in an annotation /A,
+/// so every object is scanned and each dict's inline values are walked.
+fn gotoe_target_names(src: &Document) -> HashSet<Vec<u8>> {
+    let mut names = HashSet::new();
+    for obj in src.objects.values() {
+        scan_for_gotoe(src, obj, &mut names, 0);
+    }
+    names
+}
+
+fn scan_for_gotoe(src: &Document, obj: &Object, names: &mut HashSet<Vec<u8>>, depth: u32) {
+    if depth > NAME_TREE_MAX_DEPTH {
+        return;
+    }
+    let d = match obj {
+        Object::Dictionary(d) => d,
+        Object::Stream(s) => &s.dict,
+        Object::Array(a) => {
+            a.iter().for_each(|o| scan_for_gotoe(src, o, names, depth + 1));
+            return;
+        }
+        _ => return,
+    };
+    if d.get(b"S").and_then(Object::as_name).is_ok_and(|s| s == b"GoToE") {
+        if let Some((_, target)) = d.get(b"T").ok().and_then(|t| resolve_catalog_dict(src, t)) {
+            if let Ok(n) = target.get(b"N").and_then(|v| src.dereference(v).map(|(_, o)| o)).and_then(Object::as_str) {
+                names.insert(n.to_vec());
+            }
+        }
+    }
+    for (_, v) in d.iter() {
+        scan_for_gotoe(src, v, names, depth + 1);
     }
 }
 
@@ -3020,7 +3097,35 @@ mod tests {
         );
     }
 
-    // ---- F3: a later input's /CO makes the form unmergeable -----------------
+    #[test]
+    fn merge_multi_input_rejects_duplicate_field_names_across_encodings() {
+        // Finding 1: the SAME field name written two ways — the literal "(total)"
+        // and the UTF-16BE <FEFF0074006F00740061006C> — is one fully-qualified
+        // name. Comparing DECODED names catches the collision that a raw byte
+        // compare would miss (and would otherwise concatenate into an ambiguous
+        // namespace).
+        let total_utf16: Vec<u8> = {
+            let mut v = vec![0xFE, 0xFF];
+            for ch in "total".chars() {
+                v.extend_from_slice(&(ch as u16).to_be_bytes());
+            }
+            v
+        };
+        let mut a = build_acroform_doc(b"total");
+        let mut b = build_acroform_doc(&total_utf16);
+        let pa = save_temp(&mut a, "pdfree_pagedoc_enc_a.pdf");
+        let pb = save_temp(&mut b, "pdfree_pagedoc_enc_b.pdf");
+        let err = merge(&[pa.clone(), pb.clone()]).unwrap_err();
+        let _ = std::fs::remove_file(&pa);
+        let _ = std::fs::remove_file(&pb);
+        assert!(
+            matches!(err, PageDocError::UnmergeableCatalog(what) if what.contains("duplicate names")),
+            "got {err:?}"
+        );
+    }
+
+    // ---- F2/F3 (round 5): a later input's /CO or disagreeing /Q//DA makes
+    //      the form unmergeable ----------------------------------------------
 
     #[test]
     fn merge_multi_input_rejects_later_calculation_order() {
@@ -3045,7 +3150,48 @@ mod tests {
         );
     }
 
-    // ---- F4: colliding /EmbeddedFiles names are unmergeable ------------------
+    #[test]
+    fn merge_multi_input_rejects_later_omitted_quadding() {
+        // Finding 2: the first form sets /Q 1; the later form omits /Q, whose
+        // EFFECTIVE value is the spec default 0. Keeping /Q 1 would silently
+        // re-justify the later input's fields, so the disagreement is refused
+        // even though the later /Q is only implicit.
+        let mut a = build_acroform_doc(b"(a)");
+        let mut b = build_acroform_doc(b"(b)");
+        let acro_a = catalog_of(&a).get(b"AcroForm").and_then(Object::as_reference).unwrap();
+        a.get_dictionary_mut(acro_a).unwrap().set("Q", 1);
+        let pa = save_temp(&mut a, "pdfree_pagedoc_q_a.pdf");
+        let pb = save_temp(&mut b, "pdfree_pagedoc_q_b.pdf");
+        let err = merge(&[pa.clone(), pb.clone()]).unwrap_err();
+        let _ = std::fs::remove_file(&pa);
+        let _ = std::fs::remove_file(&pb);
+        assert!(
+            matches!(err, PageDocError::UnmergeableCatalog(what) if what.contains("default appearance")),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn merge_multi_input_merges_matching_quadding() {
+        // Finding 2: two forms whose effective /Q agree (both /Q 1) merge, and the
+        // shared value is kept. Guards against over-refusing safe cases.
+        let mut a = build_acroform_doc(b"(a)");
+        let mut b = build_acroform_doc(b"(b)");
+        for doc in [&mut a, &mut b] {
+            let acro = catalog_of(doc).get(b"AcroForm").and_then(Object::as_reference).unwrap();
+            doc.get_dictionary_mut(acro).unwrap().set("Q", 1);
+        }
+        let pa = save_temp(&mut a, "pdfree_pagedoc_qm_a.pdf");
+        let pb = save_temp(&mut b, "pdfree_pagedoc_qm_b.pdf");
+        let out = merge(&[pa.clone(), pb.clone()]).unwrap();
+        let _ = std::fs::remove_file(&pa);
+        let _ = std::fs::remove_file(&pb);
+        assert_eq!(acroform_of(&out).get(b"Q").and_then(Object::as_i64).unwrap(), 1);
+        assert_eq!(field_names(&out).len(), 2, "both distinct fields merge");
+    }
+
+    // ---- F3 (round 5): colliding /EmbeddedFiles names merge unless a GoToE
+    //      selects the collided name -----------------------------------------
 
     /// One-page doc whose catalog /Names /EmbeddedFiles names one embedded file.
     fn build_embedded_file_doc(fname: &[u8]) -> Document {
@@ -3086,12 +3232,67 @@ mod tests {
         doc
     }
 
+    /// As `build_embedded_file_doc`, plus an /OpenAction GoToE that selects an
+    /// embedded file by its name-tree key (`/T << /R /C /N (target) >>`).
+    fn build_embedded_file_doc_with_gotoe(fname: &[u8], target: &[u8]) -> Document {
+        let mut doc = build_embedded_file_doc(fname);
+        let gotoe = doc.add_object(dictionary! {
+            "S" => "GoToE",
+            "D" => Object::Array(vec![0.into(), "Fit".into()]),
+            "T" => dictionary! {
+                "R" => "C",
+                "N" => Object::String(target.to_vec(), lopdf::StringFormat::Literal),
+            },
+        });
+        let root = doc.trailer.get(b"Root").and_then(Object::as_reference).unwrap();
+        doc.get_dictionary_mut(root).unwrap().set("OpenAction", Object::Reference(gotoe));
+        doc
+    }
+
+    /// The embedded-file name-tree keys in the merged output.
+    fn embedded_file_names(out: &Document) -> Vec<Vec<u8>> {
+        let names_ref = catalog_of(out).get(b"Names").and_then(Object::as_reference).unwrap();
+        let names = out.get_dictionary(names_ref).unwrap();
+        let ef_ref = names.get(b"EmbeddedFiles").and_then(Object::as_reference).unwrap();
+        let ef = out.get_dictionary(ef_ref).unwrap();
+        ef.get(b"Names")
+            .unwrap()
+            .as_array()
+            .unwrap()
+            .chunks(2)
+            .filter_map(|kv| kv[0].as_str().ok().map(<[u8]>::to_vec))
+            .collect()
+    }
+
     #[test]
-    fn merge_multi_input_rejects_colliding_embedded_files() {
+    fn merge_multi_input_merges_colliding_embedded_files_without_gotoe() {
+        // Finding 3: two ordinary PDFs both attaching "data.bin" with NO GoToE
+        // are safely mergeable — the later name is suffixed and BOTH attachments
+        // are kept, rather than over-refusing the whole merge.
         let mut a = build_embedded_file_doc(b"data.bin");
         let mut b = build_embedded_file_doc(b"data.bin");
         let pa = save_temp(&mut a, "pdfree_pagedoc_ef_a.pdf");
         let pb = save_temp(&mut b, "pdfree_pagedoc_ef_b.pdf");
+        let out = merge(&[pa.clone(), pb.clone()]).unwrap();
+        let _ = std::fs::remove_file(&pa);
+        let _ = std::fs::remove_file(&pb);
+
+        let names = embedded_file_names(&out);
+        assert_eq!(names.len(), 2, "both attachments survive");
+        assert!(names.contains(&b"data.bin".to_vec()), "the first keeps its name");
+        assert!(names.iter().any(|n| n != b"data.bin"), "the later collider is suffixed");
+        assert_no_dangling(&out);
+    }
+
+    #[test]
+    fn merge_multi_input_rejects_colliding_embedded_files_referenced_by_gotoe() {
+        // Finding 3: the later input attaches "data.bin" (a collision) AND carries
+        // a GoToE selecting it by that exact name — a rename would leave the
+        // action resolving to the other input's attachment, so the merge refuses.
+        let mut a = build_embedded_file_doc(b"data.bin");
+        let mut b = build_embedded_file_doc_with_gotoe(b"data.bin", b"data.bin");
+        let pa = save_temp(&mut a, "pdfree_pagedoc_efg_a.pdf");
+        let pb = save_temp(&mut b, "pdfree_pagedoc_efg_b.pdf");
         let err = merge(&[pa.clone(), pb.clone()]).unwrap_err();
         let _ = std::fs::remove_file(&pa);
         let _ = std::fs::remove_file(&pb);
@@ -3195,6 +3396,92 @@ mod tests {
         assert_eq!(dests.len(), 2, "both destinations survive unrenamed");
         let names: Vec<Vec<u8>> = dests.iter().map(|(n, _)| n.clone()).collect();
         assert!(names.contains(&b"home".to_vec()) && names.contains(&b"toc".to_vec()));
+        assert_no_dangling(&out);
+    }
+
+    // ---- F4 (round 5): a rendition action's /JS counts as JavaScript ---------
+
+    /// One-page doc with a named destination whose ONLY action is a rendition
+    /// action carrying its JavaScript in /JS — no /S /JavaScript action exists,
+    /// so only the Rendition detection can flag this input (finding 4).
+    fn build_named_dest_rendition_doc(dest: &[u8]) -> Document {
+        let mut doc = Document::with_version("1.7");
+        let pages_id = doc.new_object_id();
+        let page_id = doc.new_object_id();
+        let c = doc.add_object(Stream::new(dictionary! {}, b"(x)".to_vec()));
+        doc.set_object(page_id, dictionary! {
+            "Type" => "Page",
+            "Parent" => Object::Reference(pages_id),
+            "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+            "Contents" => Object::Reference(c),
+        });
+        doc.set_object(pages_id, dictionary! {
+            "Type" => "Pages",
+            "Kids" => vec![Object::Reference(page_id)],
+            "Count" => 1,
+        });
+        let dests = doc.add_object(dictionary! {
+            "Names" => vec![
+                Object::String(dest.to_vec(), lopdf::StringFormat::Literal),
+                Object::Array(vec![Object::Reference(page_id), "Fit".into()]),
+            ],
+        });
+        let names = doc.add_object(dictionary! { "Dests" => Object::Reference(dests) });
+        let open_action = doc.add_object(dictionary! {
+            "S" => "Rendition",
+            "JS" => Object::String(b"this.gotoNamedDest('toc');".to_vec(), lopdf::StringFormat::Literal),
+        });
+        let catalog_id = doc.add_object(dictionary! {
+            "Type" => "Catalog",
+            "Pages" => Object::Reference(pages_id),
+            "Names" => Object::Reference(names),
+            "OpenAction" => Object::Reference(open_action),
+        });
+        doc.trailer.set("Root", Object::Reference(catalog_id));
+        doc
+    }
+
+    #[test]
+    fn merge_multi_input_rejects_dest_collision_with_rendition_js() {
+        // Finding 4: a rendition action carries JavaScript in /JS. Both inputs
+        // name "toc" (forcing a rename); the Rendition-borne JS could reference
+        // the renamed dest by opaque string, so the merge is refused.
+        let mut a = build_named_dest_rendition_doc(b"toc");
+        let mut b = build_named_dest_rendition_doc(b"toc");
+        let pa = save_temp(&mut a, "pdfree_pagedoc_rend_a.pdf");
+        let pb = save_temp(&mut b, "pdfree_pagedoc_rend_b.pdf");
+        let err = merge(&[pa.clone(), pb.clone()]).unwrap_err();
+        let _ = std::fs::remove_file(&pa);
+        let _ = std::fs::remove_file(&pb);
+        assert!(
+            matches!(err, PageDocError::UnmergeableCatalog(what) if what.contains("JavaScript")),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn merge_multi_input_rendition_without_js_is_not_javascript() {
+        // Finding 4 boundary: a rendition action with NO /JS carries no
+        // JavaScript, so a dest rename alongside it is safe and the merge
+        // proceeds — the /JS entry, not the /S /Rendition, is what flags it.
+        let mut a = build_named_dest_rendition_doc(b"toc");
+        let mut b = build_named_dest_rendition_doc(b"toc");
+        for doc in [&mut a, &mut b] {
+            let root = doc.trailer.get(b"Root").and_then(Object::as_reference).unwrap();
+            let open = doc
+                .get_dictionary(root)
+                .unwrap()
+                .get(b"OpenAction")
+                .and_then(Object::as_reference)
+                .unwrap();
+            doc.get_dictionary_mut(open).unwrap().remove(b"JS");
+        }
+        let pa = save_temp(&mut a, "pdfree_pagedoc_rend2_a.pdf");
+        let pb = save_temp(&mut b, "pdfree_pagedoc_rend2_b.pdf");
+        let out = merge(&[pa.clone(), pb.clone()]).unwrap();
+        let _ = std::fs::remove_file(&pa);
+        let _ = std::fs::remove_file(&pb);
+        assert_eq!(out.get_pages().len(), 2, "dest collision without JS still merges");
         assert_no_dangling(&out);
     }
 }
