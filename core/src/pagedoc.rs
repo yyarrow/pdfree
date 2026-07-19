@@ -1738,17 +1738,29 @@ fn collect_field_names_rec(
     // 7.3.10); the round-5 code called `decode_text_string` on the raw value,
     // so an indirect /T failed to decode and contributed no name at all,
     // letting two inputs that both indirectly named `total` slip past the
-    // collision check. Dereference first. Also strip a leading UTF-8 BOM
-    // (U+FEFF, `EF BB BF` in PDF 2.0's UTF-8 string encoding): lopdf 0.43's
-    // `decode_text_string` leaves it in the decoded `String` (see
-    // `metadata.rs`), so a BOM'd `total` and a plain `total` would otherwise
-    // compare unequal and miss a real collision.
+    // collision check. Dereference first.
+    //
+    // Round-8 finding: only strip a leading U+FEFF when the raw bytes are the
+    // PDF 2.0 UTF-8 BOM (`EF BB BF`), which lopdf 0.43's `decode_text_string`
+    // leaves in the decoded `String` (see `metadata.rs::strip_bom`). For a
+    // UTF-16BE string, lopdf consumes the `FE FF` encoding BOM *before*
+    // decoding, so any leading U+FEFF that survives is real field-name content
+    // — e.g. `FE FF FE FF 00 74 ...` decodes to `\u{FEFF}t...`. Stripping it
+    // unconditionally would conflate that distinct name with a plain one and
+    // wrongly reject an otherwise valid merge as a duplicate.
     let fqn = d
         .get(b"T")
         .ok()
         .and_then(|t| src.dereference(t).ok())
-        .and_then(|(_, t)| decode_text_string(t).ok())
-        .map(|t| t.strip_prefix('\u{FEFF}').map(str::to_string).unwrap_or(t))
+        .and_then(|(_, t)| {
+            let decoded = decode_text_string(t).ok()?;
+            let text = if t.as_str().is_ok_and(|raw| raw.starts_with(b"\xEF\xBB\xBF")) {
+                decoded.strip_prefix('\u{FEFF}').map(str::to_string).unwrap_or(decoded)
+            } else {
+                decoded
+            };
+            Some(text)
+        })
         .map(|t| {
             let mut n = prefix.to_vec();
             if !n.is_empty() {
@@ -3751,6 +3763,38 @@ mod tests {
             matches!(err, PageDocError::UnmergeableCatalog(what) if what.contains("duplicate names")),
             "got {err:?}"
         );
+    }
+
+    #[test]
+    fn merge_multi_input_keeps_utf16_leading_feff_distinct_from_plain() {
+        // Round-8 finding: a UTF-16BE /T whose CONTENT begins with U+FEFF is
+        // encoded as `FE FF` (encoding BOM, consumed by lopdf) + `FE FF` (real
+        // U+FEFF) + the rest. It decodes to `\u{FEFF}total`, a name distinct
+        // from plain "total". Stripping the leading U+FEFF unconditionally
+        // would conflate the two and wrongly reject this valid merge as a
+        // duplicate; the fix strips only the PDF-2.0 UTF-8 BOM (`EF BB BF`).
+        let utf16_feff_total = {
+            // FE FF (encoding BOM) + FE FF (content U+FEFF) + UTF-16BE "total".
+            let mut v = vec![0xFE, 0xFF, 0xFE, 0xFF];
+            for &b in b"total" {
+                v.push(0x00);
+                v.push(b);
+            }
+            v
+        };
+        let mut a = build_acroform_doc(&utf16_feff_total);
+        let mut b = build_acroform_doc(b"total");
+        let pa = save_temp(&mut a, "pdfree_pagedoc_u16feff_a.pdf");
+        let pb = save_temp(&mut b, "pdfree_pagedoc_u16feff_b.pdf");
+        let out = merge(&[pa.clone(), pb.clone()]).unwrap();
+        let _ = std::fs::remove_file(&pa);
+        let _ = std::fs::remove_file(&pb);
+        assert_eq!(
+            acroform_of(&out).get(b"Fields").unwrap().as_array().unwrap().len(),
+            2,
+            "\\u{{FEFF}}total and total are distinct names and both must survive"
+        );
+        assert_no_dangling(&out);
     }
 
     // ---- F3: an action's /S may be an indirect reference -------------------
