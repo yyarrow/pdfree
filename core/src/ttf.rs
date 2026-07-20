@@ -187,6 +187,14 @@ impl TtfFont {
         self.units_per_em as f32
     }
 
+    /// Whether a unicode-keyed cmap subtable was found — i.e. whether
+    /// `glyph_for_char`/`can_render_char` can answer at all. A `false` here
+    /// means the font is the byte-only shape (reportlab-style subsets,
+    /// symbol fonts).
+    pub fn has_unicode_cmap(&self) -> bool {
+        self.cmap_subtable.is_some()
+    }
+
     /// Looks up the glyph for `c` via `cmap`, then resolves its outline
     /// (recursing into composite components) and advance width.
     pub fn glyph_for_char(&self, c: char) -> Option<GlyphOutline> {
