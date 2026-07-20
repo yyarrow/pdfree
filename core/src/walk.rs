@@ -163,26 +163,39 @@ pub struct FontInfo<'a> {
     /// clear): such fonts resolve codes through their OWN byte-keyed cmap
     /// (ISO 32000 9.6.6.4), not through unicode.
     symbolic: bool,
+    /// Whether the font dict carries an /Encoding entry at all. Per ISO
+    /// 32000 9.6.6.4 a TrueType font with NO /Encoding resolves codes
+    /// through its built-in (3,0)/(1,0) cmap exactly like the symbolic
+    /// case, regardless of the Symbolic flag.
+    has_encoding: bool,
 }
 
-/// Parsed embedded font programs, cached per thread (engine and WASM are
-/// single-threaded) across FontInfo lifetimes. Tiny LRU: real documents use
-/// a handful of embedded fonts per page; the win is not re-decompressing a
-/// 10MB CJK font for every segment of one fragmented run edit.
+/// Embedded font-program parse results, cached per thread (engine and WASM
+/// are single-threaded) across FontInfo lifetimes. Tiny LRU: real documents
+/// use a handful of embedded fonts per page; the win is not re-decompressing
+/// a 10MB CJK font for every segment of one fragmented run edit.
+///
+/// Each entry keeps a copy of the RAW (still compressed) stream and a hit
+/// requires exact byte equality with it — the sampled fingerprint is only a
+/// fast filter, never trusted as identity, so object-id reuse across
+/// documents or a sampled-region collision can never hand back the wrong
+/// font (memcmp of a few MB is ~1ms; re-decompress + parse is 100×.that).
+/// FAILED parses are cached too (value None): a corrupt or unsupported
+/// font must not re-decompress per segment either. Memory is bounded by
+/// the cap (4 × raw stream).
 const TTF_CACHE_CAP: usize = 4;
+type TtfCacheEntry = (u64, std::rc::Rc<Vec<u8>>, Option<std::rc::Rc<crate::ttf::TtfFont>>);
 thread_local! {
-    static TTF_CACHE: std::cell::RefCell<Vec<(u64, std::rc::Rc<crate::ttf::TtfFont>)>> =
+    static TTF_CACHE: std::cell::RefCell<Vec<TtfCacheEntry>> =
         const { std::cell::RefCell::new(Vec::new()) };
 }
 
-/// Cheap fingerprint of a raw (still compressed) stream: length plus the
-/// first/last 1KB hashed. Sampling keeps repeated cache probes O(1) even
-/// for multi-megabyte font programs; two distinct embedded fonts agreeing
-/// on length AND both boundary kilobytes is not a realistic collision.
-fn stream_fingerprint(id: Option<lopdf::ObjectId>, raw: &[u8]) -> u64 {
+/// Cheap fingerprint of a raw stream (length + first/last 1KB hashed) used
+/// as the cache's fast-reject filter. Probing stays O(1) for multi-megabyte
+/// font programs; equality is confirmed by full memcmp on a filter hit.
+fn stream_fingerprint(raw: &[u8]) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut h = std::collections::hash_map::DefaultHasher::new();
-    id.hash(&mut h);
     raw.len().hash(&mut h);
     raw[..raw.len().min(1024)].hash(&mut h);
     raw[raw.len().saturating_sub(1024)..].hash(&mut h);
@@ -261,29 +274,34 @@ impl<'a> FontInfo<'a> {
     fn embedded_ttf(&self, doc: &Document) -> Option<&crate::ttf::TtfFont> {
         self.embedded
             .get_or_init(|| {
-                (|| {
+                let stream = (|| {
                     let fd = doc.dereference(self.dict.get(b"FontDescriptor").ok()?).ok()?.1.as_dict().ok()?;
-                    let ff_obj = fd.get(b"FontFile2").ok()?;
-                    let ff_id = ff_obj.as_reference().ok();
-                    let stream = doc.dereference(ff_obj).ok()?.1.as_stream().ok()?;
-                    let key = stream_fingerprint(ff_id, &stream.content);
-                    TTF_CACHE.with(|cache| {
-                        let mut cache = cache.borrow_mut();
-                        if let Some(pos) = cache.iter().position(|(k, _)| *k == key) {
-                            let hit = cache.remove(pos);
-                            let rc = hit.1.clone();
-                            cache.push(hit); // move to most-recent slot
-                            return Some(rc);
-                        }
-                        let data = stream.decompressed_content().ok()?;
-                        let rc = std::rc::Rc::new(crate::ttf::TtfFont::parse(data)?);
-                        if cache.len() >= TTF_CACHE_CAP {
-                            cache.remove(0);
-                        }
-                        cache.push((key, rc.clone()));
-                        Some(rc)
-                    })
-                })()
+                    doc.dereference(fd.get(b"FontFile2").ok()?).ok()?.1.as_stream().ok()
+                })()?;
+                let key = stream_fingerprint(&stream.content);
+                TTF_CACHE.with(|cache| {
+                    let mut cache = cache.borrow_mut();
+                    if let Some(pos) = cache
+                        .iter()
+                        .position(|(k, raw, _)| *k == key && raw.as_slice() == stream.content)
+                    {
+                        let hit = cache.remove(pos);
+                        let parsed = hit.2.clone();
+                        cache.push(hit); // move to most-recent slot
+                        return parsed;
+                    }
+                    // Miss: parse (or fail) ONCE and remember either way.
+                    let parsed = stream
+                        .decompressed_content()
+                        .ok()
+                        .and_then(crate::ttf::TtfFont::parse)
+                        .map(std::rc::Rc::new);
+                    if cache.len() >= TTF_CACHE_CAP {
+                        cache.remove(0);
+                    }
+                    cache.push((key, std::rc::Rc::new(stream.content.clone()), parsed.clone()));
+                    parsed
+                })
             })
             .as_deref()
     }
@@ -329,10 +347,22 @@ impl<'a> FontInfo<'a> {
             //   reportlab-shard shape: the generator wrote encoding and
             //   cmap together, the byte IS the font-internal code.
             let ws = c.is_some_and(char::is_whitespace);
-            if self.symbolic {
+            // Byte-keyed resolution applies when the Symbolic flag is set
+            // OR the font dict has no /Encoding at all — ISO 32000 9.6.6.4
+            // names both conditions; painting then goes through the
+            // built-in (3,0)/(1,0) cmap with the string byte. (ToUnicode
+            // still defines what the byte MEANS; the generator that wrote
+            // both tables is responsible for their consistency, so a real
+            // glyph at the byte is the correct renderability verdict.)
+            if self.symbolic || !self.has_encoding {
                 if let Some(v) = ttf.can_render_code(b, ws) {
                     return v;
                 }
+                // No byte-keyed table to consult: fall back to the unicode
+                // verdict rather than refusing outright — viewers are
+                // lenient here and treat unicode-only fonts' codes as
+                // characters, so a hard refusal would push perfectly
+                // renderable text into the rescue/fallback path.
                 return c.map(|c| ttf.can_render_char(c)).unwrap_or(false);
             }
             if ttf.has_unicode_cmap() {
@@ -595,6 +625,7 @@ fn build_font_info<'a>(doc: &'a Document, dict: &'a Dictionary) -> FontInfo<'a> 
             Some(flags & 4 != 0 && flags & 32 == 0)
         })()
         .unwrap_or(false);
+        let has_encoding = dict.has(b"Encoding");
         FontInfo {
             dict,
             cid,
@@ -609,6 +640,7 @@ fn build_font_info<'a>(doc: &'a Document, dict: &'a Dictionary) -> FontInfo<'a> 
             t3_vertical,
             embedded: std::cell::OnceCell::new(),
             symbolic,
+            has_encoding,
         }
     }
 }
@@ -1058,6 +1090,23 @@ mod tests {
         assert!(f.symbolic);
         assert!(f.glyph_available(&doc, 0x80, None));
         assert!(!f.glyph_available(&doc, 0x81, None), "unmapped byte still refused");
+    }
+
+    #[test]
+    fn missing_encoding_routes_through_byte_cmap() {
+        // ISO 32000 9.6.6.4: no /Encoding entry -> the built-in
+        // (3,0)/(1,0) cmap resolves the byte, same as the symbolic case,
+        // regardless of the Symbolic flag. The dual-cmap fixture maps Mac
+        // byte 0x80 to a real glyph, so WITHOUT /Encoding the byte is
+        // renderable; WITH /Encoding (nonsymbolic) the unicode table rules
+        // and 0x80/'€' stays refused (see the dual-cmap test above).
+        let mut doc = Document::with_version("1.7");
+        let id = font_dict_id_with(&mut doc, Some(SUBSET_TTF_DUAL));
+        doc.get_dictionary_mut(id).unwrap().remove(b"Encoding");
+        let f = font_info(&doc, id);
+        assert!(!f.symbolic && !f.has_encoding);
+        assert!(f.glyph_available(&doc, 0x80, Some('\u{20AC}')));
+        assert!(!f.glyph_available(&doc, 0x90, None), "unmapped byte still refused");
     }
 
     #[test]

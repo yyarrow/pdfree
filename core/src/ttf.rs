@@ -282,9 +282,11 @@ impl TtfFont {
             if score > 0 {
                 uni.push((score, abs_off));
             }
+            // PDF's byte-keyed glyph selection tries (3,0) before (1,0)
+            // (ISO 32000 9.6.6.4), so score the symbol table higher.
             match (platform_id, encoding_id) {
-                (1, 0) => byte.push((2, abs_off, false)),
-                (3, 0) => byte.push((1, abs_off, true)),
+                (3, 0) => byte.push((2, abs_off, true)),
+                (1, 0) => byte.push((1, abs_off, false)),
                 _ => {}
             }
         }
