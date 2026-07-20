@@ -7,9 +7,14 @@ engine and judge the result with four automatic checks:
   3. visibility — pixels inside the edit bbox must have changed
   4. semantics  — extracted text must contain the new string
 
-Three supplementary font-fidelity oracles run alongside the above (they add
-new verdicts to the same counts; a check's own inability to run degrades to
-a skip, it never asserts pass/fail it can't back up):
+Three supplementary font-fidelity oracles run alongside the above. Font
+substitution / glyph tofu failures override the file's headline verdict
+(fail beats pass; case.json keeps the original as primary_verdict); the
+identity-drift probe and oracle-availability skips are counted in a
+separate `checks` dict in report.json (and their own stdout section) so
+the headline stays exactly one verdict per corpus file. A check's own
+inability to run degrades to a skip — it never asserts a pass/fail it
+can't back up:
 
   5. identity drift      — re-encoding the SAME text (find == with) must
      render pixel-identical; any diff can only come from the engine's
@@ -53,6 +58,16 @@ BBOX_PAD = 6  # pixels of slack around the reported edit bbox
 
 MUTOOL = shutil.which("mutool") or "/opt/homebrew/bin/mutool"
 SUBSET_PREFIX_RE = re.compile(r"^[A-Z]{6}\+")  # ISO 32000 9.6.4: subset tag
+
+# Identity-drift confidence floor. Evidence-based, NOT copied from judge's
+# 96: measured across all 60 synthetic-corpus identity edits (find==with,
+# 2026-07-20), the raw unthresholded max pixel diff was 0 on every single
+# case — the engine's identity re-encode path currently renders
+# pixel-identical, with none of the sub-hundredth-point compensation
+# residue that motivates judge's 96 (that residue comes from actually
+# CHANGING glyphs). measured_max(0) + 16 margin. Judge's 96 would swallow
+# real drift on light-gray text (luminance delta < 96); 16 will not.
+IDENTITY_DRIFT_THRESHOLD = 16
 
 
 def sh(args):
@@ -271,39 +286,50 @@ def detect_font_substitution(before_spans, after_spans, edit_bbox):
     edit. A character the original font never drew is exempt: falling back
     for a genuinely unsupported glyph is legitimate engine behavior.
 
-    Mixed-font-neighbor exemption: the edit bbox (plus its overlap pad) can
-    graze ADJACENT text that legitimately uses a different font — e.g. a
-    "label (FontA): value (FontB)" line where only the value is edited. Such
-    a neighbor char may well be in covered_chars (orig_font drew the same
-    char elsewhere) yet was never touched by the edit. So any (char,
-    base-font) pair that ALREADY appears inside the before-page bbox is
-    treated as a pre-existing neighbor and skipped; only combinations that
-    are NEW inside the bbox after the edit get the covered_chars test.
+    Mixed-font-neighbor exemption (POSITIONAL): the edit bbox (plus its
+    overlap pad) can graze ADJACENT text that legitimately uses a different
+    font — e.g. a "label (FontA): value (FontB)" line where only the value
+    is edited. Such a neighbor char may well be in covered_chars (orig_font
+    drew the same char elsewhere) yet was never touched by the edit. An
+    after-page char is exempt only if the before-page bbox contains the
+    SAME char in the SAME base font at (approximately, ±2pt) the SAME
+    position — an untouched neighbor renders identically, while a rewritten
+    edit segment necessarily lays its characters out at new positions, so a
+    genuine "engine painted my new char in the neighbor's font" bug (same
+    char+font existing elsewhere in the bbox) is NOT exempted by identity
+    of (char, font) alone.
 
     Pure function over already-fetched mutool spans; returns
     ("fail_font_substituted", detail) or (None, None).
     """
     in_bbox = _bbox_overlap_pred(edit_bbox)
 
-    before_in_bbox = [(c, f) for c, f, box in before_spans if in_bbox(box)]
+    before_in_bbox = [(c, f, box) for c, f, box in before_spans if in_bbox(box)]
     if not before_in_bbox:
         return None, None
 
     font_counts = {}
-    for _, f in before_in_bbox:
+    for _, f, _box in before_in_bbox:
         font_counts[f] = font_counts.get(f, 0) + 1
     orig_font_raw = max(font_counts, key=font_counts.get)
     orig_font = strip_subset_prefix(orig_font_raw)
 
     covered_chars = {c for c, f, _ in before_spans if strip_subset_prefix(f) == orig_font}
-    preexisting = {(c, strip_subset_prefix(f)) for c, f in before_in_bbox}
+    preexisting = [(c, strip_subset_prefix(f), box) for c, f, box in before_in_bbox]
+
+    def untouched_neighbor(c, base_f, box, tol=2.0):
+        return any(
+            pc == c and pf == base_f
+            and all(abs(a - b) <= tol for a, b in zip(box, pbox))
+            for pc, pf, pbox in preexisting
+        )
 
     for c, f, box in after_spans:
         if not in_bbox(box) or c not in covered_chars:
             continue
         new_font = strip_subset_prefix(f)
-        if (c, new_font) in preexisting:
-            continue  # same char+font was already in the bbox before the edit
+        if untouched_neighbor(c, new_font, box):
+            continue  # same char+font at the same spot before the edit
         if new_font != orig_font:
             return "fail_font_substituted", {
                 "char": c, "orig_font": orig_font, "new_font": new_font,
@@ -312,24 +338,47 @@ def detect_font_substitution(before_spans, after_spans, edit_bbox):
     return None, None
 
 
-def detect_glyph_tofu(after_img, page_box, after_spans, edit_bbox, repl):
+def detect_glyph_tofu(after_img, page_box, before_spans, after_spans, edit_bbox, repl):
     """Check 3: a replacement character can be encoded into a subset font
     that keeps the SAME font name (so check 2 sees nothing wrong) but lacks
     that glyph's outline — the text layer says the character is there
     (ToUnicode round-trips) yet nothing gets painted ("tofu"). Also covers
     the renderer dropping the character from stext entirely, which is
-    evidence of the same underlying problem by a different symptom.
+    evidence of the same underlying problem by a different symptom — up to
+    and including the WHOLE edited segment vanishing from stext: if the
+    before-page bbox had spans (the target text existed) but the after-page
+    bbox has none, every non-whitespace repl char is reported missing
+    rather than silently passing (the most severe symptom must not be the
+    one the check is blind to).
 
     Aligns `repl`'s characters against the after-page's in-bbox char spans
     with difflib (tolerant of a dropped/reordered char breaking a naive
-    1:1 zip), then requires at least one dark pixel (<150, matching judge's
-    visibility floor) under each non-whitespace character's quad on the
-    AFTER render. Pure function except for the PIL crop on the caller-
-    supplied after_img; returns ("fail_glyph_tofu", detail) or (None, None).
+    1:1 zip), then requires actual glyph ink under each non-whitespace
+    character's quad on the AFTER render: the region's luminance extrema
+    must span >= 96 (same confidence threshold as judge's diff check).
+    A painted glyph always produces foreground/background contrast plus
+    antialiasing transitions; a blank quad is near-uniform. This holds on
+    any SOLID background, dark or light (a plain darkness test would
+    false-pass blank glyphs on dark backgrounds, where every pixel is
+    already dark). Known limitation, accepted: a blank quad sitting on a
+    busy gradient/image background can show >= 96 contrast from the
+    background alone and slip through.
+
+    Pure function except for the PIL crop on the caller-supplied after_img;
+    returns ("fail_glyph_tofu", detail) or (None, None).
     """
     in_bbox = _bbox_overlap_pred(edit_bbox)
     after_in_bbox = [(c, f, box) for c, f, box in after_spans if in_bbox(box)]
     if not after_in_bbox:
+        # Renderer dropped the entire edited segment from stext. Only a
+        # tofu verdict if there was something there before and the
+        # replacement has visible characters to account for.
+        had_before = any(in_bbox(box) for _, _, box in before_spans)
+        visible_repl = [ch for ch in repl if not ch.isspace()]
+        if had_before and visible_repl:
+            return "fail_glyph_tofu", {
+                "missing": [{"char": ch, "reason": "missing_from_stext"} for ch in visible_repl],
+            }
         return None, None
 
     after_str = "".join(c for c, _, _ in after_in_bbox)
@@ -356,7 +405,8 @@ def detect_glyph_tofu(after_img, page_box, after_spans, edit_bbox, repl):
             tofu.append({"char": ch, "reason": "offpage_quad"})
             continue
         region = after_img.crop((px0, py0, px1, py1))
-        if region.point(lambda v: 255 if v < 150 else 0).getbbox() is None:
+        lo, hi = region.getextrema()
+        if hi - lo < 96:
             tofu.append({"char": ch, "reason": "blank_glyph"})
 
     if tofu:
@@ -495,17 +545,20 @@ def check_identity_drift(case, pdf_path, run, find, work):
     if region.point(lambda v: 255 if v < 150 else 0).getbbox() is None:
         return "skip_identity_invisible_text", None, out_pdf
 
-    diff = ImageChops.difference(before, after).point(lambda v: 255 if v >= 96 else 0)
+    diff = ImageChops.difference(before, after).point(
+        lambda v: 255 if v >= IDENTITY_DRIFT_THRESHOLD else 0)
     if diff.getbbox() is not None:
         return "fail_identity_drift", diff, out_pdf
     return "pass", None, out_pdf
 
 
 def run_case(pdf_path: Path, work: Path):
-    """Returns a list of (file, verdict, detail) rows — usually one (the
-    primary edit's verdict), but the identity-drift probe (check 1) and a
-    skip_font_oracle bookkeeping row (checks 2/3) can add extra rows for
-    the SAME file into the same counts, per the task's aggregation choice.
+    """Returns (primary_row, check_rows): primary_row is this file's ONE
+    (file, verdict, detail) headline verdict (font-check failures override
+    it, fail beats pass); check_rows are supplementary-oracle outcomes
+    (identity drift, skip_font_oracle) that are counted and reported
+    separately so the headline per-file totals stay exactly one row per
+    corpus file.
     """
     case = hashlib.sha1(pdf_path.name.encode()).hexdigest()[:10]
     rng = random.Random(case)
@@ -520,10 +573,10 @@ def run_case(pdf_path: Path, work: Path):
     r = sh([str(ENGINE), "extract", str(pdf_path)])
     if r.returncode != 0:
         if not input_renderable():
-            return [(pdf_path.name, "skip_invalid_input", None)]
-        return [(pdf_path.name, "fail_engine_extract", r.stderr.strip()[:200])]
+            return (pdf_path.name, "skip_invalid_input", None), []
+        return (pdf_path.name, "fail_engine_extract", r.stderr.strip()[:200]), []
     if VARLEN:
-        return [run_case_varlen(pdf_path, work, case, rng)]
+        return run_case_varlen(pdf_path, work, case, rng), []
     runs = json.loads(r.stdout)["runs"]
     out_pdf = work / f"{case}_out.pdf"
     run = find = repl = None
@@ -542,20 +595,20 @@ def run_case(pdf_path: Path, work: Path):
         last_err = r.stderr.strip()[:200]
     if run is None:
         if tried == 0:
-            return [(pdf_path.name, "skip_no_candidate", None)]
+            return (pdf_path.name, "skip_no_candidate", None), []
         # engine refusing every candidate is a capability gap (usually a
         # font that can't encode the replacement), not silent corruption
         if last_err and "encrypted" in last_err:
-            return [(pdf_path.name, "skip_encrypted", None)]
+            return (pdf_path.name, "skip_encrypted", None), []
         if last_err and "cannot represent" in last_err:
-            return [(pdf_path.name, "fail_unencodable", last_err)]
-        return [(pdf_path.name, "fail_engine_replace", last_err)]
+            return (pdf_path.name, "fail_unencodable", last_err), []
+        return (pdf_path.name, "fail_engine_replace", last_err), []
     report = json.loads(r.stdout)
 
     try:
         verdict, diff = judge(case, pdf_path, out_pdf, run["page"], report, find, repl, work)
     except Exception as e:
-        return [(pdf_path.name, "fail_harness_error", f"{type(e).__name__}: {e}"[:200])]
+        return (pdf_path.name, "fail_harness_error", f"{type(e).__name__}: {e}"[:200]), []
 
     # Checks 2/3 (font substitution / glyph tofu): only meaningful once
     # judge() got as far as a valid, on-page, size-matched before/after
@@ -579,7 +632,8 @@ def run_case(pdf_path: Path, work: Path):
             except Exception:
                 font_verdict, font_info = None, None
             try:
-                tofu_verdict, tofu_info = detect_glyph_tofu(after_img, page_box, after_spans, edit_bbox, repl)
+                tofu_verdict, tofu_info = detect_glyph_tofu(
+                    after_img, page_box, before_spans, after_spans, edit_bbox, repl)
             except Exception:
                 tofu_verdict, tofu_info = None, None
 
@@ -592,7 +646,6 @@ def run_case(pdf_path: Path, work: Path):
                 final_verdict = "fail_font_substituted"
                 case_extra["font_check"] = font_info
 
-    results = []
     if final_verdict.startswith("fail"):
         dest = FAILURES / f"{pdf_path.stem}_{final_verdict}"
         dest.mkdir(parents=True, exist_ok=True)
@@ -603,16 +656,19 @@ def run_case(pdf_path: Path, work: Path):
         (dest / "case.json").write_text(json.dumps(case_data, indent=2))
         if diff is not None:
             diff.save(dest / "diff.png")
-        results.append((pdf_path.name, final_verdict, f"find={find} with={repl} page={run['page']}"))
+        primary = (pdf_path.name, final_verdict, f"find={find} with={repl} page={run['page']}")
     else:
-        results.append((pdf_path.name, final_verdict, None))
+        primary = (pdf_path.name, final_verdict, None)
+
+    check_rows = []
     if skip_font_oracle:
-        results.append((pdf_path.name, "skip_font_oracle", None))
+        check_rows.append((pdf_path.name, "skip_font_oracle", None))
 
     # Check 1 (identity drift): independent probe on the same edit target,
     # always attempted whenever a real edit run was found above, regardless
-    # of the primary/font-check outcome. Only added as its own row when it
-    # isn't a plain pass, so it doesn't inflate the "passed" bucket.
+    # of the primary/font-check outcome. Reported in the supplementary
+    # checks section (never mixed into the per-file headline counts);
+    # failures still get a failures/ archive like any other fail.
     id_verdict, id_diff, id_out = check_identity_drift(case, pdf_path, run, find, work)
     if id_verdict.startswith("fail"):
         dest = FAILURES / f"{pdf_path.stem}_{id_verdict}"
@@ -624,11 +680,12 @@ def run_case(pdf_path: Path, work: Path):
             {"find": find, "with": find, "mode": "identity", "page": run["page"]}, indent=2))
         if id_diff is not None:
             id_diff.save(dest / "diff.png")
-        results.append((pdf_path.name, id_verdict, f"find={find} page={run['page']}"))
-    elif id_verdict != "pass":
-        results.append((pdf_path.name, id_verdict, None))
+        check_rows.append((pdf_path.name, id_verdict, f"find={find} page={run['page']}"))
+    else:
+        check_rows.append((pdf_path.name,
+                           "identity_pass" if id_verdict == "pass" else id_verdict, None))
 
-    return results
+    return primary, check_rows
 
 
 def run_case_varlen(pdf_path: Path, work: Path, case: str, rng):
@@ -714,16 +771,22 @@ def main():
 
     results = []
     counts = {}
+    check_results = []
+    check_counts = {}
     for pdf in pdfs:
         try:
-            entries = run_case(pdf, work)
+            primary, check_rows = run_case(pdf, work)
         except Exception as e:
-            entries = [(pdf.name, "fail_harness_crash", f"{type(e).__name__}: {e}"[:200])]
-        for name, verdict, detail in entries:
-            counts[verdict] = counts.get(verdict, 0) + 1
-            results.append({"file": name, "verdict": verdict, "detail": detail})
-            mark = "." if verdict == "pass" else ("s" if verdict.startswith("skip") else "F")
-            print(mark, end="", flush=True)
+            primary = (pdf.name, "fail_harness_crash", f"{type(e).__name__}: {e}"[:200])
+            check_rows = []
+        name, verdict, detail = primary
+        counts[verdict] = counts.get(verdict, 0) + 1
+        results.append({"file": name, "verdict": verdict, "detail": detail})
+        mark = "." if verdict == "pass" else ("s" if verdict.startswith("skip") else "F")
+        print(mark, end="", flush=True)
+        for cname, cverdict, cdetail in check_rows:
+            check_counts[cverdict] = check_counts.get(cverdict, 0) + 1
+            check_results.append({"file": cname, "verdict": cverdict, "detail": cdetail})
 
     print()
     total = len(results)
@@ -733,9 +796,14 @@ def main():
           f"({100 * passed / max(tested, 1):.1f}%) ===")
     for k in sorted(counts):
         print(f"  {k}: {counts[k]}")
+    if check_counts:
+        print("\n--- supplementary checks (identity drift / font oracle) ---")
+        for k in sorted(check_counts):
+            print(f"  {k}: {check_counts[k]}")
 
     (ROOT / "report.json").write_text(json.dumps(
-        {"counts": counts, "results": results}, indent=2))
+        {"counts": counts, "results": results,
+         "checks": check_counts, "check_results": check_results}, indent=2))
 
 
 if __name__ == "__main__":
