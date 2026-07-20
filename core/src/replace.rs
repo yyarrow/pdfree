@@ -173,11 +173,20 @@ pub(crate) fn replace_seg_internal(
         let result = font.encode(doc, &new_text).ok_or(ReplaceError::Unencodable).and_then(|bytes| {
             // Encoding proves the code points exist in the encoding, not that
             // the (often subsetted) font has glyphs for them. Require
-            // verifiable metrics/procedures for every byte we introduce;
-            // bytes already present in the original string obviously render.
+            // verifiable evidence — the embedded font program when present,
+            // else metrics/procedures — for every byte we introduce; bytes
+            // already present in the original string obviously render.
             if !font.cid {
-                for &b in &bytes {
-                    if !seg.bytes.contains(&b) && !font.glyph_available(b) {
+                // Simple-font codes are one byte per character, so when the
+                // roundtrip-verified encoding has one byte per char the two
+                // sequences align positionally; a ligature-style ToUnicode
+                // breaks that, and `None` makes glyph_available conservative.
+                let chars: Vec<char> = new_text.chars().collect();
+                let aligned = bytes.len() == chars.len();
+                for (i, &b) in bytes.iter().enumerate() {
+                    if !seg.bytes.contains(&b)
+                        && !font.glyph_available(doc, b, aligned.then(|| chars[i]))
+                    {
                         return Err(ReplaceError::MissingGlyph);
                     }
                 }
@@ -312,7 +321,16 @@ fn try_borrow(
             continue;
         }
         let Some(bytes) = font.encode(doc, with) else { continue };
-        if !bytes.iter().all(|&b| font.glyph_available(b)) {
+        // A borrowed font must prove EVERY character (there is no "already
+        // rendered in this segment" shortcut — the segment used a different
+        // font). Same byte↔char alignment rule as replace_seg_internal.
+        let chars: Vec<char> = with.chars().collect();
+        let aligned = bytes.len() == chars.len();
+        if !bytes
+            .iter()
+            .enumerate()
+            .all(|(i, &b)| font.glyph_available(doc, b, aligned.then(|| chars[i])))
+        {
             continue;
         }
         let same_size = segs

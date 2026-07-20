@@ -32,10 +32,24 @@ pub struct GlyphOutline {
 
 /// Which `cmap` subtable format we picked as the best unicode source.
 enum CmapSubtable {
+    /// Absolute byte offset into `data` of the format-0 subtable header.
+    Format0(usize),
     /// Absolute byte offset into `data` of the format-4 subtable header.
     Format4(usize),
+    /// Absolute byte offset into `data` of the format-6 subtable header.
+    Format6(usize),
     /// Absolute byte offset into `data` of the format-12 subtable header.
     Format12(usize),
+}
+
+/// A cmap subtable keyed by the FONT-INTERNAL byte/code value rather than
+/// unicode: platform (1,0) Mac (what reportlab-style subsetters emit —
+/// codes are the PDF string bytes directly) or platform (3,0) Windows
+/// symbol (codes live at 0xF000+byte, sometimes at the bare byte).
+struct ByteCmap {
+    sub: CmapSubtable,
+    /// True for (3,0) symbol tables: try 0xF000|code before the bare code.
+    f000: bool,
 }
 
 /// A parsed (but not decompressed/interpreted beyond what we need) TrueType
@@ -50,7 +64,13 @@ pub struct TtfFont {
     hmtx_offset: u32,
     loca_offset: u32,
     glyf_offset: u32,
-    cmap_subtable: CmapSubtable,
+    /// Best unicode-keyed subtable, when the font has one. Outline lookups
+    /// by char (`glyph_for_char`, fallback synthesis) require it.
+    cmap_subtable: Option<CmapSubtable>,
+    /// Best byte-keyed subtable ((1,0) Mac or (3,0) symbol), when present.
+    /// Coverage checks for simple-font byte codes use it: for these fonts
+    /// the PDF string byte IS the cmap key, no unicode roundtrip involved.
+    byte_cmap: Option<ByteCmap>,
 }
 
 // ---------------------------------------------------------------------
@@ -142,7 +162,12 @@ impl TtfFont {
             return None;
         }
 
-        let cmap_subtable = Self::find_cmap_subtable(&data, cmap_range)?;
+        let (cmap_subtable, byte_cmap) = Self::find_cmap_subtables(&data, cmap_range);
+        // A font with no usable subtable of either kind can't be consulted
+        // for anything; treat it as unparseable.
+        if cmap_subtable.is_none() && byte_cmap.is_none() {
+            return None;
+        }
 
         Some(TtfFont {
             data,
@@ -154,6 +179,7 @@ impl TtfFont {
             loca_offset: loca_range.0,
             glyf_offset: glyf_range.0,
             cmap_subtable,
+            byte_cmap,
         })
     }
 
@@ -173,27 +199,70 @@ impl TtfFont {
         Some(GlyphOutline { advance, contours })
     }
 
+    /// Whether this font can actually PAINT `c`: the cmap must map it, and a
+    /// non-whitespace character must have a non-empty outline. Subsetters can
+    /// drop a glyph from cmap entirely, or (with gid-retention) keep the gid
+    /// while stripping its contours — either way the character would render
+    /// as invisible tofu, which is worse than refusing. Whitespace glyphs
+    /// (space, NBSP) legitimately have no contours and still count.
+    pub fn can_render_char(&self, c: char) -> bool {
+        match self.glyph_for_char(c) {
+            Some(g) => !g.contours.is_empty() || c.is_whitespace(),
+            None => false,
+        }
+    }
+
+    /// Byte-keyed variant of `can_render_char` for fonts whose cmap keys
+    /// are the PDF string bytes themselves ((1,0) Mac or (3,0) symbol).
+    /// `None` when this font has no byte-keyed subtable to consult;
+    /// `Some(verdict)` otherwise. `is_whitespace` lets a legitimately
+    /// contour-less glyph (space) pass, mirroring the char-keyed check.
+    pub fn can_render_code(&self, b: u8, is_whitespace: bool) -> Option<bool> {
+        self.byte_cmap.as_ref()?;
+        let Some(gid) = self.lookup_byte_cmap(b) else {
+            return Some(false);
+        };
+        if gid as u32 >= self.num_glyphs as u32 {
+            return Some(false);
+        }
+        let Some(contours) = self.outline_for_gid(gid, 0) else {
+            return Some(false);
+        };
+        Some(!contours.is_empty() || is_whitespace)
+    }
+
     // -------------------------------------------------------------
     // cmap
     // -------------------------------------------------------------
 
-    /// Scans the `cmap` encoding records and picks the subtable most likely
-    /// to give full-repertoire unicode coverage: platform 3/encoding 10
-    /// (Windows, full unicode incl. supplementary planes) is preferred,
-    /// then platform 0 (Unicode) full-repertoire encodings, then plain
-    /// platform 3/encoding 1 (Windows BMP), then any other platform-0
-    /// subtable. Only format 4 and format 12 subtables are usable; other
-    /// formats are skipped even if their encoding record scores highest.
-    fn find_cmap_subtable(data: &[u8], range: (u32, u32)) -> Option<CmapSubtable> {
+    /// Scans the `cmap` encoding records and picks two subtables:
+    ///
+    /// UNICODE-keyed — most likely to give full-repertoire coverage:
+    /// platform 3/encoding 10 (Windows, full unicode incl. supplementary
+    /// planes) is preferred, then platform 0 (Unicode) full-repertoire
+    /// encodings, then plain platform 3/encoding 1 (Windows BMP), then any
+    /// other platform-0 subtable. Only format 4 and 12 are usable here.
+    ///
+    /// BYTE-keyed — platform (1,0) Mac (reportlab-style subsetters put the
+    /// PDF string bytes straight into a format-6/format-0 table here) or
+    /// (3,0) Windows symbol (codes at 0xF000+byte). Formats 0/4/6/12
+    /// accepted. Fonts embedded by such generators often have ONLY this
+    /// table, so coverage checks must be able to key by byte.
+    fn find_cmap_subtables(data: &[u8], range: (u32, u32)) -> (Option<CmapSubtable>, Option<ByteCmap>) {
         let base = range.0 as usize;
-        let num_tables = u16_at(data, base + 2)? as usize;
+        let Some(num_tables) = u16_at(data, base + 2) else {
+            return (None, None);
+        };
 
-        let mut candidates: Vec<(u8, usize)> = Vec::with_capacity(num_tables);
-        for i in 0..num_tables {
+        // (score, absolute offset, is (3,0) symbol) per keying kind.
+        let mut uni: Vec<(u8, usize)> = Vec::new();
+        let mut byte: Vec<(u8, usize, bool)> = Vec::new();
+        for i in 0..num_tables as usize {
             let rec_off = base + 4 + i * 8;
-            let platform_id = u16_at(data, rec_off)?;
-            let encoding_id = u16_at(data, rec_off + 2)?;
-            let offset = u32_at(data, rec_off + 4)?;
+            let Some(platform_id) = u16_at(data, rec_off) else { break };
+            let Some(encoding_id) = u16_at(data, rec_off + 2) else { break };
+            let Some(offset) = u32_at(data, rec_off + 4) else { break };
+            let Some(abs_off) = base.checked_add(offset as usize) else { continue };
             let score: u8 = match (platform_id, encoding_id) {
                 (3, 10) => 5,
                 (0, 4) | (0, 6) => 4,
@@ -203,27 +272,81 @@ impl TtfFont {
                 _ => 0,
             };
             if score > 0 {
-                let abs_off = base.checked_add(offset as usize)?;
-                candidates.push((score, abs_off));
+                uni.push((score, abs_off));
+            }
+            match (platform_id, encoding_id) {
+                (1, 0) => byte.push((2, abs_off, false)),
+                (3, 0) => byte.push((1, abs_off, true)),
+                _ => {}
             }
         }
-        candidates.sort_by(|a, b| b.0.cmp(&a.0));
+        uni.sort_by(|a, b| b.0.cmp(&a.0));
+        byte.sort_by(|a, b| b.0.cmp(&a.0));
 
-        for (_, off) in candidates {
-            match u16_at(data, off) {
-                Some(4) => return Some(CmapSubtable::Format4(off)),
-                Some(12) => return Some(CmapSubtable::Format12(off)),
-                _ => continue,
-            }
-        }
-        None
+        let unicode = uni.iter().find_map(|&(_, off)| match u16_at(data, off) {
+            Some(4) => Some(CmapSubtable::Format4(off)),
+            Some(12) => Some(CmapSubtable::Format12(off)),
+            _ => None,
+        });
+        let byte_keyed = byte.iter().find_map(|&(_, off, f000)| {
+            let sub = match u16_at(data, off) {
+                Some(0) => CmapSubtable::Format0(off),
+                Some(4) => CmapSubtable::Format4(off),
+                Some(6) => CmapSubtable::Format6(off),
+                Some(12) => CmapSubtable::Format12(off),
+                _ => return None,
+            };
+            Some(ByteCmap { sub, f000 })
+        });
+        (unicode, byte_keyed)
     }
 
     fn lookup_cmap(&self, c: u32) -> Option<u16> {
-        match self.cmap_subtable {
-            CmapSubtable::Format4(off) => Self::lookup_format4(&self.data, off, c),
-            CmapSubtable::Format12(off) => Self::lookup_format12(&self.data, off, c),
+        Self::lookup_subtable(&self.data, self.cmap_subtable.as_ref()?, c)
+    }
+
+    fn lookup_subtable(data: &[u8], sub: &CmapSubtable, c: u32) -> Option<u16> {
+        match *sub {
+            CmapSubtable::Format0(off) => Self::lookup_format0(data, off, c),
+            CmapSubtable::Format4(off) => Self::lookup_format4(data, off, c),
+            CmapSubtable::Format6(off) => Self::lookup_format6(data, off, c),
+            CmapSubtable::Format12(off) => Self::lookup_format12(data, off, c),
         }
+    }
+
+    /// Byte-keyed glyph id lookup via the (1,0)/(3,0) subtable. Symbol
+    /// tables conventionally map codes in the 0xF0xx PUA range, so try
+    /// 0xF000|code first, then the bare code.
+    fn lookup_byte_cmap(&self, b: u8) -> Option<u16> {
+        let bc = self.byte_cmap.as_ref()?;
+        if bc.f000 {
+            if let Some(gid) = Self::lookup_subtable(&self.data, &bc.sub, 0xF000 | b as u32) {
+                return Some(gid);
+            }
+        }
+        Self::lookup_subtable(&self.data, &bc.sub, b as u32)
+    }
+
+    /// Format 0: header (format, length, language: u16 each) then a flat
+    /// 256-entry u8 glyph id array indexed by code.
+    fn lookup_format0(data: &[u8], off: usize, c: u32) -> Option<u16> {
+        if c > 0xFF {
+            return None;
+        }
+        let gid = u8_at(data, off + 6 + c as usize)? as u16;
+        if gid == 0 { None } else { Some(gid) }
+    }
+
+    /// Format 6: header (format, length, language: u16 each), firstCode,
+    /// entryCount, then entryCount u16 glyph ids for the dense code range.
+    fn lookup_format6(data: &[u8], off: usize, c: u32) -> Option<u16> {
+        let first = u16_at(data, off + 6)? as u32;
+        let count = u16_at(data, off + 8)? as u32;
+        if c < first || c >= first + count {
+            return None;
+        }
+        let gid = u16_at(data, off + 10 + ((c - first) as usize) * 2)?;
+        if gid == 0 { None } else { Some(gid) }
     }
 
     fn lookup_format4(data: &[u8], off: usize, c: u32) -> Option<u16> {
