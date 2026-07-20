@@ -28,6 +28,9 @@ pub fn replace_run_text(
     fallback: Option<&TtfFont>,
 ) -> Result<ReplaceReport, ReplaceError> {
     crate::replace::reject_encrypted(doc)?;
+    // New edit operation: embedded-font cache pointer shortcuts from any
+    // earlier operation must re-verify (see bump_ttf_cache_epoch).
+    crate::walk::bump_ttf_cache_epoch();
     let mut work = doc.clone();
     let report = replace_run_inner(&mut work, page_no, block, line, run, new_text, fallback)?;
     *doc = work;

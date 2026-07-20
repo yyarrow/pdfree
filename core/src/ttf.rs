@@ -42,14 +42,16 @@ enum CmapSubtable {
     Format12(usize),
 }
 
-/// A cmap subtable keyed by the FONT-INTERNAL byte/code value rather than
-/// unicode: platform (1,0) Mac (what reportlab-style subsetters emit —
-/// codes are the PDF string bytes directly) or platform (3,0) Windows
-/// symbol (codes live at 0xF000+byte, sometimes at the bare byte).
+/// Cmap subtables keyed by the FONT-INTERNAL byte/code value rather than
+/// unicode. PDF's byte-keyed glyph selection (ISO 32000 9.6.6.4) consults
+/// the (3,0) Windows symbol table first — whose codes may live in any of
+/// the 0x0000, 0xF000, 0xF100 or 0xF200 high-byte ranges — then the (1,0)
+/// Mac table (what reportlab-style subsetters emit — codes are the PDF
+/// string bytes directly). Both are kept so an F1xx/F2xx symbol table
+/// doesn't shadow a usable Mac table.
 struct ByteCmap {
-    sub: CmapSubtable,
-    /// True for (3,0) symbol tables: try 0xF000|code before the bare code.
-    f000: bool,
+    symbol: Option<CmapSubtable>,
+    mac: Option<CmapSubtable>,
 }
 
 /// A parsed (but not decompressed/interpreted beyond what we need) TrueType
@@ -262,9 +264,10 @@ impl TtfFont {
             return (None, None);
         };
 
-        // (score, absolute offset, is (3,0) symbol) per keying kind.
+        // (score, absolute offset) for unicode; symbol/mac kept separately.
         let mut uni: Vec<(u8, usize)> = Vec::new();
-        let mut byte: Vec<(u8, usize, bool)> = Vec::new();
+        let mut symbol_off: Option<usize> = None;
+        let mut mac_off: Option<usize> = None;
         for i in 0..num_tables as usize {
             let rec_off = base + 4 + i * 8;
             let Some(platform_id) = u16_at(data, rec_off) else { break };
@@ -282,32 +285,35 @@ impl TtfFont {
             if score > 0 {
                 uni.push((score, abs_off));
             }
-            // PDF's byte-keyed glyph selection tries (3,0) before (1,0)
-            // (ISO 32000 9.6.6.4), so score the symbol table higher.
             match (platform_id, encoding_id) {
-                (3, 0) => byte.push((2, abs_off, true)),
-                (1, 0) => byte.push((1, abs_off, false)),
+                (3, 0) => symbol_off = symbol_off.or(Some(abs_off)),
+                (1, 0) => mac_off = mac_off.or(Some(abs_off)),
                 _ => {}
             }
         }
         uni.sort_by(|a, b| b.0.cmp(&a.0));
-        byte.sort_by(|a, b| b.0.cmp(&a.0));
 
         let unicode = uni.iter().find_map(|&(_, off)| match u16_at(data, off) {
             Some(4) => Some(CmapSubtable::Format4(off)),
             Some(12) => Some(CmapSubtable::Format12(off)),
             _ => None,
         });
-        let byte_keyed = byte.iter().find_map(|&(_, off, f000)| {
-            let sub = match u16_at(data, off) {
-                Some(0) => CmapSubtable::Format0(off),
-                Some(4) => CmapSubtable::Format4(off),
-                Some(6) => CmapSubtable::Format6(off),
-                Some(12) => CmapSubtable::Format12(off),
-                _ => return None,
-            };
-            Some(ByteCmap { sub, f000 })
-        });
+        let usable = |off: usize| -> Option<CmapSubtable> {
+            match u16_at(data, off) {
+                Some(0) => Some(CmapSubtable::Format0(off)),
+                Some(4) => Some(CmapSubtable::Format4(off)),
+                Some(6) => Some(CmapSubtable::Format6(off)),
+                Some(12) => Some(CmapSubtable::Format12(off)),
+                _ => None,
+            }
+        };
+        let symbol = symbol_off.and_then(usable);
+        let mac = mac_off.and_then(usable);
+        let byte_keyed = if symbol.is_some() || mac.is_some() {
+            Some(ByteCmap { symbol, mac })
+        } else {
+            None
+        };
         (unicode, byte_keyed)
     }
 
@@ -324,17 +330,20 @@ impl TtfFont {
         }
     }
 
-    /// Byte-keyed glyph id lookup via the (1,0)/(3,0) subtable. Symbol
-    /// tables conventionally map codes in the 0xF0xx PUA range, so try
-    /// 0xF000|code first, then the bare code.
+    /// Byte-keyed glyph id lookup: the (3,0) symbol table first — probing
+    /// every high-byte range ISO 32000 permits for it (bare, 0xF000,
+    /// 0xF100, 0xF200) — then the (1,0) Mac table with the bare byte.
     fn lookup_byte_cmap(&self, b: u8) -> Option<u16> {
         let bc = self.byte_cmap.as_ref()?;
-        if bc.f000 {
-            if let Some(gid) = Self::lookup_subtable(&self.data, &bc.sub, 0xF000 | b as u32) {
-                return Some(gid);
+        if let Some(sym) = &bc.symbol {
+            for high in [0x0000u32, 0xF000, 0xF100, 0xF200] {
+                if let Some(gid) = Self::lookup_subtable(&self.data, sym, high | b as u32) {
+                    return Some(gid);
+                }
             }
         }
-        Self::lookup_subtable(&self.data, &bc.sub, b as u32)
+        let mac = bc.mac.as_ref()?;
+        Self::lookup_subtable(&self.data, mac, b as u32)
     }
 
     /// Format 0: header (format, length, language: u16 each) then a flat

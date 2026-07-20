@@ -175,24 +175,50 @@ pub struct FontInfo<'a> {
 /// use a handful of embedded fonts per page; the win is not re-decompressing
 /// a 10MB CJK font for every segment of one fragmented run edit.
 ///
-/// Each entry keeps a copy of the RAW (still compressed) stream and a hit
-/// requires exact byte equality with it — the sampled fingerprint is only a
-/// fast filter, never trusted as identity, so object-id reuse across
-/// documents or a sampled-region collision can never hand back the wrong
-/// font (memcmp of a few MB is ~1ms; re-decompress + parse is 100×.that).
-/// FAILED parses are cached too (value None): a corrupt or unsupported
-/// font must not re-decompress per segment either. Memory is bounded by
-/// the cap (4 × raw stream).
+/// Identity is exact, never sampled: an entry stores a copy of the RAW
+/// (still compressed) stream PLUS its decode configuration (/Filter,
+/// /DecodeParms — the same payload under different filters decodes to
+/// different programs), and a first hit requires byte equality with both.
+/// The sampled fingerprint is only a fast-reject filter. FAILED parses are
+/// cached too (value None): a corrupt or unsupported font must not
+/// re-decompress per segment either. Memory is bounded by the cap.
+///
+/// The full memcmp is then amortized to ONCE per font per edit operation:
+/// a verified entry records (buffer ptr, len, epoch); public edit entry
+/// points bump the epoch (`bump_ttf_cache_epoch`), and within one epoch
+/// the probing stream's buffer identity is proof enough — the document is
+/// borrowed for the whole edit, so the same allocation can't have changed
+/// bytes. A new epoch (or a different document) re-verifies with one full
+/// memcmp. This is exact: the O(1) shortcut never crosses an edit
+/// boundary, so allocator address reuse can't alias two fonts.
 const TTF_CACHE_CAP: usize = 4;
-type TtfCacheEntry = (u64, std::rc::Rc<Vec<u8>>, Option<std::rc::Rc<crate::ttf::TtfFont>>);
+struct TtfCacheEntry {
+    fingerprint: u64,
+    /// Serialized /Filter + /DecodeParms of the cached stream.
+    decode_cfg: String,
+    raw: std::rc::Rc<Vec<u8>>,
+    parsed: Option<std::rc::Rc<crate::ttf::TtfFont>>,
+    /// (buffer ptr, len, epoch) of the last full-verified probe.
+    verified: std::cell::Cell<(usize, usize, u64)>,
+}
 thread_local! {
     static TTF_CACHE: std::cell::RefCell<Vec<TtfCacheEntry>> =
         const { std::cell::RefCell::new(Vec::new()) };
+    static TTF_CACHE_EPOCH: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Start a new edit operation for the embedded-font cache: pointer-identity
+/// shortcuts from earlier operations stop being trusted and the next hit
+/// per font re-verifies with a full byte comparison. Public edit entry
+/// points call this; forgetting one costs a memcmp per segment, never
+/// correctness.
+pub fn bump_ttf_cache_epoch() {
+    TTF_CACHE_EPOCH.with(|e| e.set(e.get().wrapping_add(1)));
 }
 
 /// Cheap fingerprint of a raw stream (length + first/last 1KB hashed) used
 /// as the cache's fast-reject filter. Probing stays O(1) for multi-megabyte
-/// font programs; equality is confirmed by full memcmp on a filter hit.
+/// font programs; equality is confirmed exactly on a filter hit.
 fn stream_fingerprint(raw: &[u8]) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut h = std::collections::hash_map::DefaultHasher::new();
@@ -200,6 +226,16 @@ fn stream_fingerprint(raw: &[u8]) -> u64 {
     raw[..raw.len().min(1024)].hash(&mut h);
     raw[raw.len().saturating_sub(1024)..].hash(&mut h);
     h.finish()
+}
+
+/// The decode configuration that, together with the raw payload, fully
+/// determines `decompressed_content()`'s output.
+fn stream_decode_cfg(stream: &lopdf::Stream) -> String {
+    format!(
+        "{:?}|{:?}",
+        stream.dict.get(b"Filter").ok(),
+        stream.dict.get(b"DecodeParms").ok()
+    )
 }
 
 /// Map a BaseFont name (possibly subset-prefixed or an Arial/TimesNewRoman
@@ -279,14 +315,21 @@ impl<'a> FontInfo<'a> {
                     doc.dereference(fd.get(b"FontFile2").ok()?).ok()?.1.as_stream().ok()
                 })()?;
                 let key = stream_fingerprint(&stream.content);
+                let cfg = stream_decode_cfg(stream);
+                let ident = (stream.content.as_ptr() as usize, stream.content.len());
+                let epoch = TTF_CACHE_EPOCH.with(std::cell::Cell::get);
                 TTF_CACHE.with(|cache| {
                     let mut cache = cache.borrow_mut();
-                    if let Some(pos) = cache
-                        .iter()
-                        .position(|(k, raw, _)| *k == key && raw.as_slice() == stream.content)
-                    {
+                    let pos = cache.iter().position(|e| {
+                        e.fingerprint == key
+                            && e.decode_cfg == cfg
+                            && (e.verified.get() == (ident.0, ident.1, epoch)
+                                || e.raw.as_slice() == stream.content)
+                    });
+                    if let Some(pos) = pos {
                         let hit = cache.remove(pos);
-                        let parsed = hit.2.clone();
+                        hit.verified.set((ident.0, ident.1, epoch));
+                        let parsed = hit.parsed.clone();
                         cache.push(hit); // move to most-recent slot
                         return parsed;
                     }
@@ -299,7 +342,13 @@ impl<'a> FontInfo<'a> {
                     if cache.len() >= TTF_CACHE_CAP {
                         cache.remove(0);
                     }
-                    cache.push((key, std::rc::Rc::new(stream.content.clone()), parsed.clone()));
+                    cache.push(TtfCacheEntry {
+                        fingerprint: key,
+                        decode_cfg: cfg,
+                        raw: std::rc::Rc::new(stream.content.clone()),
+                        parsed: parsed.clone(),
+                        verified: std::cell::Cell::new((ident.0, ident.1, epoch)),
+                    });
                     parsed
                 })
             })
@@ -1090,6 +1139,27 @@ mod tests {
         assert!(f.symbolic);
         assert!(f.glyph_available(&doc, 0x80, None));
         assert!(!f.glyph_available(&doc, 0x81, None), "unmapped byte still refused");
+    }
+
+    /// The subset with ONLY a (3,0) symbol cmap whose codes live in the
+    /// 0xF100 range — one of the four high-byte ranges ISO 32000 permits
+    /// for symbol tables (crbot #7 round-3 finding 1).
+    const SUBSET_TTF_SYM_F100: &[u8] = include_bytes!("testdata/noto_sc_subset_symbol_f100.ttf");
+
+    #[test]
+    fn symbol_cmap_f100_range_is_probed() {
+        let mut doc = Document::with_version("1.7");
+        let id = font_dict_id_with(&mut doc, Some(SUBSET_TTF_SYM_F100));
+        {
+            let font_dict = doc.get_dictionary(id).unwrap();
+            let fd_id = font_dict.get(b"FontDescriptor").unwrap().as_reference().unwrap();
+            doc.get_dictionary_mut(fd_id).unwrap().set("Flags", 4);
+        }
+        let f = font_info(&doc, id);
+        // 'I' lives at 0xF149; probing only 0xF000|b and the bare byte
+        // missed it and wrongly refused the whole font.
+        assert!(f.glyph_available(&doc, b'I', None));
+        assert!(!f.glyph_available(&doc, b'd', None), "absent glyph still refused");
     }
 
     #[test]
