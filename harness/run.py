@@ -271,6 +271,15 @@ def detect_font_substitution(before_spans, after_spans, edit_bbox):
     edit. A character the original font never drew is exempt: falling back
     for a genuinely unsupported glyph is legitimate engine behavior.
 
+    Mixed-font-neighbor exemption: the edit bbox (plus its overlap pad) can
+    graze ADJACENT text that legitimately uses a different font — e.g. a
+    "label (FontA): value (FontB)" line where only the value is edited. Such
+    a neighbor char may well be in covered_chars (orig_font drew the same
+    char elsewhere) yet was never touched by the edit. So any (char,
+    base-font) pair that ALREADY appears inside the before-page bbox is
+    treated as a pre-existing neighbor and skipped; only combinations that
+    are NEW inside the bbox after the edit get the covered_chars test.
+
     Pure function over already-fetched mutool spans; returns
     ("fail_font_substituted", detail) or (None, None).
     """
@@ -287,11 +296,14 @@ def detect_font_substitution(before_spans, after_spans, edit_bbox):
     orig_font = strip_subset_prefix(orig_font_raw)
 
     covered_chars = {c for c, f, _ in before_spans if strip_subset_prefix(f) == orig_font}
+    preexisting = {(c, strip_subset_prefix(f)) for c, f in before_in_bbox}
 
     for c, f, box in after_spans:
         if not in_bbox(box) or c not in covered_chars:
             continue
         new_font = strip_subset_prefix(f)
+        if (c, new_font) in preexisting:
+            continue  # same char+font was already in the bbox before the edit
         if new_font != orig_font:
             return "fail_font_substituted", {
                 "char": c, "orig_font": orig_font, "new_font": new_font,
@@ -621,6 +633,10 @@ def run_case(pdf_path: Path, work: Path):
 
 def run_case_varlen(pdf_path: Path, work: Path, case: str, rng):
     """Variable-length probing through the model path (replace-run).
+
+    NOTE: the font-fidelity oracles (identity drift, font substitution,
+    glyph tofu) currently only cover the fixed-length path in run_case();
+    this varlen path runs judge() alone and returns a single row.
 
     An engine refusal (reflow/unencodable/encrypted) on one candidate is
     NOT a verdict for the file — keep trying later candidates and page 2, so
