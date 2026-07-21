@@ -346,6 +346,33 @@ def build_territory(before_spans, after_spans, pre_edit_bbox, new_text):
         key=lambda s: (s[2][0] + s[2][2]) / 2)
     before_band = [s for s in before_spans if in_band(s[2])]
 
+    def truncate_continuous(seq):
+        """GEOMETRIC CONTINUITY: the accepted product sequence must be
+        spatially contiguous. A left anchor alone is not enough — if the
+        first character survives at x0 while the rest of the segment
+        vanished, alignment happily splices an unrelated run further
+        right into the string, ignoring the spatial hole. Cut the
+        sequence at the first inter-span x gap exceeding
+        max(2pt, 1.5 x the band's median char width); gaps adjacent to a
+        SPACE character get twice that (word gaps are legitimately
+        wider). Everything past the cut — including any alignment that
+        pointed there — is discarded; the caller's missing/abstain logic
+        then applies to the truncated sequence."""
+        if len(seq) <= 1:
+            return seq
+        widths = [s[2][2] - s[2][0] for s in after_band
+                  if not s[0].isspace() and s[2][2] > s[2][0]]
+        med = sorted(widths)[len(widths) // 2] if widths else 0.0
+        base_thr = max(2.0, 1.5 * med)
+        out = [seq[0]]
+        for prev, cur in zip(seq, seq[1:]):
+            gap = cur[2][0] - prev[2][2]
+            thr = base_thr * 2 if (prev[0].isspace() or cur[0].isspace()) else base_thr
+            if gap > thr:
+                break
+            out.append(cur)
+        return out
+
     anchor_failed = False
     if new_text:
         band_str = "".join(c for c, _, _ in after_band)
@@ -370,12 +397,14 @@ def build_territory(before_spans, after_spans, pre_edit_bbox, new_text):
             product_seq = []
             anchor_failed = True
         else:
-            product_seq = after_band[: last + 1]
+            product_seq = truncate_continuous(after_band[: last + 1])
     else:
         product_seq = after_band
         if product_seq and abs(product_seq[0][2][0] - x0) > BAND_PAD:
             product_seq = []
             anchor_failed = True
+        else:
+            product_seq = truncate_continuous(product_seq)
 
     overlapping = []
     for c, f, box in product_seq:
@@ -496,12 +525,14 @@ def _masked_span(img, rect, punch_rects, glyph_pad=2, also_punch=None, protect_r
         px0, py0, px1, py1 = protect_rect
         paint(px0, py0, px1, py1, 255)
         # Foreign glyphs' own territory is not attributable to this glyph
-        # — subtract it back out of the protected core, with 1px of bleed
-        # slack (glyph ink antialiases to/just past its quad boundary; the
-        # full glyph_pad would re-starve narrow glyphs, which is what the
-        # protection exists to prevent).
+        # — subtract it back out of the protected core with the SAME
+        # glyph_pad as the primary masking (per review: soundness first —
+        # an asymmetric smaller pad let the second bleed pixel of a
+        # neighbor count as attributable ink). Narrow glyphs whose core
+        # is consumed by symmetric pads fall to the sufficiency floor
+        # below and abstain rather than get judged on neighbor bleed.
         for gx0, gy0, gx1, gy1 in punch_rects:
-            paint(gx0 - 1, gy0 - 1, gx1 + 1, gy1 + 1, 0)
+            paint(gx0 - glyph_pad, gy0 - glyph_pad, gx1 + glyph_pad, gy1 + glyph_pad, 0)
         cx0, cy0 = max(px0, rx0), max(py0, ry0)
         cx1, cy1 = min(px1, rx1), min(py1, ry1)
         if cx1 > cx0 and cy1 > cy0:
@@ -618,6 +649,7 @@ def detect_glyph_tofu(after_img, page_box, before_spans, after_spans, edit_bbox,
     w, h = after_img.size
     tofu = []
     unknown = []
+    unattributable = []
     judged = 0
     for ch, span in zip(repl, pairing):
         if ch.isspace():
@@ -658,32 +690,56 @@ def detect_glyph_tofu(after_img, page_box, before_spans, after_spans, edit_bbox,
         span_contrast, core_live, core_area = _masked_span(
             after_img, rect, others, protect_rect=own_rect)
         if core_area > 0 and core_live < max(4, 0.3 * core_area):
-            # The glyph's own core exists but almost none of it remains
-            # attributable to THIS glyph (a foreign quad covers it):
-            # nothing judgeable — abstain rather than let the foreign ink
-            # vouch either way. (core_area == 0 is different: a BLANK
-            # glyph gets a degenerate zero-height quad from mutool, so
-            # the padded rect judged below is exactly what catches it.)
+            # Fast abstention: the glyph's own core exists but almost
+            # none of it remains attributable to THIS glyph (a foreign
+            # quad covers it) — nothing meaningful to judge. (core_area
+            # == 0 is different: a BLANK glyph gets a degenerate
+            # zero-height quad from mutool, so the padded rect judged
+            # below is exactly what catches it.)
             unknown.append(ch)
             continue
         if span_contrast is None:
             # Fully masked by neighbors: nothing attributable — abstain.
             unknown.append(ch)
             continue
+        if span_contrast >= 96:
+            judged += 1  # inked, and the ink is attributable to this glyph
+            continue
+        # Attributable region is blank. A BLANK verdict additionally
+        # requires the RAW quad to be blank too: raw ink with no
+        # attributable survivor means the glyph's ink was swallowed by
+        # the symmetric neighbor masking (narrow glyphs) or belongs to a
+        # foreign glyph — either way it is UNATTRIBUTABLE, and
+        # unattributable is not blank: abstain instead of guessing
+        # (reviewed ruling, round 11). Soundness holds in both
+        # directions: "inked" still only ever comes from attributable
+        # ink above, and a genuinely blank glyph on any solid background
+        # has a uniform raw quad (the ring check already validated the
+        # background) and still fails here.
+        raw_lo, raw_hi = after_img.crop(rect).getextrema()
+        if raw_hi - raw_lo >= 96:
+            unattributable.append(ch)
+            continue
         judged += 1
-        if span_contrast < 96:
-            tofu.append({"char": ch, "reason": "blank_glyph"})
+        tofu.append({"char": ch, "reason": "blank_glyph"})
 
     if tofu:
         detail = {"missing": tofu}
         if unknown:
             detail["unknown_background"] = unknown
+        if unattributable:
+            detail["unattributable"] = unattributable
         return "fail_glyph_tofu", detail
-    if unknown:
+    if unknown or unattributable:
         # ANY unjudgeable char without a definite failure means this edit
         # was not fully verified: abstain (counted as skip_font_oracle),
         # never report success on partial coverage.
-        return "skip_font_oracle", {"unknown_background": unknown, "judged_ok": judged}
+        detail = {"judged_ok": judged}
+        if unknown:
+            detail["unknown_background"] = unknown
+        if unattributable:
+            detail["unattributable"] = unattributable
+        return "skip_font_oracle", detail
     return None, None
 
 
