@@ -439,17 +439,20 @@ def build_territory(before_spans, after_spans, pre_edit_bbox, new_text):
 
     def _align(text, upto=None):
         """difflib-align `text` against the band prefix of length `upto`
-        (whole band when None). Returns (first, last): first/last aligned
-        band indices (None/-1 when nothing aligns)."""
+        (whole band when None). Returns (first, last, covered): first/last
+        aligned band indices (None/-1 when nothing aligns) and the count
+        of NON-WHITESPACE chars of `text` covered by equal blocks
+        (whitespace-insensitive, consistent with judge's conventions)."""
         seg = band_str if upto is None else band_str[:upto]
         smx = difflib.SequenceMatcher(a=text, b=seg, autojunk=False)
-        f, l = None, -1
-        for tag, _a0, _a1, b0, b1 in smx.get_opcodes():
+        f, l, cov = None, -1, 0
+        for tag, a0, a1, b0, b1 in smx.get_opcodes():
             if tag == "equal":
                 if f is None:
                     f = b0
                 l = max(l, b1 - 1)
-        return f, l
+                cov += sum(1 for ch in text[a0:a1] if not ch.isspace())
+        return f, l, cov
 
     anchor_failed = False
     ambiguous_reason = None
@@ -457,7 +460,7 @@ def build_territory(before_spans, after_spans, pre_edit_bbox, new_text):
     chosen = None  # (first, last) of the boundary's prefix alignment
 
     if new_text is not None:
-        g_first, g_last = _align(new_text)
+        g_first, g_last, _g_cov = _align(new_text)
         if g_first is None:
             product_seq = []  # nothing of the edit output found: missing path
         elif abs(after_band[g_first][2][0] - x0) > BAND_PAD:
@@ -477,29 +480,49 @@ def build_territory(before_spans, after_spans, pre_edit_bbox, new_text):
                     deltas.append(abox[0] - bbox_[0])
                 if ok and max(deltas) - min(deltas) <= 0.5:
                     cands.append(i)
-            # ACCEPTANCE (round 18, completes the uniqueness rule): every
-            # candidate — including a unique one — must carry an ANCHORED,
-            # NON-EMPTY prefix alignment (at least one product span at the
-            # pre-edit x0). A candidate whose prefix is empty coincides
-            # with the anchor position itself: that geometry (replacement
-            # char left at x0 vs. vanished replacement with the suffix
-            # shifted onto x0) is inherently indistinguishable and belongs
-            # to the abstention class, never to missing and never to a
-            # decided boundary. All candidates invalid while before right
-            # neighbors exist -> right_boundary_lost.
+            # ACCEPTANCE (rounds 18+19, completing the uniqueness rule):
+            # a candidate — including a unique one — is acceptable only
+            # when its prefix alignment is
+            #   1. ANCHORED at the pre-edit x0,
+            #   2. NON-EMPTY (a candidate whose prefix is empty coincides
+            #      with the anchor itself: replacement-left-at-x0 vs.
+            #      suffix-shifted-onto-x0 is indistinguishable), and
+            #   3. COMPLETE — its equal blocks cover ALL of new_text
+            #      (whitespace-insensitive). An incomplete prefix means
+            #      either products lost characters or the boundary is
+            #      misidentified, and those two hypotheses cannot be told
+            #      apart in this geometry.
+            # The boundary mechanism therefore serves ONLY to scope the
+            # ink verification of COMPLETE product sequences; detecting
+            # missing characters when right neighbors exist is explicitly
+            # ceded to a visible abstention. (Edits without right
+            # neighbors — the majority, in synthetic and typical
+            # documents — keep full missing detection via the global
+            # path.) Rigid candidates present but none acceptable ->
+            # right_boundary_ambiguous.
             K = 8
             evaluated = sorted(cands, reverse=True)[:K]
+            total_ns = sum(1 for ch in new_text if not ch.isspace())
+            if not cands:
+                # No rigid match at all: the right-neighbor topology
+                # cannot be re-established -> lost (distinct from
+                # candidates existing but none acceptable -> ambiguous).
+                ambiguous_reason = "right_boundary_lost"
             valid = []
             for i in evaluated:
-                pf, pl = _align(new_text, upto=i)
+                pf, pl, cov = _align(new_text, upto=i)
                 if pf is None:
                     continue  # empty prefix: candidate sits on the anchor
                 if abs(after_band[pf][2][0] - x0) > BAND_PAD:
                     continue  # prefix not anchored at the target
+                if cov < total_ns:
+                    continue  # incomplete products: undecidable geometry
                 valid.append((pf, pl))
             hyps = set(valid)
-            if not valid:
-                ambiguous_reason = "right_boundary_lost"
+            if ambiguous_reason is not None:
+                pass  # lost already decided above
+            elif not valid:
+                ambiguous_reason = "right_boundary_ambiguous"
             elif len(cands) > K or len(hyps) >= 2:
                 ambiguous_reason = "right_boundary_ambiguous"
             else:
