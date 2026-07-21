@@ -263,6 +263,16 @@ def match_untouched_neighbors(before_spans, after_spans, edit_bbox, tol=2.0):
     neighbor spans are consumed by their own before twins and cannot be
     mistaken for surviving replacement text.
 
+    KNOWN LIMITATION (reviewed; accepted by user decision, PR #8 round 3):
+    if a rewritten character happens to land within the 2pt tolerance of a
+    DIFFERENT sequence position that held the same char in the same base
+    font before the edit, it can be consumed as an "untouched neighbor"
+    and skip downstream scrutiny (e.g. the tofu ink test). Constructing
+    this requires two same-char/same-font twins within 2pt of each other —
+    only possible at tiny font sizes or with overlapping renders, since
+    normal glyph advances exceed 2pt at any size; judge()'s pixel-diff
+    checks still cover the window.
+
     Returns (before_in, after_in, matched) where before_in / after_in are
     the in-bbox subsets (original span tuples, order kept) and matched maps
     after_in index -> before_in index of its consumed twin.
@@ -371,8 +381,9 @@ def _ring_contrast(img, quad_rect, glyph_rects, expand=3, glyph_pad=2):
     bleed) — adjacent glyphs' own ink is text, not background, and must not
     make a plain page look "busy". Returns the ring's hi-lo span, or None
     when no background pixels survive the masking (dense text or a quad
-    flush against the image edge) — callers treat None as "uniform enough"
-    and fall back to the plain quad test, which was the pre-ring behavior.
+    flush against the image edge) — with no observable background there is
+    no basis for trusting a quad-contrast judgement, so callers record the
+    char as "unknown" (abstention), same as a busy ring.
     """
     w, h = img.size
     qx0, qy0, qx1, qy1 = quad_rect
@@ -430,15 +441,24 @@ def detect_glyph_tofu(after_img, page_box, before_spans, after_spans, edit_bbox,
     near-flat. Background-validity heuristic: the quad's surrounding ring
     (3px frame outside the quad, with every OTHER glyph quad masked out —
     neighboring text ink is not "background") is checked first. If the
-    RING's own extrema span >= 96 the local background is itself busy
-    (photo, gradient, dense linework) and no contrast judgement inside the
-    quad can be trusted: that char is recorded as "unknown" rather than
-    passed or failed. If EVERY ink-tested character comes back unknown the
-    whole check abstains ("skip_font_oracle" — counted, not failed).
-    Heuristic boundary, accepted: a background busy at exactly the glyph's
-    scale but flat in the 3px ring can still fool the quad test, and
-    unknown chars on busy backgrounds are simply not judged — tofu there
-    goes undetected by THIS check (judge's pixel-diff checks still apply).
+    RING's extrema span >= 96 the local background is itself busy (photo,
+    gradient, dense linework), and if NO ring pixels survive the masking
+    (dense text, image edge) there is no observable background at all: in
+    either case the quad judgement can't be trusted and the char is
+    recorded as "unknown" rather than passed or failed. Any unknown char
+    without a definite tofu failure makes the whole check abstain
+    ("skip_font_oracle" — counted, not failed): success is only reported
+    when every ink-tested character was actually judged. Heuristic
+    boundary, accepted: a background busy at exactly the glyph's scale but
+    flat in the 3px ring can still fool the quad test, and unknown chars
+    are simply not judged — tofu there goes undetected by THIS check
+    (judge's pixel-diff checks still apply).
+
+    Neighbor-matching inherits match_untouched_neighbors()'s known 2pt-twin
+    limitation (see its docstring): a rewritten char within 2pt of a
+    same-char/same-font twin's old position can be misclassified as an
+    untouched neighbor and skip the ink test — accepted risk, judge()'s
+    pixel checks still apply.
 
     Pure function except for PIL crops on the caller-supplied after_img;
     returns ("fail_glyph_tofu", detail), ("skip_font_oracle", detail), or
@@ -498,8 +518,11 @@ def detect_glyph_tofu(after_img, page_box, before_spans, after_spans, edit_bbox,
             tofu.append({"char": ch, "reason": "offpage_quad"})
             continue
         ring = _ring_contrast(after_img, (px0, py0, px1, py1), glyph_rects)
-        if ring is not None and ring >= 96:
-            unknown.append(ch)  # busy background: quad contrast unreliable
+        if ring is None or ring >= 96:
+            # Busy background, or no background pixels survived masking
+            # (dense text / image edge): quad contrast unreliable either
+            # way — abstain on this char rather than guess.
+            unknown.append(ch)
             continue
         judged += 1
         lo, hi = after_img.crop((px0, py0, px1, py1)).getextrema()
@@ -511,9 +534,11 @@ def detect_glyph_tofu(after_img, page_box, before_spans, after_spans, edit_bbox,
         if unknown:
             detail["unknown_background"] = unknown
         return "fail_glyph_tofu", detail
-    if unknown and judged == 0:
-        # Every ink-tested char sat on a busy background: abstain.
-        return "skip_font_oracle", {"unknown_background": unknown}
+    if unknown:
+        # ANY unjudgeable char without a definite failure means this edit
+        # was not fully verified: abstain (counted as skip_font_oracle),
+        # never report success on partial coverage.
+        return "skip_font_oracle", {"unknown_background": unknown, "judged_ok": judged}
     return None, None
 
 
