@@ -99,7 +99,15 @@ VARLEN = False  # set by --varlen: probe variable-length replacements too
 
 def pick_edits(runs, rng, n=3):
     """Yield up to n distinct (run, find, with_) candidates, so a font that
-    can't encode one replacement doesn't end the whole case."""
+    can't encode one replacement doesn't end the whole case.
+
+    Only (run, find) pairs where `run` is the page's FIRST run containing
+    `find` are yielded (engine_edits_this_run): the engine edits that
+    first occurrence, so picking any other run would make the judge
+    anchor its oracles on a segment the engine never touched. Words of a
+    run that also appear in an earlier run are simply not usable for that
+    run — try the run's other words before giving up on it.
+    """
     candidates = [
         r for r in runs
         if not r["cid"] and r.get("visible", True)
@@ -113,7 +121,10 @@ def pick_edits(runs, rng, n=3):
         words = [w for w in run["text"].split() if len(w) >= 4 and w.isalpha() and w.isascii()]
         if not words:
             continue
-        find = rng.choice(words)
+        rng.shuffle(words)
+        find = next((w for w in words if engine_edits_this_run(runs, run, w)), None)
+        if find is None:
+            continue
         # same-length replacement: shift letters, preserve case
         repl = "".join(
             chr((ord(ch.lower()) - 97 + 7) % 26 + 97).upper() if ch.isupper()
@@ -123,6 +134,18 @@ def pick_edits(runs, rng, n=3):
         if repl != find:
             picked += 1
             yield run, find, repl
+
+
+def engine_edits_this_run(runs, run, find):
+    """True iff `run` is the FIRST run (in extract order) on its page whose
+    text contains `find` — which is the run the engine's `replace` command
+    will actually edit. The font-fidelity oracles anchor territory and
+    target font on the picked run's pre-edit bbox, so judging any other
+    occurrence would anchor them on a segment the engine never touched.
+    """
+    first = next(
+        (r for r in runs if r["page"] == run["page"] and find in r["text"]), None)
+    return first is run
 
 
 def pick_model_edits(engine_model_json, rng, n=3):
@@ -234,133 +257,11 @@ def mutool_char_spans(pdf_path, page_no, page_box, timeout=20):
     return spans
 
 
-def _bbox_overlap_pred(bbox, pad=2.0):
-    """Closure testing whether a char bbox (PDF user-space) overlaps an
-    edit's reported bbox, with a small point-space pad for float slop."""
-    bx0, by0, bx1, by1 = bbox
-
-    def pred(cbox):
-        cx0, cy0, cx1, cy1 = cbox
-        return not (cx1 < bx0 - pad or cx0 > bx1 + pad or cy1 < by0 - pad or cy0 > by1 + pad)
-
-    return pred
-
-
-def match_untouched_neighbors(before_spans, after_spans, edit_bbox, tol=2.0, pixel_ctx=None):
-    """ONE-TO-ONE greedy matching of in-bbox after spans to in-bbox before
-    spans: a pair qualifies when char, base font, and all four bbox coords
-    (each within `tol` pt) agree; closest pairs (by max coord delta) are
-    consumed first and every before span is consumed AT MOST ONCE.
-
-    This is the shared foundation of checks 2 and 3. Matched after spans
-    are "untouched neighbors" — text the edit bbox merely grazes, which
-    rendered identically before and after — and are excluded from both
-    checks. Unmatched after spans are edit products. One-to-one consumption
-    is load-bearing twice over: (a) a single before neighbor can no longer
-    exempt SEVERAL after spans, so a genuine replacement char landing
-    within tol of a same-char/same-font neighbor still shows up as an edit
-    product; (b) when the engine drops the whole edited segment, leftover
-    neighbor spans are consumed by their own before twins and cannot be
-    mistaken for surviving replacement text.
-
-    PIXEL VERIFICATION (pixel_ctx = (before_img, after_img, page_box)):
-    distance alone cannot be trusted — narrow glyphs advance less than tol
-    at ordinary sizes (Helvetica 'i' is 222/1000 em = 1.998pt at 9pt), so
-    a rewritten char CAN land within tol of a different same-char/same-font
-    twin's old position. "Untouched" is therefore verified against its own
-    definition: the UNION rectangle of the before twin's quad and the after
-    span's quad (expanded 2px for antialias bleed) must render RAW-identical
-    between the before and after pages (ImageChops.difference(...).getbbox()
-    is None — same no-threshold standard as the identity check). The union
-    matters: comparing only the after quad would miss a shifted glyph whose
-    OLD ink lies entirely outside the new quad (a ~2pt shift of a narrow
-    glyph separates the two quads completely), letting a blank new glyph
-    masquerade as its inked twin. Any pixel difference cancels the match
-    and the span is treated as an edit product. Mis-cancelling is cheap: a
-    genuinely untouched char with ink still passes the downstream ink test
-    as an edit product, and blank (whitespace) chars are skipped by that
-    test anyway; whereas the dangerous case — a newly written BLANK glyph
-    near an inked twin's old position — always differs somewhere in the
-    union region and is forced through the ink test, where it fails. When
-    pixel_ctx is None (span-only fixtures) matching is distance-only.
-
-    Returns (before_in, after_in, matched, pixel_vetoed) where before_in /
-    after_in are the in-bbox subsets (original span tuples, order kept),
-    matched maps after_in index -> before_in index of its consumed twin,
-    and pixel_vetoed is the set of after_in indices that ACTIVELY FAILED
-    pixel verification for a live candidate (its turn came in the greedy
-    loop with the twin still unconsumed, and the union-rect renders
-    differed). Losing a twin to another span is deliberately NOT a veto:
-    e.g. a legitimate borrowed-font edit product (engine writes FontB for
-    a glyph the target font lacks) can land within tol of an untouched
-    FontB neighbor that consumed its own twin — that new span was never
-    pixel-refuted and must be treated as a plain edit product downstream
-    (aligned + ink-tested), not classified ambiguous (see
-    detect_glyph_tofu).
-    """
-    in_bbox = _bbox_overlap_pred(edit_bbox)
-    before_in = [(c, f, box) for c, f, box in before_spans if in_bbox(box)]
-    after_in = [(c, f, box) for c, f, box in after_spans if in_bbox(box)]
-
-    candidates = []
-    for i, (ac, af, abox) in enumerate(after_in):
-        a_base = strip_subset_prefix(af)
-        for j, (bc, bf, bbox_) in enumerate(before_in):
-            if ac != bc or a_base != strip_subset_prefix(bf):
-                continue
-            delta = max(abs(a - b) for a, b in zip(abox, bbox_))
-            if delta <= tol:
-                candidates.append((delta, i, j))
-    candidates.sort(key=lambda t: t[0])  # distance-first greedy: order-stable
-
-    pixel_ok_cache = {}
-
-    def pixel_identical(i, j):
-        """Whether the UNION of before_in[j]'s and after_in[i]'s quads
-        rendered identically across the two pages. The union (not just the
-        after quad) catches a shifted glyph whose old ink lies entirely
-        outside the new quad. Cached per (i, j) pair — the region depends
-        on both quads."""
-        if pixel_ctx is None:
-            return True
-        if (i, j) in pixel_ok_cache:
-            return pixel_ok_cache[(i, j)]
-        before_img, after_img, page_box = pixel_ctx
-        w, h = after_img.size
-        ax0, ay0, ax1, ay1 = after_in[i][2]
-        bx0, by0, bx1, by1 = before_in[j][2]
-        union = (min(ax0, bx0), min(ay0, by0), max(ax1, bx1), max(ay1, by1))
-        px0, py0, px1, py1 = bbox_to_pixels(union, page_box, pad=2)  # 2px antialias slack
-        px0, py0 = max(px0, 0), max(py0, 0)
-        px1, py1 = min(px1, w), min(py1, h)
-        if px1 <= px0 or py1 <= py0:
-            ok = False  # degenerate/offpage region: nothing verifiable
-        else:
-            rect = (px0, py0, px1, py1)
-            ok = ImageChops.difference(
-                before_img.crop(rect), after_img.crop(rect)).getbbox() is None
-        pixel_ok_cache[(i, j)] = ok
-        return ok
-
-    matched, used_before = {}, set()
-    pixel_vetoed = set()
-    for _, i, j in candidates:
-        if i in matched or j in used_before:
-            continue
-        if not pixel_identical(i, j):
-            pixel_vetoed.add(i)  # actively refuted by the renders
-            continue
-        matched[i] = j
-        used_before.add(j)
-    pixel_vetoed -= set(matched)  # a later candidate may still have matched it
-    return before_in, after_in, matched, pixel_vetoed
-
-
 def mutool_probe(case, pdf_path, out_pdf, run, work):
     """Shared I/O for checks 2 and 3 (font substitution / glyph tofu):
-    before AND after page renders (the before bitmap feeds the pixel
-    verification of neighbor matches, see match_untouched_neighbors) plus
-    two mutool stext calls, so the two checks don't each re-invoke mutool.
+    before AND after page renders (the before bitmap feeds the
+    unchanged-char ink-test exemption in detect_glyph_tofu) plus two
+    mutool stext calls, so the two checks don't each re-invoke mutool.
 
     Returns (page_box, before_spans, after_spans, before_img, after_img),
     or None on any failure (render crash, size mismatch, mutool
@@ -384,67 +285,124 @@ def mutool_probe(case, pdf_path, out_pdf, run, work):
     return page_box, before_spans, after_spans, before_img, after_img
 
 
-def detect_font_substitution(before_spans, after_spans, edit_bbox, pixel_ctx=None,
-                             pre_edit_bbox=None):
+BAND_PAD = 2.0  # pt of slack for the territory line band
+
+
+def build_territory(before_spans, after_spans, pre_edit_bbox, new_text):
+    """Territory-presumption product identification, shared by checks 2/3.
+
+    All anchoring information is the judge's own (the run bbox recorded
+    when the judge picked the edit word from engine extract, cross-checked
+    against mutool's before-page text by the caller) — nothing here trusts
+    the engine's post-edit report coordinates.
+
+    - BEFORE CORE: before spans whose center lies inside pre_edit_bbox.
+      This is the confirmed edit target; its majority font is the target
+      font (no padded-neighbor ballot problem: grazed/adjacent text has
+      its center outside the pre-edit bbox).
+    - PRODUCT TERRITORY: the target line band (pre_edit y-range +-2pt)
+      intersected with x >= pre_edit x0 - 2pt, taken as the x-ordered
+      span sequence starting at the span closest to the target's left
+      edge. Its LENGTH is bounded by difflib-aligning the band's text
+      against new_text (the rewritten segment's text): spans past the
+      last aligned position are unrelated same-line text to the right and
+      are excluded. Everything inside the bounded sequence is presumed an
+      edit product; everything outside is unrelated text that neither
+      gets ink-tested nor may account for repl characters.
+    - OVERLAPPING TEXT: a non-target-font span inside the product
+      sequence that ALREADY EXISTED before the edit — same char + base
+      font at essentially the SAME position (0.5pt tolerance) on the
+      before-page band — is pre-existing foreign text overprinted/
+      interleaved into the target territory. No clean judgement is
+      possible there: callers abstain (skip_font_oracle,
+      "overlapping_text" in the detail) rather than risk either verdict.
+      The tolerance is deliberately TIGHT, not the 2pt neighbor-matching
+      kind: untouched text re-renders at identical coordinates (same PDF
+      operations), while a borrowed-font PRODUCT near a same-font twin
+      sits at a genuinely different position — a loose tolerance would
+      misclassify it as pre-existing and abstain away a valid edit. A
+      non-target-font span without such a same-position twin is a
+      legitimate borrowed-font product (engine used another document
+      font for a glyph the target font lacks) and stays in the sequence.
+
+    Returns (orig_font_raw, before_core, product_seq, overlapping) where
+    orig_font_raw is None when the before core is empty, product_seq is
+    the bounded x-ordered after-span list, and overlapping is a list of
+    {char, font} dicts (non-empty => abstain).
+    """
+    x0, y0, x1, y1 = pre_edit_bbox
+    before_core = [s for s in before_spans if _center_in(s[2], pre_edit_bbox)]
+    orig_font_raw = _majority_font(before_core) if before_core else None
+    orig_base = strip_subset_prefix(orig_font_raw) if orig_font_raw else None
+
+    def in_band(box):
+        cx, cy = (box[0] + box[2]) / 2, (box[1] + box[3]) / 2
+        return (y0 - BAND_PAD) <= cy <= (y1 + BAND_PAD) and cx >= x0 - BAND_PAD
+
+    after_band = sorted(
+        (s for s in after_spans if in_band(s[2])),
+        key=lambda s: (s[2][0] + s[2][2]) / 2)
+    before_band = [s for s in before_spans if in_band(s[2])]
+
+    if new_text:
+        band_str = "".join(c for c, _, _ in after_band)
+        sm = difflib.SequenceMatcher(a=new_text, b=band_str, autojunk=False)
+        last = -1
+        for tag, _a0, _a1, b0, b1 in sm.get_opcodes():
+            if tag == "equal":
+                last = max(last, b1 - 1)
+        product_seq = after_band[: last + 1] if last >= 0 else []
+    else:
+        product_seq = after_band
+
+    overlapping = []
+    for c, f, box in product_seq:
+        base = strip_subset_prefix(f)
+        if orig_base is None or base == orig_base:
+            continue
+        preexisting = any(
+            c == bc and base == strip_subset_prefix(bf)
+            and max(abs(p - q) for p, q in zip(box, bbox_)) <= 0.5
+            for bc, bf, bbox_ in before_band)
+        if preexisting:
+            overlapping.append({"char": c, "font": f})
+    return orig_font_raw, before_core, product_seq, overlapping
+
+
+def detect_font_substitution(before_spans, after_spans, edit_bbox,
+                             pre_edit_bbox=None, new_text=None):
     """Check 2: characters the ORIGINAL font already covered (drawn
     somewhere on the before-page in that font — a conservative black-box
     proof the font has the glyph) must keep the same base font after the
     edit. A character the original font never drew is exempt: falling back
-    for a genuinely unsupported glyph is legitimate engine behavior.
+    (or borrowing another document font) for a genuinely unsupported glyph
+    is legitimate engine behavior.
 
-    Untouched neighbors — after spans one-to-one matched to an identical
-    before span by match_untouched_neighbors() — are excluded first: the
-    edit bbox (plus its overlap pad) routinely grazes adjacent text in a
-    different font ("label (FontA): value (FontB)" lines), and those chars
-    may well be in covered_chars without the edit ever touching them. Only
-    UNMATCHED after spans (edit products) are tested, and because matching
-    consumes each before span once, a replacement char painted in a
-    neighbor's font is still flagged even if it lands within tolerance of
-    a real neighbor (the neighbor's before twin is already consumed by the
-    neighbor itself).
-
-    THIS check matches DISTANCE-ONLY, deliberately ignoring pixel_ctx (the
-    tofu check uses the pixel-verified set; the two matching sets are
-    separate). A distance match already requires the before twin to share
-    the after span's base font, so the span's font provably did not change
-    — which is the only thing this check judges. Pixel differences inside
-    a neighbor's quad (italic overhang or antialias bleed from adjacent
-    NEW glyphs) are therefore not treated as substitution evidence; under
-    pixel-verified matching such a neighbor would be demoted to an edit
-    product and, when its char happens to be in covered_chars, falsely
-    flagged. Residual window of the split (correct width math this time):
-    a replacement char that the engine mis-paints in a NEIGHBOR's font AND
-    that lands within 2pt of a same-char span already in that font is
-    distance-matched and escapes this check — reachable, since narrow
-    glyph advances drop under 2pt at small sizes (Helvetica 'i' = 1.998pt
-    at 9pt). Accepted as defense-in-depth: engine-side glyph validation
-    (PR #7) refuses to write wrong glyphs, and the tofu check's
-    pixel-verified path still scrutinizes that span.
+    The checked set is the territory product sequence from
+    build_territory(): adjacent text left of the target or on other lines
+    never enters it, and same-line text right of the rewritten segment is
+    cut off by the new_text length bounding — so grazed neighbors in other
+    fonts can no longer be mistaken for substituted output. Pre-existing
+    foreign text INSIDE the territory (overlapping/overprint) makes the
+    check abstain instead of guessing.
 
     Pure function over already-fetched mutool spans; returns
-    ("fail_font_substituted", detail) or (None, None). pixel_ctx is
-    accepted for signature symmetry but intentionally unused.
+    ("fail_font_substituted", detail), ("skip_font_oracle", detail), or
+    (None, None).
     """
-    del pixel_ctx  # distance-only by design; see docstring
-    before_in, after_in, matched, _pixel_vetoed = match_untouched_neighbors(
-        before_spans, after_spans, edit_bbox)
-    if not before_in:
+    anchor = pre_edit_bbox if pre_edit_bbox is not None else edit_bbox
+    orig_font_raw, _before_core, product_seq, overlapping = build_territory(
+        before_spans, after_spans, anchor, new_text)
+    if orig_font_raw is None:
         return None, None
-
-    # Anchor the target-font vote on the PRE-EDIT run bbox (ground truth
-    # from engine extract) when available; the post-edit report bbox can
-    # extend rightward for wider replacements and swallow neighbor votes.
-    orig_font_raw = _target_font(
-        before_in, pre_edit_bbox if pre_edit_bbox is not None else edit_bbox)
+    if overlapping:
+        return "skip_font_oracle", {"overlapping_text": overlapping}
     orig_font = strip_subset_prefix(orig_font_raw)
-
     covered_chars = {c for c, f, _ in before_spans if strip_subset_prefix(f) == orig_font}
 
-    for i, (c, f, box) in enumerate(after_in):
-        if i in matched or c not in covered_chars:
-            continue
+    for c, f, _box in product_seq:
         new_font = strip_subset_prefix(f)
-        if new_font != orig_font:
+        if new_font != orig_font and c in covered_chars:
             return "fail_font_substituted", {
                 "char": c, "orig_font": orig_font, "new_font": new_font,
                 "orig_font_raw": orig_font_raw, "new_font_raw": f,
@@ -468,57 +426,41 @@ def _center_in(box, bbox):
     return bx0 <= cx <= bx1 and by0 <= cy <= by1
 
 
-def _target_font(before_in, anchor_bbox):
-    """Raw font name of the EDIT TARGET, inferred from the spans anchored
-    in anchor_bbox: only before spans whose CENTER lies inside it vote.
-
-    anchor_bbox should be the PRE-EDIT target bbox (engine extract's
-    run["bbox"] — ground truth for where the edited segment sat before
-    the edit), not the post-edit report bbox: the report bbox can extend
-    RIGHTWARD when the replacement is wider than the find text, swallowing
-    genuine neighbor centers, and before_in is additionally collected with
-    a 2pt overlap pad — either way a long adjacent run in another font can
-    outnumber a short edit target and flip a naive majority vote,
-    inverting the downstream classification (blank target glyphs dropped
-    as ambiguous, inked neighbors admitted to the alignment). Neighbors'
-    centers fall outside the pre-edit bbox, so the anchored vote is
-    immune. Falls back to the padded-majority vote if no span centers
-    inside (degenerate bboxes), which simply restores the previous
-    behavior there.
-    """
-    core = [s for s in before_in if _center_in(s[2], anchor_bbox)]
-    return _majority_font(core if core else before_in)
-
-
-def _ring_contrast(img, quad_rect, glyph_rects, expand=3, glyph_pad=2):
-    """Luminance extrema span of the BACKGROUND RING around a glyph quad:
-    expand quad_rect by `expand` px, subtract the quad itself, and mask out
-    every OTHER char quad on the page (padded by glyph_pad for antialias
-    bleed) — adjacent glyphs' own ink is text, not background, and must not
-    make a plain page look "busy". Returns the ring's hi-lo span, or None
-    when no background pixels survive the masking (dense text or a quad
-    flush against the image edge) — with no observable background there is
-    no basis for trusting a quad-contrast judgement, so callers record the
-    char as "unknown" (abstention), same as a busy ring.
-    """
+def _masked_span(img, rect, punch_rects, glyph_pad=2, also_punch=None, protect_rect=None):
+    """Luminance extrema span of img inside `rect` with every rect in
+    punch_rects (padded glyph_pad px for antialias bleed) masked out;
+    also_punch (unpadded) is removed too when given. protect_rect
+    (unpadded) is re-included AFTER all punching — the glyph under test's
+    own core territory, which adjacent glyphs' padded punches must not
+    swallow (a narrow glyph a few px wide would otherwise lose its entire
+    quad to its neighbors' pads and read as blank). Returns hi-lo, or
+    None when no pixels survive the masking."""
     w, h = img.size
-    qx0, qy0, qx1, qy1 = quad_rect
-    ex0, ey0 = max(qx0 - expand, 0), max(qy0 - expand, 0)
-    ex1, ey1 = min(qx1 + expand, w), min(qy1 + expand, h)
-    if ex1 <= ex0 or ey1 <= ey0:
+    rx0, ry0, rx1, ry1 = rect
+    rx0, ry0 = max(rx0, 0), max(ry0, 0)
+    rx1, ry1 = min(rx1, w), min(ry1, h)
+    if rx1 <= rx0 or ry1 <= ry0:
         return None
-    crop = img.crop((ex0, ey0, ex1, ey1))
+    crop = img.crop((rx0, ry0, rx1, ry1))
     mask = Image.new("L", crop.size, 255)
     draw = ImageDraw.Draw(mask)
-    # Punch out the quad under test (its own ink is what we're judging).
-    draw.rectangle((qx0 - ex0, qy0 - ey0, qx1 - ex0 - 1, qy1 - ey0 - 1), fill=0)
-    # Punch out every other glyph's quad that intersects the ring.
-    for gx0, gy0, gx1, gy1 in glyph_rects:
-        gx0, gy0 = gx0 - glyph_pad, gy0 - glyph_pad
-        gx1, gy1 = gx1 + glyph_pad, gy1 + glyph_pad
-        if gx1 <= ex0 or gx0 >= ex1 or gy1 <= ey0 or gy0 >= ey1:
-            continue
-        draw.rectangle((gx0 - ex0, gy0 - ey0, gx1 - ex0 - 1, gy1 - ey0 - 1), fill=0)
+
+    def paint(x0, y0, x1, y1, fill):
+        # Clamp to the crop and skip empty/degenerate rects (zero-height
+        # whitespace quads produce them) — ImageDraw raises otherwise.
+        lx0, ly0 = max(x0 - rx0, 0), max(y0 - ry0, 0)
+        lx1, ly1 = min(x1 - rx0, rx1 - rx0) - 1, min(y1 - ry0, ry1 - ry0) - 1
+        if lx1 >= lx0 and ly1 >= ly0:
+            draw.rectangle((lx0, ly0, lx1, ly1), fill=fill)
+
+    if also_punch is not None:
+        ax0, ay0, ax1, ay1 = also_punch
+        paint(ax0, ay0, ax1, ay1, 0)
+    for gx0, gy0, gx1, gy1 in punch_rects:
+        paint(gx0 - glyph_pad, gy0 - glyph_pad, gx1 + glyph_pad, gy1 + glyph_pad, 0)
+    if protect_rect is not None:
+        px0, py0, px1, py1 = protect_rect
+        paint(px0, py0, px1, py1, 255)
     hist = crop.histogram(mask)
     live = [v for v, n in enumerate(hist[:256]) if n]
     if not live:
@@ -526,145 +468,100 @@ def _ring_contrast(img, quad_rect, glyph_rects, expand=3, glyph_pad=2):
     return live[-1] - live[0]
 
 
+def _ring_contrast(img, quad_rect, glyph_rects, expand=3):
+    """Luminance extrema span of the BACKGROUND RING around a glyph quad:
+    expand quad_rect by `expand` px, subtract the quad itself, and mask out
+    every OTHER char quad on the page (padded for antialias bleed) —
+    adjacent glyphs' own ink is text, not background, and must not make a
+    plain page look "busy". Returns the ring's hi-lo span, or None when no
+    background pixels survive the masking (dense text or a quad flush
+    against the image edge) — with no observable background there is no
+    basis for trusting a quad-contrast judgement, so callers record the
+    char as "unknown" (abstention), same as a busy ring.
+    """
+    qx0, qy0, qx1, qy1 = quad_rect
+    ring_rect = (qx0 - expand, qy0 - expand, qx1 + expand, qy1 + expand)
+    return _masked_span(img, ring_rect, glyph_rects, also_punch=quad_rect)
+
+
 def detect_glyph_tofu(after_img, page_box, before_spans, after_spans, edit_bbox, repl,
-                      before_img=None, pre_edit_bbox=None):
+                      before_img=None, pre_edit_bbox=None, new_text=None):
     """Check 3: a replacement character can be encoded into a subset font
     that keeps the SAME font name (so check 2 sees nothing wrong) but lacks
     that glyph's outline — the text layer says the character is there
     (ToUnicode round-trips) yet nothing gets painted ("tofu"). Also covers
     the renderer dropping characters from stext entirely — up to and
-    including the WHOLE edited segment vanishing: untouched neighbors are
-    removed first via match_untouched_neighbors(), so leftover neighbor
-    spans that happen to spell out repl's characters can never stand in
-    for the missing edit products (their before twins consume them). If
-    the edit products are empty while the before-page bbox had spans and
-    repl has visible characters, every such character is reported
-    missing_from_stext.
+    including the WHOLE edited segment vanishing: if the territory product
+    sequence is empty while the before core had text and repl has visible
+    characters, every such character is reported missing_from_stext.
 
-    THREE-WAY SPAN CLASSIFICATION (matching alone is not enough):
-    1. VERIFIED NEIGHBOR — distance-matched AND pixel-identical (union
-       rect). Exempt. Those whose before twin is in the edit target's own
-       (majority) font join the alignment string as unchanged in-place
-       characters (accepted without ink test: their render is
-       byte-identical to before); other-font verified neighbors are
-       unrelated grazed text and are excluded.
-    2. EDIT PRODUCT — no distance candidate at all, OR distance-matched
-       but pixel-vetoed with a TARGET-font twin (a same-font twin nearby
-       is exactly the round-4/5 capture scenario: it must face the ink
-       test). Joins the alignment string and is ink-tested.
-    3. AMBIGUOUS — ACTIVELY pixel-vetoed (its candidate's turn came with
-       the twin unconsumed and the union-rect renders differed), in a
-       non-target font, AND with its center OUTSIDE the pre-edit target
-       bbox. Since distance candidates require the same base font, a
-       non-target-font span with a veto is not part of the edited run,
-       and its pixel difference is most likely adjacent edit ink
-       swallowed by the union pad (italic overhang / antialias bleed). It
-       is neither a trusted neighbor nor an edit product: excluded from
-       the alignment string entirely — not ink-tested, and NOT allowed to
-       account for repl characters. A blank replacement glyph therefore
-       stays the only alignment candidate for its repl char and fails the
-       ink test, instead of the inked bled-into neighbor absorbing the
-       alignment. Merely LOSING a twin to one-to-one consumption is not a
-       veto: such spans (e.g. a legitimate borrowed-font glyph written
-       within tol of an untouched same-font neighbor) stay class 2.
+    PRODUCT IDENTIFICATION is territory presumption (build_territory):
+    everything in the bounded target-line sequence is an edit product and
+    is aligned + ink-tested; everything outside is unrelated text that
+    neither gets tested nor may account for repl characters; pre-existing
+    foreign text INSIDE the territory makes the check abstain
+    (overlapping_text). No pixel veto or neighbor matching is involved in
+    identification anymore.
 
-    PRE-EDIT BBOX ANCHOR (ground truth from engine extract's run bbox):
-    any after span whose CENTER lies inside the pre-edit target bbox is
-    UNCONDITIONALLY an edit product — vetoed or not, anything inside the
-    target's own territory must face the ink test. This closes the
-    collateral-veto hole: a borrowed-font product whose ink bleeds into
-    its neighbor's union pad vetoes BOTH the neighbor's match and its own
-    candidate, but sitting inside the target bbox it can no longer be
-    dropped as ambiguous. Residual, documented and accepted: a vetoed
-    borrowed-font product placed in the RIGHT-EXTENSION zone of a wider
-    replacement (outside the pre-edit bbox, inside the report bbox) can
-    still classify ambiguous — full pixel attribution would be needed to
-    close that; judge()'s pixel checks and engine-side glyph validation
-    (PR #7) remain the backstop there.
-       Residual window unchanged (documented in
-       detect_font_substitution): a replacement char mis-painted in a
-       neighbor's font within 2pt of a same-char span of that font is
-       classified ambiguous and escapes the ink test — engine-side glyph
-       validation (PR #7) covers that path.
+    UNCHANGED-CHAR EXEMPTION (uses before_img when supplied): a product
+    span whose quad renders RAW-identical across the before/after pages
+    AND visibly contains ink is an unchanged in-place character (e.g. the
+    untouched prefix of a same-position rewrite) — accepted as present
+    without the ring/ink test, which spares it from busy-background
+    abstention. Identity alone is NOT enough: a blank quad can be blank
+    in both renders (a shifted narrow glyph leaves its old ink outside
+    the new quad), so a blank-but-identical quad still faces the ink
+    test and fails there.
 
-    Ink test per aligned edit-product character: the quad's luminance
-    extrema must span >= 96 (same confidence threshold as judge). A
-    painted glyph always produces foreground/background contrast plus
-    antialiasing transitions; a blank quad on a uniform background is
-    near-flat. Background-validity heuristic: the quad's surrounding ring
-    (3px frame outside the quad, with every OTHER glyph quad masked out —
-    neighboring text ink is not "background") is checked first. If the
-    RING's extrema span >= 96 the local background is itself busy (photo,
-    gradient, dense linework), and if NO ring pixels survive the masking
-    (dense text, image edge) there is no observable background at all: in
-    either case the quad judgement can't be trusted and the char is
-    recorded as "unknown" rather than passed or failed. Any unknown char
-    without a definite tofu failure makes the whole check abstain
+    Ink test per aligned product character: the quad's luminance extrema
+    must span >= 96 (same confidence threshold as judge). A painted glyph
+    always produces foreground/background contrast plus antialiasing
+    transitions; a blank quad on a uniform background is near-flat.
+    Background-validity heuristic: the quad's surrounding ring (3px frame
+    outside the quad, with every OTHER glyph quad masked out — neighboring
+    text ink is not "background") is checked first. If the RING's extrema
+    span >= 96 the local background is itself busy (photo, gradient,
+    dense linework), and if NO ring pixels survive the masking (dense
+    text, image edge) there is no observable background at all: in either
+    case the quad judgement can't be trusted and the char is recorded as
+    "unknown" rather than passed or failed. Any unknown char without a
+    definite tofu failure makes the whole check abstain
     ("skip_font_oracle" — counted, not failed): success is only reported
     when every ink-tested character was actually judged. Heuristic
-    boundary, accepted: a background busy at exactly the glyph's scale but
-    flat in the 3px ring can still fool the quad test, and unknown chars
-    are simply not judged — tofu there goes undetected by THIS check
-    (judge's pixel-diff checks still apply).
-
-    Neighbor matches are pixel-verified when before_img is supplied (see
-    match_untouched_neighbors): a span only counts as an untouched
-    neighbor if its quad rendered raw-identical before and after, so a
-    newly written blank glyph landing on an inked twin's old position
-    (possible within the 2pt tolerance: narrow glyphs advance < 2pt at
-    ordinary sizes) is forced through the ink test instead of being
-    skipped.
+    boundary, accepted: a background busy at exactly the glyph's scale
+    but flat in the 3px ring can still fool the quad test, and unknown
+    chars are simply not judged — tofu there goes undetected by THIS
+    check (judge's pixel-diff checks still apply).
 
     Pure function except for PIL crops on the caller-supplied images;
     returns ("fail_glyph_tofu", detail), ("skip_font_oracle", detail), or
     (None, None).
     """
-    pixel_ctx = (before_img, after_img, page_box) if before_img is not None else None
-    before_in, after_in, matched, pixel_vetoed = match_untouched_neighbors(
-        before_spans, after_spans, edit_bbox, pixel_ctx=pixel_ctx)
+    anchor = pre_edit_bbox if pre_edit_bbox is not None else edit_bbox
+    if new_text is None:
+        new_text = repl
+    orig_font_raw, before_core, product_seq, overlapping = build_territory(
+        before_spans, after_spans, anchor, new_text)
     visible_repl = [ch for ch in repl if not ch.isspace()]
 
-    if all(i in matched for i in range(len(after_in))):
-        # No edit products at all in the after bbox — everything present is
-        # a pre-existing twin. If the target existed and repl needs visible
-        # glyphs, the edit output vanished wholesale.
-        if before_in and visible_repl:
+    if overlapping:
+        return "skip_font_oracle", {"overlapping_text": overlapping}
+    if not product_seq:
+        # Nothing left in the target territory. If the target existed and
+        # repl needs visible glyphs, the edit output vanished wholesale.
+        if before_core and visible_repl:
             return "fail_glyph_tofu", {
                 "missing": [{"char": ch, "reason": "missing_from_stext"} for ch in visible_repl],
             }
         return None, None
 
-    anchor_bbox = pre_edit_bbox if pre_edit_bbox is not None else edit_bbox
-    orig_font = strip_subset_prefix(_target_font(before_in, anchor_bbox)) if before_in else None
-
-    # Three-way classification -> (span, is_product) alignment sequence in
-    # reading order; ambiguous spans are dropped entirely (see docstring).
-    # Ambiguity requires an ACTIVE pixel veto AND a center outside the
-    # pre-edit target bbox: anything inside the target's own territory is
-    # unconditionally an edit product and must face the ink test; a span
-    # that merely lost its twin to one-to-one consumption was never
-    # refuted by the renders and stays an edit product too.
-    seq = []
-    ambiguous = []
-    for i, span in enumerate(after_in):
-        if i in matched:
-            if orig_font is not None and strip_subset_prefix(before_in[matched[i]][1]) == orig_font:
-                seq.append((span, False))  # verified neighbor, target font
-            continue  # verified other-font neighbor: excluded
-        span_font = strip_subset_prefix(span[1])
-        if (i in pixel_vetoed and orig_font is not None and span_font != orig_font
-                and not _center_in(span[2], anchor_bbox)):
-            ambiguous.append(span[0])  # class 3: excluded from alignment
-            continue
-        seq.append((span, True))  # class 2: edit product, ink-tested
-
-    after_str = "".join(entry[0][0] for entry in seq)
+    after_str = "".join(c for c, _, _ in product_seq)
     sm = difflib.SequenceMatcher(a=repl, b=after_str, autojunk=False)
     pairing = [None] * len(repl)
     for tag, a0, a1, b0, b1 in sm.get_opcodes():
         if tag == "equal":
             for i in range(a1 - a0):
-                pairing[a0 + i] = seq[b0 + i]
+                pairing[a0 + i] = product_seq[b0 + i]
 
     # Every char quad on the page in pixel space, for ring masking.
     glyph_rects = [bbox_to_pixels(box, page_box, pad=0) for _, _, box in after_spans]
@@ -673,48 +570,59 @@ def detect_glyph_tofu(after_img, page_box, before_spans, after_spans, edit_bbox,
     tofu = []
     unknown = []
     judged = 0
-    for ch, entry in zip(repl, pairing):
+    for ch, span in zip(repl, pairing):
         if ch.isspace():
             continue
-        if entry is None:
+        if span is None:
             tofu.append({"char": ch, "reason": "missing_from_stext"})
             continue
-        (_, _, cbox), is_product = entry
-        if not is_product:
-            continue  # unchanged in-place char: rendered identically to before
+        _, _, cbox = span
         px0, py0, px1, py1 = bbox_to_pixels(cbox, page_box, pad=1)
         px0, py0 = max(px0, 0), max(py0, 0)
         px1, py1 = min(px1, w), min(py1, h)
         if px1 <= px0 or py1 <= py0:
             tofu.append({"char": ch, "reason": "offpage_quad"})
             continue
-        ring = _ring_contrast(after_img, (px0, py0, px1, py1), glyph_rects)
+        rect = (px0, py0, px1, py1)
+        # Ink attribution mask: every OTHER glyph's quad is punched out of
+        # any contrast measured inside this quad, or an adjacent
+        # character's ink at the quad edge (tight kerning) would vouch
+        # for a blank glyph — in the exemption below as well as in the
+        # ink test.
+        own_rect = bbox_to_pixels(cbox, page_box, pad=0)
+        others = [g for g in glyph_rects if g != own_rect]
+        if before_img is not None:
+            if ImageChops.difference(
+                    before_img.crop(rect), after_img.crop(rect)).getbbox() is None:
+                mc = _masked_span(after_img, rect, others, protect_rect=own_rect)
+                if mc is not None and mc >= 96:
+                    continue  # unchanged in-place char, visibly inked
+        ring = _ring_contrast(after_img, rect, glyph_rects)
         if ring is None or ring >= 96:
             # Busy background, or no background pixels survived masking
             # (dense text / image edge): quad contrast unreliable either
             # way — abstain on this char rather than guess.
             unknown.append(ch)
             continue
+        span_contrast = _masked_span(after_img, rect, others, protect_rect=own_rect)
+        if span_contrast is None:
+            # Fully masked by neighbors: nothing attributable — abstain.
+            unknown.append(ch)
+            continue
         judged += 1
-        lo, hi = after_img.crop((px0, py0, px1, py1)).getextrema()
-        if hi - lo < 96:
+        if span_contrast < 96:
             tofu.append({"char": ch, "reason": "blank_glyph"})
 
     if tofu:
         detail = {"missing": tofu}
         if unknown:
             detail["unknown_background"] = unknown
-        if ambiguous:
-            detail["ambiguous_neighbors"] = ambiguous
         return "fail_glyph_tofu", detail
     if unknown:
         # ANY unjudgeable char without a definite failure means this edit
         # was not fully verified: abstain (counted as skip_font_oracle),
         # never report success on partial coverage.
-        detail = {"unknown_background": unknown, "judged_ok": judged}
-        if ambiguous:
-            detail["ambiguous_neighbors"] = ambiguous
-        return "skip_font_oracle", detail
+        return "skip_font_oracle", {"unknown_background": unknown, "judged_ok": judged}
     return None, None
 
 
@@ -895,6 +803,9 @@ def run_case(pdf_path: Path, work: Path):
     last_err = None
     tried = 0
     for run_, find_, repl_ in pick_edits(runs, rng):
+        # pick_edits guarantees run_ is the page's first run containing
+        # find_ (engine_edits_this_run), so the engine will edit exactly
+        # the run the oracles anchor on.
         tried += 1
         r = sh([
             str(ENGINE), "replace", str(pdf_path), str(out_pdf),
@@ -939,23 +850,35 @@ def run_case(pdf_path: Path, work: Path):
         else:
             page_box, before_spans, after_spans, before_img, after_img = probe
             edit_bbox = tuple(report["bbox"])
-            # Ground truth: the edited run's PRE-EDIT bbox from engine
-            # extract — anchors target-font voting and product territory
-            # (the report bbox can extend rightward for wider repls).
+            # Anchor: the picked run's PRE-EDIT bbox — the judge's own
+            # information from when it chose the edit word out of engine
+            # extract (the post-edit report bbox is only the affected-
+            # pixel scope, never an identity anchor).
             pre_edit_bbox = tuple(run["bbox"])
-            pixel_ctx = (before_img, after_img, page_box)
-            try:
-                font_verdict, font_info = detect_font_substitution(
-                    before_spans, after_spans, edit_bbox, pixel_ctx=pixel_ctx,
-                    pre_edit_bbox=pre_edit_bbox)
-            except Exception:
-                font_verdict, font_info = None, None
-            try:
-                tofu_verdict, tofu_info = detect_glyph_tofu(
-                    after_img, page_box, before_spans, after_spans, edit_bbox, repl,
-                    before_img=before_img, pre_edit_bbox=pre_edit_bbox)
-            except Exception:
-                tofu_verdict, tofu_info = None, None
+            # Independent confirmation by the mutool witness: the before-
+            # page text inside the anchor must contain `find` (whitespace-
+            # insensitive). If not, the anchor cannot be independently
+            # established — abstain rather than judge on a shaky anchor.
+            anchor_text = "".join(
+                c for c, _f, box in before_spans if _center_in(box, pre_edit_bbox))
+            font_verdict = font_info = tofu_verdict = tofu_info = None
+            if "".join(find.split()) not in "".join(anchor_text.split()):
+                skip_font_oracle = True
+            else:
+                new_text = report.get("new_text")
+                try:
+                    font_verdict, font_info = detect_font_substitution(
+                        before_spans, after_spans, edit_bbox,
+                        pre_edit_bbox=pre_edit_bbox, new_text=new_text)
+                except Exception:
+                    font_verdict, font_info = None, None
+                try:
+                    tofu_verdict, tofu_info = detect_glyph_tofu(
+                        after_img, page_box, before_spans, after_spans, edit_bbox, repl,
+                        before_img=before_img, pre_edit_bbox=pre_edit_bbox,
+                        new_text=new_text)
+                except Exception:
+                    tofu_verdict, tofu_info = None, None
 
             # tofu (nothing rendered at all) is the more severe symptom;
             # prefer it if both somehow fire on the same edit.
@@ -965,9 +888,10 @@ def run_case(pdf_path: Path, work: Path):
             elif font_verdict == "fail_font_substituted":
                 final_verdict = "fail_font_substituted"
                 case_extra["font_check"] = font_info
-            if tofu_verdict == "skip_font_oracle":
-                # Every visible char sat on a busy background: the ink test
-                # abstained for this file (font-name check still ran).
+            if tofu_verdict == "skip_font_oracle" or font_verdict == "skip_font_oracle":
+                # Abstention: busy/unobservable background under every
+                # ink-tested char, or overlapping foreign text inside the
+                # product territory — counted, never guessed.
                 skip_font_oracle = True
 
     if final_verdict.startswith("fail"):

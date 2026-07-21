@@ -87,19 +87,24 @@ def main():
     report = json.loads(r.stdout)
     print(f"engine report: {report}")
 
+    rext = subprocess.run([str(R.ENGINE), "extract", str(PROBE_PDF)],
+                          capture_output=True, text=True)
+    pre_edit_bbox = tuple(json.loads(rext.stdout)["runs"][0]["bbox"])
+
     probe = R.mutool_probe("fontfidelity_selftest", PROBE_PDF, OUT_PDF, {"page": 1}, WORK)
     if probe is None:
         print("mutool_probe returned None (mutool crash/timeout/parse failure) -- can't self-test")
         sys.exit(1)
     page_box, before_spans, after_spans, before_img, after_img = probe
     edit_bbox = tuple(report["bbox"])
-    pixel_ctx = (before_img, after_img, page_box)
 
     font_verdict, font_info = R.detect_font_substitution(
-        before_spans, after_spans, edit_bbox, pixel_ctx=pixel_ctx)
+        before_spans, after_spans, edit_bbox,
+        pre_edit_bbox=pre_edit_bbox, new_text=report.get("new_text"))
     tofu_verdict, tofu_info = R.detect_glyph_tofu(
         after_img, page_box, before_spans, after_spans, edit_bbox, REPL,
-        before_img=before_img)
+        before_img=before_img, pre_edit_bbox=pre_edit_bbox,
+        new_text=report.get("new_text"))
 
     print(f"check 2 (font substitution): {font_verdict} {font_info}")
     print(f"check 3 (glyph tofu):        {tofu_verdict} {tofu_info}")
