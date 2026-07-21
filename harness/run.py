@@ -699,8 +699,27 @@ def detect_glyph_tofu(after_img, page_box, before_spans, after_spans, edit_bbox,
             for i in range(a1 - a0):
                 pairing[a0 + i] = product_seq[b0 + i]
 
-    # Every char quad on the page in pixel space, for ring masking.
-    glyph_rects = [bbox_to_pixels(box, page_box, pad=0) for _, _, box in after_spans]
+    # Every char quad on the page in pixel space, for ring masking; the
+    # font travels along for the risk-targeted inner margins below.
+    glyph_info = [(bbox_to_pixels(box, page_box, pad=0), f) for _, f, box in after_spans]
+    glyph_rects = [g for g, _f in glyph_info]
+
+    def _overhang_risk(neighbor_font, own_base):
+        """Whether a neighbor's ink can plausibly bleed further than the
+        standard 2px antialias pad (reviewed ruling, round 12 follow-up):
+        upright glyphs paint outside their own quad only by ~1px of
+        antialiasing, which the 2px pad covers; >2px overhang comes from
+        italic/oblique shear or from cross-font metric differences. The
+        stricter 4px inner margin is therefore applied only to neighbors
+        whose font name says Italic/Oblique (case-insensitive, covering
+        faux-italic naming variants) or whose base font differs from the
+        tested glyph's own. Known residuals, accepted: rare upright
+        long-swash glyphs (long-f, script faces), and italic overhang
+        beyond 4px."""
+        nf = neighbor_font.lower()
+        if "italic" in nf or "oblique" in nf:
+            return True
+        return strip_subset_prefix(neighbor_font) != own_base
 
     w, h = after_img.size
     tofu = []
@@ -725,14 +744,25 @@ def detect_glyph_tofu(after_img, page_box, before_spans, after_spans, edit_bbox,
         # any contrast measured inside this quad, or an adjacent
         # character's ink at the quad edge (tight kerning) would vouch
         # for a blank glyph — in the exemption below as well as in the
-        # ink test.
+        # ink test. Punch pads are RISK-TARGETED (see _overhang_risk):
+        # upright same-font neighbors get the standard 2px in both masks;
+        # italic/oblique or cross-font neighbors get 4px in the inner
+        # mask, demanding a 2px margin from their punch boundary.
         own_rect = bbox_to_pixels(cbox, page_box, pad=0)
-        others = [g for g in glyph_rects if g != own_rect]
+        own_base = strip_subset_prefix(span[1])
+
+        def _padded(r, p):
+            return (r[0] - p, r[1] - p, r[2] + p, r[3] + p)
+
+        others_meta = [(g, f) for g, f in glyph_info if g != own_rect]
+        outer_rects = [_padded(g, 2) for g, _f in others_meta]
+        inner_rects = [_padded(g, 4 if _overhang_risk(f, own_base) else 2)
+                       for g, f in others_meta]
         if before_img is not None:
             if ImageChops.difference(
                     before_img.crop(rect), after_img.crop(rect)).getbbox() is None:
                 mc, _core_live, _core_area = _masked_span(
-                    after_img, rect, others, glyph_pad=4, protect_rect=own_rect)
+                    after_img, rect, inner_rects, glyph_pad=0, protect_rect=own_rect)
                 if mc is not None and mc >= 96:
                     # Unchanged in-place char with INNER-margin
                     # attributable ink; same provenance + inner-margin
@@ -746,14 +776,15 @@ def detect_glyph_tofu(after_img, page_box, before_spans, after_spans, edit_bbox,
             # way — abstain on this char rather than guess.
             unknown.append(ch)
             continue
-        # INKED requires INNER-margin ink (round 12): italic overhang can
-        # bleed past the 2px punch pad, so ink surviving only in the 2px
-        # band right at a punch boundary may still be a neighbor's. The
-        # qualifying ink must sit >= 2px inside from every punched
-        # foreign region — measured by re-masking with the punches
-        # expanded a further 2px (glyph_pad=4). Known residual: an
-        # overhang longer than 4px total still reaches the inner region;
-        # fixed pads cannot bound arbitrary swash lengths. The sufficiency floor
+        # INKED requires INNER-margin ink from RISKY neighbors (round 12,
+        # targeted per ruling): italic/oblique shear and cross-font
+        # metric differences can bleed past the 2px punch pad, so ink
+        # surviving only in the 2px band at such a neighbor's punch
+        # boundary may still be that neighbor's — the inner mask expands
+        # those punches to 4px. Upright same-font neighbors keep the
+        # plain 2px pad (their bleed is ~1px antialiasing), so normal
+        # tight body text stays judgeable. Known residuals: upright
+        # long-swash glyphs, and overhang beyond 4px. The sufficiency floor
         # deliberately does NOT gate the inked branch (reviewed ruling,
         # round 11 follow-up): inner-surviving ink is attributable by
         # provenance regardless of how few pixels survive; the fringe
@@ -761,12 +792,12 @@ def detect_glyph_tofu(after_img, page_box, before_spans, after_spans, edit_bbox,
         # validated. The floor only guards the blank/unknown direction
         # (and blank has the raw<96 requirement as its own second gate).
         span_inner, _il, _ia = _masked_span(
-            after_img, rect, others, glyph_pad=4, protect_rect=own_rect)
+            after_img, rect, inner_rects, glyph_pad=0, protect_rect=own_rect)
         if span_inner is not None and span_inner >= 96:
             judged += 1  # inner-margin ink: attributable with slack
             continue
         span_contrast, core_live, core_area = _masked_span(
-            after_img, rect, others, protect_rect=own_rect)
+            after_img, rect, outer_rects, glyph_pad=0, protect_rect=own_rect)
         if span_contrast is not None and span_contrast >= 96:
             # Ink exists only within the 2px boundary band next to a
             # punched foreign region: could be this glyph's, could be
