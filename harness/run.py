@@ -408,14 +408,57 @@ def build_territory(before_spans, after_spans, pre_edit_bbox, new_text):
     # boundary can be drawn and no product identity is safe: abstain
     # (right_boundary_lost), never guess. End-of-line edits (no before
     # right neighbors) are unaffected.
+    # RIGHT BOUNDARY from pre-edit right neighbors (independent of the
+    # alignment), tolerant of a UNIFORM SHIFT (round 13) and hardened
+    # against product impostors (round 14): the engine's rewrite of
+    # ' / " operators legally moves every downstream pen, so untouched
+    # right neighbors can sit far from their old positions. The
+    # before-band spans starting at/right of the pre-edit right edge form
+    # an ORDERED sequence, searched in the after band as a contiguous run
+    # with the same chars and RAW fonts, in order, all moved by one rigid
+    # delta_x (spread <= 0.5pt). Round-14 hardening — a single-character
+    # neighbor sequence makes the rigid-shift spread vacuous, and a
+    # replacement that happens to contain the neighbor's char in the same
+    # font puts an IMPOSTOR candidate at the left end of the territory:
+    #   1. ALL rigid candidates are collected (no first-match);
+    #   2. candidates overlapping the alignment's product spans are
+    #      invalid — an after span already aligned as an edit product
+    #      cannot double as the boundary (products take priority);
+    #   3. the boundary is the RIGHTMOST valid candidate (the true
+    #      untouched suffix lies right of the products, impostors left);
+    #   4. another valid candidate starting beyond the expected product
+    #      extent means two suffix look-alikes that geometry cannot tell
+    #      apart -> abstain (right_boundary_ambiguous);
+    # no valid candidate while before right neighbors exist -> the
+    # topology cannot be re-established: abstain (right_boundary_lost).
+    # End-of-line edits (no before right neighbors) are unaffected.
     before_rn_seq = sorted(
         (s for s in before_band if s[2][0] >= x1 - 0.5),
         key=lambda s: (s[2][0] + s[2][2]) / 2)
 
+    _widths = [s[2][2] - s[2][0] for s in after_band
+               if not s[0].isspace() and s[2][2] > s[2][0]]
+    med_w = sorted(_widths)[len(_widths) // 2] if _widths else 0.0
+
+    # Alignment first: the boundary filtering needs to know which after
+    # spans the product alignment claims.
+    aligned = set()
+    first, last = None, -1
+    if new_text:
+        band_str = "".join(c for c, _, _ in after_band)
+        sm = difflib.SequenceMatcher(a=new_text, b=band_str, autojunk=False)
+        for tag, _a0, _a1, b0, b1 in sm.get_opcodes():
+            if tag == "equal":
+                if first is None:
+                    first = b0
+                last = max(last, b1 - 1)
+                aligned.update(range(b0, b1))
+
     first_rn = None
-    right_boundary_lost = False
+    boundary_reason = None
     if before_rn_seq:
         n = len(before_rn_seq)
+        cands = []
         for i in range(len(after_band) - n + 1):
             deltas = []
             ok = True
@@ -426,39 +469,39 @@ def build_territory(before_spans, after_spans, pre_edit_bbox, new_text):
                     break
                 deltas.append(abox[0] - bbox_[0])
             if ok and max(deltas) - min(deltas) <= 0.5:
-                first_rn = i
-                break
-        if first_rn is None:
-            right_boundary_lost = True
+                cands.append(i)
+        valid = [i for i in cands
+                 if not any(k in aligned for k in range(i, i + n))]
+        if not valid:
+            boundary_reason = "right_boundary_lost"
+        else:
+            first_rn = max(valid)  # rightmost: true suffix, not an impostor
+            expected_right = x0 + 1.3 * len(new_text or "") * med_w + 2.0
+            for i in valid:
+                if i != first_rn and after_band[i][2][0] > expected_right:
+                    # A second suffix look-alike beyond where products
+                    # could plausibly reach: undecidable which is real.
+                    boundary_reason = "right_boundary_ambiguous"
+                    break
 
     anchor_failed = False
     ambiguous_reason = None
-    if right_boundary_lost:
-        product_seq = []
-        ambiguous_reason = "right_boundary_lost"
-    elif new_text:
-        band_str = "".join(c for c, _, _ in after_band)
-        sm = difflib.SequenceMatcher(a=new_text, b=band_str, autojunk=False)
-        first, last = None, -1
-        for tag, _a0, _a1, b0, b1 in sm.get_opcodes():
-            if tag == "equal":
-                if first is None:
-                    first = b0
-                last = max(last, b1 - 1)
+    if new_text:
         # LEFT ANCHOR: the band has no right edge of its own, so alignment
         # alone can lock onto an unrelated same-font run further right on
-        # the line (e.g. when the edited segment vanished entirely and
-        # that run happens to contain new_text) and silently vouch for
-        # the edit. The first aligned span must sit at the target's own
-        # left edge (pre-edit x0, same 2pt tolerance as the band itself);
-        # otherwise no product sequence is established at all — the
-        # caller reports the output missing or abstains, but never
-        # extends rightward.
+        # the line and silently vouch for the edit. The first aligned span
+        # must sit at the target's own left edge (pre-edit x0, same 2pt
+        # tolerance as the band); anchor failures are judged BEFORE the
+        # boundary abstentions so vanished-output cases keep reporting
+        # missing rather than degrading into a boundary abstention.
         if first is None:
             product_seq = []
         elif abs(after_band[first][2][0] - x0) > BAND_PAD:
             product_seq = []
             anchor_failed = True
+        elif boundary_reason is not None:
+            product_seq = []
+            ambiguous_reason = boundary_reason
         elif first_rn is not None and last >= first_rn:
             product_seq = []
             ambiguous_reason = "crosses_preexisting"
@@ -468,15 +511,19 @@ def build_territory(before_spans, after_spans, pre_edit_bbox, new_text):
                 product_seq = []
                 ambiguous_reason = "gap_ambiguous"
     else:
-        product_seq = after_band if first_rn is None else after_band[:first_rn]
-        if product_seq and abs(product_seq[0][2][0] - x0) > BAND_PAD:
+        if boundary_reason is not None:
             product_seq = []
-            anchor_failed = True
+            ambiguous_reason = boundary_reason
         else:
-            product_seq, gap_amb = truncate_continuous(product_seq)
-            if gap_amb:
+            product_seq = after_band if first_rn is None else after_band[:first_rn]
+            if product_seq and abs(product_seq[0][2][0] - x0) > BAND_PAD:
                 product_seq = []
-                ambiguous_reason = "gap_ambiguous"
+                anchor_failed = True
+            else:
+                product_seq, gap_amb = truncate_continuous(product_seq)
+                if gap_amb:
+                    product_seq = []
+                    ambiguous_reason = "gap_ambiguous"
 
     overlapping = []
     for c, f, box in product_seq:
