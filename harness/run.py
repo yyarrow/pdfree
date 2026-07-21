@@ -391,47 +391,32 @@ def build_territory(before_spans, after_spans, pre_edit_bbox, new_text):
             out.append(cur)
         return out, False
 
-    # RIGHT BOUNDARY from pre-edit right neighbors (independent of the
-    # alignment), tolerant of a UNIFORM SHIFT (round 13): the engine's
-    # rewrite of ' / \" operators legally moves every downstream pen, so
-    # untouched right neighbors can sit far from their old positions —
-    # static +-0.5pt matching would lose the boundary and let the
-    # alignment absorb neighbor text. The before-band spans starting
-    # at/right of the pre-edit right edge form an ORDERED sequence; it is
-    # searched for in the after band as a contiguous run with the same
-    # chars and the same RAW fonts, in order, where every span moved by
-    # the same delta_x (spread <= 0.5pt — one rigid translation). Found:
-    # the run's first span is the right boundary, and the product
-    # sequence must never reach it (crosses_preexisting below). NOT
-    # found while before right neighbors exist: the topology cannot be
-    # re-established — neither in place nor rigidly shifted — so no
-    # boundary can be drawn and no product identity is safe: abstain
-    # (right_boundary_lost), never guess. End-of-line edits (no before
-    # right neighbors) are unaffected.
-    # RIGHT BOUNDARY from pre-edit right neighbors (independent of the
-    # alignment), tolerant of a UNIFORM SHIFT (round 13) and hardened
-    # against product impostors (round 14): the engine's rewrite of
-    # ' / " operators legally moves every downstream pen, so untouched
-    # right neighbors can sit far from their old positions. The
-    # before-band spans starting at/right of the pre-edit right edge form
-    # an ORDERED sequence, searched in the after band as a contiguous run
-    # with the same chars and RAW fonts, in order, all moved by one rigid
-    # delta_x (spread <= 0.5pt). Round-14 hardening — a single-character
-    # neighbor sequence makes the rigid-shift spread vacuous, and a
-    # replacement that happens to contain the neighbor's char in the same
-    # font puts an IMPOSTOR candidate at the left end of the territory:
-    #   1. ALL rigid candidates are collected (no first-match);
-    #   2. candidates overlapping the alignment's product spans are
-    #      invalid — an after span already aligned as an edit product
-    #      cannot double as the boundary (products take priority);
-    #   3. the boundary is the RIGHTMOST valid candidate (the true
-    #      untouched suffix lies right of the products, impostors left);
-    #   4. another valid candidate starting beyond the expected product
-    #      extent means two suffix look-alikes that geometry cannot tell
-    #      apart -> abstain (right_boundary_ambiguous);
-    # no valid candidate while before right neighbors exist -> the
-    # topology cannot be re-established: abstain (right_boundary_lost).
-    # End-of-line edits (no before right neighbors) are unaffected.
+    # RIGHT BOUNDARY from pre-edit right neighbors, decided by
+    # PER-CANDIDATE PREFIX ALIGNMENT (round 15): a global alignment run
+    # before the boundary is chosen can BORROW the true suffix when a
+    # product character is missing from stext (intended products ABCB,
+    # right neighbor C, mutool drops the second product char -> band
+    # ACBC: the global alignment claims indices 0,2,3, stealing the true
+    # suffix at 3, so the true boundary candidate looked
+    # product-claimed and the impostor at 1 survived). The boundary
+    # hypothesis therefore comes FIRST and the alignment is constrained
+    # by it:
+    #   1. rigid-shift candidates as before (ordered before-side right
+    #      neighbors re-found in the after band, one rigid delta_x);
+    #   2. for each candidate, new_text is aligned ONLY against the band
+    #      prefix left of the candidate; the candidate is valid when
+    #      that prefix alignment anchors at the pre-edit x0 AND its
+    #      equal coverage is not below the global alignment's;
+    #   3. the boundary is the RIGHTMOST valid candidate and its prefix
+    #      alignment IS the product sequence (missing judgement runs on
+    #      it — in the example, C at index 1 aligns as a product and the
+    #      dropped B is correctly reported missing);
+    #   4. no valid candidate while before right neighbors exist ->
+    #      abstain (right_boundary_lost); a second valid candidate
+    #      starting beyond the expected product extent -> abstain
+    #      (right_boundary_ambiguous).
+    # End-of-line edits (no before right neighbors) use the plain global
+    # alignment as before.
     before_rn_seq = sorted(
         (s for s in before_band if s[2][0] >= x1 - 0.5),
         key=lambda s: (s[2][0] + s[2][2]) / 2)
@@ -440,25 +425,32 @@ def build_territory(before_spans, after_spans, pre_edit_bbox, new_text):
                if not s[0].isspace() and s[2][2] > s[2][0]]
     med_w = sorted(_widths)[len(_widths) // 2] if _widths else 0.0
 
-    # Alignment first: the boundary filtering needs to know which after
-    # spans the product alignment claims.
-    aligned = set()
-    first, last = None, -1
-    if new_text:
-        band_str = "".join(c for c, _, _ in after_band)
-        sm = difflib.SequenceMatcher(a=new_text, b=band_str, autojunk=False)
-        for tag, _a0, _a1, b0, b1 in sm.get_opcodes():
-            if tag == "equal":
-                if first is None:
-                    first = b0
-                last = max(last, b1 - 1)
-                aligned.update(range(b0, b1))
+    band_str = "".join(c for c, _, _ in after_band)
 
-    first_rn = None
-    boundary_reason = None
+    def _align(text, upto=None):
+        """difflib-align `text` against the band prefix of length `upto`
+        (whole band when None). Returns (first, last, coverage): first/
+        last aligned band indices and the total equal-char count."""
+        seg = band_str if upto is None else band_str[:upto]
+        smx = difflib.SequenceMatcher(a=text, b=seg, autojunk=False)
+        f, l, cov = None, -1, 0
+        for tag, _a0, _a1, b0, b1 in smx.get_opcodes():
+            if tag == "equal":
+                if f is None:
+                    f = b0
+                l = max(l, b1 - 1)
+                cov += b1 - b0
+        return f, l, cov
+
+    g_first = None
+    g_last = -1
+    g_cov = 0
+    if new_text:
+        g_first, g_last, g_cov = _align(new_text)
+
+    rigid_cands = []
     if before_rn_seq:
         n = len(before_rn_seq)
-        cands = []
         for i in range(len(after_band) - n + 1):
             deltas = []
             ok = True
@@ -469,61 +461,75 @@ def build_territory(before_spans, after_spans, pre_edit_bbox, new_text):
                     break
                 deltas.append(abox[0] - bbox_[0])
             if ok and max(deltas) - min(deltas) <= 0.5:
-                cands.append(i)
-        valid = [i for i in cands
-                 if not any(k in aligned for k in range(i, i + n))]
-        if not valid:
-            boundary_reason = "right_boundary_lost"
-        else:
-            first_rn = max(valid)  # rightmost: true suffix, not an impostor
-            expected_right = x0 + 1.3 * len(new_text or "") * med_w + 2.0
-            for i in valid:
-                if i != first_rn and after_band[i][2][0] > expected_right:
-                    # A second suffix look-alike beyond where products
-                    # could plausibly reach: undecidable which is real.
-                    boundary_reason = "right_boundary_ambiguous"
-                    break
+                rigid_cands.append(i)
 
     anchor_failed = False
     ambiguous_reason = None
-    if new_text:
-        # LEFT ANCHOR: the band has no right edge of its own, so alignment
-        # alone can lock onto an unrelated same-font run further right on
-        # the line and silently vouch for the edit. The first aligned span
-        # must sit at the target's own left edge (pre-edit x0, same 2pt
-        # tolerance as the band); anchor failures are judged BEFORE the
-        # boundary abstentions so vanished-output cases keep reporting
-        # missing rather than degrading into a boundary abstention.
-        if first is None:
+    first_rn = None
+    chosen = None  # (first, last) of the selected candidate's prefix alignment
+    if before_rn_seq:
+        if new_text:
+            valid = []
+            for i in rigid_cands:
+                pf, pl, pcov = _align(new_text, upto=i)
+                if pf is None:
+                    continue
+                if abs(after_band[pf][2][0] - x0) > BAND_PAD:
+                    continue  # prefix alignment not anchored at the target
+                if pcov < g_cov:
+                    continue  # alignment quality below the global level
+                valid.append((i, pf, pl))
+            if not valid:
+                ambiguous_reason = "right_boundary_lost"
+            else:
+                i_sel, pf_sel, pl_sel = max(valid, key=lambda t: t[0])
+                expected_right = x0 + 1.3 * len(new_text) * med_w + 2.0
+                for i, _pf, _pl in valid:
+                    if i != i_sel and after_band[i][2][0] > expected_right:
+                        ambiguous_reason = "right_boundary_ambiguous"
+                        break
+                if ambiguous_reason is None:
+                    first_rn = i_sel
+                    chosen = (pf_sel, pl_sel)
+        else:
+            if not rigid_cands:
+                ambiguous_reason = "right_boundary_lost"
+            else:
+                first_rn = max(rigid_cands)
+
+    if ambiguous_reason:
+        product_seq = []
+    elif new_text:
+        if chosen is not None:
+            _pf, pl = chosen
+            product_seq, gap_amb = truncate_continuous(after_band[: pl + 1])
+            if gap_amb:
+                product_seq = []
+                ambiguous_reason = "gap_ambiguous"
+        elif g_first is None:
             product_seq = []
-        elif abs(after_band[first][2][0] - x0) > BAND_PAD:
+        elif abs(after_band[g_first][2][0] - x0) > BAND_PAD:
+            # LEFT ANCHOR (no right neighbors): the first aligned span
+            # must sit at the target's left edge or no product identity
+            # exists — the caller reports missing or abstains, never
+            # extends rightward.
             product_seq = []
             anchor_failed = True
-        elif boundary_reason is not None:
-            product_seq = []
-            ambiguous_reason = boundary_reason
-        elif first_rn is not None and last >= first_rn:
-            product_seq = []
-            ambiguous_reason = "crosses_preexisting"
         else:
-            product_seq, gap_amb = truncate_continuous(after_band[: last + 1])
+            product_seq, gap_amb = truncate_continuous(after_band[: g_last + 1])
             if gap_amb:
                 product_seq = []
                 ambiguous_reason = "gap_ambiguous"
     else:
-        if boundary_reason is not None:
+        product_seq = after_band if first_rn is None else after_band[:first_rn]
+        if product_seq and abs(product_seq[0][2][0] - x0) > BAND_PAD:
             product_seq = []
-            ambiguous_reason = boundary_reason
+            anchor_failed = True
         else:
-            product_seq = after_band if first_rn is None else after_band[:first_rn]
-            if product_seq and abs(product_seq[0][2][0] - x0) > BAND_PAD:
+            product_seq, gap_amb = truncate_continuous(product_seq)
+            if gap_amb:
                 product_seq = []
-                anchor_failed = True
-            else:
-                product_seq, gap_amb = truncate_continuous(product_seq)
-                if gap_amb:
-                    product_seq = []
-                    ambiguous_reason = "gap_ambiguous"
+                ambiguous_reason = "gap_ambiguous"
 
     overlapping = []
     for c, f, box in product_seq:
