@@ -675,11 +675,13 @@ def detect_glyph_tofu(after_img, page_box, before_spans, after_spans, edit_bbox,
         if before_img is not None:
             if ImageChops.difference(
                     before_img.crop(rect), after_img.crop(rect)).getbbox() is None:
-                mc, core_live, core_area = _masked_span(
+                mc, _core_live, _core_area = _masked_span(
                     after_img, rect, others, protect_rect=own_rect)
-                if (mc is not None and mc >= 96
-                        and core_area > 0 and core_live >= max(4, 0.3 * core_area)):
-                    continue  # unchanged in-place char, visibly inked
+                if mc is not None and mc >= 96:
+                    # Unchanged in-place char with attributable ink; same
+                    # provenance argument as the ink test below — the
+                    # area floor does not gate the inked direction.
+                    continue
         ring = _ring_contrast(after_img, rect, glyph_rects)
         if ring is None or ring >= 96:
             # Busy background, or no background pixels survived masking
@@ -689,21 +691,32 @@ def detect_glyph_tofu(after_img, page_box, before_spans, after_spans, edit_bbox,
             continue
         span_contrast, core_live, core_area = _masked_span(
             after_img, rect, others, protect_rect=own_rect)
+        if span_contrast is not None and span_contrast >= 96:
+            # INKED — and the sufficiency floor deliberately does NOT
+            # gate this branch (reviewed ruling, round 11 follow-up):
+            # every surviving pixel has already passed the symmetric 2px
+            # subtraction, so whatever ink remains is attributable to
+            # this glyph REGARDLESS of how few pixels survived; the
+            # fringe outside the glyph pads is background the ring check
+            # already validated as uniform. Attributability is about
+            # provenance, not area. The floor only guards the
+            # blank/unknown direction below (and blank has the raw<96
+            # requirement as its own second gate).
+            judged += 1
+            continue
         if core_area > 0 and core_live < max(4, 0.3 * core_area):
             # Fast abstention: the glyph's own core exists but almost
             # none of it remains attributable to THIS glyph (a foreign
-            # quad covers it) — nothing meaningful to judge. (core_area
-            # == 0 is different: a BLANK glyph gets a degenerate
-            # zero-height quad from mutool, so the padded rect judged
-            # below is exactly what catches it.)
+            # quad covers it) and what does remain shows no ink —
+            # nothing meaningful to judge. (core_area == 0 is different:
+            # a BLANK glyph gets a degenerate zero-height quad from
+            # mutool, so the padded rect judged below is exactly what
+            # catches it.)
             unknown.append(ch)
             continue
         if span_contrast is None:
             # Fully masked by neighbors: nothing attributable — abstain.
             unknown.append(ch)
-            continue
-        if span_contrast >= 96:
-            judged += 1  # inked, and the ink is attributable to this glyph
             continue
         # Attributable region is blank. A BLANK verdict additionally
         # requires the RAW quad to be blank too: raw ink with no
