@@ -205,15 +205,33 @@ thread_local! {
     static TTF_CACHE: std::cell::RefCell<Vec<TtfCacheEntry>> =
         const { std::cell::RefCell::new(Vec::new()) };
     static TTF_CACHE_EPOCH: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static TTF_CACHE_OP_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
 }
 
-/// Start a new edit operation for the embedded-font cache: pointer-identity
-/// shortcuts from earlier operations stop being trusted and the next hit
-/// per font re-verifies with a full byte comparison. Public edit entry
-/// points call this; forgetting one costs a memcmp per segment, never
-/// correctness.
-pub fn bump_ttf_cache_epoch() {
-    TTF_CACHE_EPOCH.with(|e| e.set(e.get().wrapping_add(1)));
+/// RAII scope marking one edit operation for the embedded-font cache. The
+/// pointer-identity shortcut is only honored while a guard is alive
+/// (depth > 0): within the guarded scope the document is borrowed for the
+/// whole edit, so equal buffer identity proves equal bytes. Probes outside
+/// any guard — load_fonts/glyph_available are public and free to be called
+/// standalone — always pay the full byte comparison, so allocator address
+/// reuse across dropped documents can never alias two fonts. Both
+/// construction and drop advance the epoch, killing shortcuts minted by
+/// neighboring operations in either direction.
+pub(crate) struct TtfCacheOpGuard(());
+
+impl TtfCacheOpGuard {
+    pub(crate) fn new() -> Self {
+        TTF_CACHE_EPOCH.with(|e| e.set(e.get().wrapping_add(1)));
+        TTF_CACHE_OP_DEPTH.with(|d| d.set(d.get() + 1));
+        TtfCacheOpGuard(())
+    }
+}
+
+impl Drop for TtfCacheOpGuard {
+    fn drop(&mut self) {
+        TTF_CACHE_OP_DEPTH.with(|d| d.set(d.get().saturating_sub(1)));
+        TTF_CACHE_EPOCH.with(|e| e.set(e.get().wrapping_add(1)));
+    }
 }
 
 /// Cheap fingerprint of a raw stream (length + first/last 1KB hashed) used
@@ -318,12 +336,13 @@ impl<'a> FontInfo<'a> {
                 let cfg = stream_decode_cfg(stream);
                 let ident = (stream.content.as_ptr() as usize, stream.content.len());
                 let epoch = TTF_CACHE_EPOCH.with(std::cell::Cell::get);
+                let guarded = TTF_CACHE_OP_DEPTH.with(std::cell::Cell::get) > 0;
                 TTF_CACHE.with(|cache| {
                     let mut cache = cache.borrow_mut();
                     let pos = cache.iter().position(|e| {
                         e.fingerprint == key
                             && e.decode_cfg == cfg
-                            && (e.verified.get() == (ident.0, ident.1, epoch)
+                            && ((guarded && e.verified.get() == (ident.0, ident.1, epoch))
                                 || e.raw.as_slice() == stream.content)
                     });
                     if let Some(pos) = pos {
@@ -1160,6 +1179,30 @@ mod tests {
         // missed it and wrongly refused the whole font.
         assert!(f.glyph_available(&doc, b'I', None));
         assert!(!f.glyph_available(&doc, b'd', None), "absent glyph still refused");
+    }
+
+    /// (3,0) symbol table (F000 range) deliberately MISSING 'n', plus a
+    /// (1,0) Mac table that HAS 'n' (crbot #7 round-4 finding 1).
+    const SUBSET_TTF_SYM_NO_N: &[u8] = include_bytes!("testdata/noto_sc_subset_sym_missing_n.ttf");
+
+    #[test]
+    fn symbol_table_verdict_is_exclusive() {
+        // A renderer selects the (3,0) table exclusively when it exists;
+        // a byte it can't map paints .notdef even if (1,0) maps it, so
+        // falling through to Mac would authorize tofu.
+        let mut doc = Document::with_version("1.7");
+        let id = font_dict_id_with(&mut doc, Some(SUBSET_TTF_SYM_NO_N));
+        {
+            let font_dict = doc.get_dictionary(id).unwrap();
+            let fd_id = font_dict.get(b"FontDescriptor").unwrap().as_reference().unwrap();
+            doc.get_dictionary_mut(fd_id).unwrap().set("Flags", 4);
+        }
+        let f = font_info(&doc, id);
+        assert!(f.glyph_available(&doc, b'I', None), "symbol table covers 'I'");
+        assert!(
+            !f.glyph_available(&doc, b'n', None),
+            "'n' missing from (3,0) must refuse even though (1,0) maps it"
+        );
     }
 
     #[test]

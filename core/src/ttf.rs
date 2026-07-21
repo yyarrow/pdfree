@@ -330,17 +330,19 @@ impl TtfFont {
         }
     }
 
-    /// Byte-keyed glyph id lookup: the (3,0) symbol table first — probing
-    /// every high-byte range ISO 32000 permits for it (bare, 0xF000,
-    /// 0xF100, 0xF200) — then the (1,0) Mac table with the bare byte.
+    /// Byte-keyed glyph id lookup. When a usable (3,0) symbol table exists
+    /// its verdict is FINAL — a renderer selects it exclusively (ISO 32000
+    /// 9.6.6.4), so a byte it can't map paints .notdef even if the (1,0)
+    /// Mac table maps it; falling through would authorize tofu. All four
+    /// high-byte ranges the spec permits for symbol tables are probed
+    /// (bare, 0xF000, 0xF100, 0xF200). The Mac table decides only for
+    /// fonts with no usable symbol table at all.
     fn lookup_byte_cmap(&self, b: u8) -> Option<u16> {
         let bc = self.byte_cmap.as_ref()?;
         if let Some(sym) = &bc.symbol {
-            for high in [0x0000u32, 0xF000, 0xF100, 0xF200] {
-                if let Some(gid) = Self::lookup_subtable(&self.data, sym, high | b as u32) {
-                    return Some(gid);
-                }
-            }
+            return [0x0000u32, 0xF000, 0xF100, 0xF200]
+                .iter()
+                .find_map(|high| Self::lookup_subtable(&self.data, sym, high | b as u32));
         }
         let mac = bc.mac.as_ref()?;
         Self::lookup_subtable(&self.data, mac, b as u32)

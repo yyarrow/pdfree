@@ -136,9 +136,9 @@ pub fn replace_text(
     fallback: Option<&TtfFont>,
 ) -> Result<ReplaceReport, ReplaceError> {
     reject_encrypted(doc)?;
-    // New edit operation: embedded-font cache pointer shortcuts from any
-    // earlier operation must re-verify (see bump_ttf_cache_epoch).
-    crate::walk::bump_ttf_cache_epoch();
+    // One edit operation: enables the font cache's pointer shortcut for
+    // this scope and invalidates it on exit (see TtfCacheOpGuard).
+    let _cache_op = crate::walk::TtfCacheOpGuard::new();
     let pages = doc.get_pages();
     let page_id = *pages.get(&page_no).ok_or(ReplaceError::PageNotFound(page_no))?;
 
