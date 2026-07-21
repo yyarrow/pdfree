@@ -268,17 +268,21 @@ def match_untouched_neighbors(before_spans, after_spans, edit_bbox, tol=2.0, pix
     at ordinary sizes (Helvetica 'i' is 222/1000 em = 1.998pt at 9pt), so
     a rewritten char CAN land within tol of a different same-char/same-font
     twin's old position. "Untouched" is therefore verified against its own
-    definition: the after quad's pixel region must be RAW-identical between
-    the before and after renders (ImageChops.difference(...).getbbox() is
-    None — same no-threshold standard as the identity check). Any pixel
-    difference cancels the match and the span is treated as an edit
-    product. Mis-cancelling is cheap: a genuinely untouched char with ink
-    still passes the downstream ink test as an edit product, and blank
-    (whitespace) chars are skipped by that test anyway; whereas the
-    dangerous case — a newly written BLANK glyph sitting where an inked
-    twin used to be — necessarily differs from the before render and is
-    forced through the ink test, where it fails. When pixel_ctx is None
-    (span-only fixtures) matching is distance-only.
+    definition: the UNION rectangle of the before twin's quad and the after
+    span's quad (expanded 2px for antialias bleed) must render RAW-identical
+    between the before and after pages (ImageChops.difference(...).getbbox()
+    is None — same no-threshold standard as the identity check). The union
+    matters: comparing only the after quad would miss a shifted glyph whose
+    OLD ink lies entirely outside the new quad (a ~2pt shift of a narrow
+    glyph separates the two quads completely), letting a blank new glyph
+    masquerade as its inked twin. Any pixel difference cancels the match
+    and the span is treated as an edit product. Mis-cancelling is cheap: a
+    genuinely untouched char with ink still passes the downstream ink test
+    as an edit product, and blank (whitespace) chars are skipped by that
+    test anyway; whereas the dangerous case — a newly written BLANK glyph
+    near an inked twin's old position — always differs somewhere in the
+    union region and is forced through the ink test, where it fails. When
+    pixel_ctx is None (span-only fixtures) matching is distance-only.
 
     Returns (before_in, after_in, matched) where before_in / after_in are
     the in-bbox subsets (original span tuples, order kept) and matched maps
@@ -301,32 +305,38 @@ def match_untouched_neighbors(before_spans, after_spans, edit_bbox, tol=2.0, pix
 
     pixel_ok_cache = {}
 
-    def pixel_identical(i):
-        """Whether after_in[i]'s quad rendered identically before/after.
-        Depends only on the after span's quad, so cache per index."""
+    def pixel_identical(i, j):
+        """Whether the UNION of before_in[j]'s and after_in[i]'s quads
+        rendered identically across the two pages. The union (not just the
+        after quad) catches a shifted glyph whose old ink lies entirely
+        outside the new quad. Cached per (i, j) pair — the region depends
+        on both quads."""
         if pixel_ctx is None:
             return True
-        if i in pixel_ok_cache:
-            return pixel_ok_cache[i]
+        if (i, j) in pixel_ok_cache:
+            return pixel_ok_cache[(i, j)]
         before_img, after_img, page_box = pixel_ctx
         w, h = after_img.size
-        px0, py0, px1, py1 = bbox_to_pixels(after_in[i][2], page_box, pad=0)
+        ax0, ay0, ax1, ay1 = after_in[i][2]
+        bx0, by0, bx1, by1 = before_in[j][2]
+        union = (min(ax0, bx0), min(ay0, by0), max(ax1, bx1), max(ay1, by1))
+        px0, py0, px1, py1 = bbox_to_pixels(union, page_box, pad=2)  # 2px antialias slack
         px0, py0 = max(px0, 0), max(py0, 0)
         px1, py1 = min(px1, w), min(py1, h)
         if px1 <= px0 or py1 <= py0:
-            ok = False  # degenerate/offpage quad: nothing verifiable
+            ok = False  # degenerate/offpage region: nothing verifiable
         else:
             rect = (px0, py0, px1, py1)
             ok = ImageChops.difference(
                 before_img.crop(rect), after_img.crop(rect)).getbbox() is None
-        pixel_ok_cache[i] = ok
+        pixel_ok_cache[(i, j)] = ok
         return ok
 
     matched, used_before = {}, set()
     for _, i, j in candidates:
         if i in matched or j in used_before:
             continue
-        if not pixel_identical(i):
+        if not pixel_identical(i, j):
             continue  # renders differ: not an untouched neighbor
         matched[i] = j
         used_before.add(j)
@@ -379,11 +389,31 @@ def detect_font_substitution(before_spans, after_spans, edit_bbox, pixel_ctx=Non
     a real neighbor (the neighbor's before twin is already consumed by the
     neighbor itself).
 
+    THIS check matches DISTANCE-ONLY, deliberately ignoring pixel_ctx (the
+    tofu check uses the pixel-verified set; the two matching sets are
+    separate). A distance match already requires the before twin to share
+    the after span's base font, so the span's font provably did not change
+    — which is the only thing this check judges. Pixel differences inside
+    a neighbor's quad (italic overhang or antialias bleed from adjacent
+    NEW glyphs) are therefore not treated as substitution evidence; under
+    pixel-verified matching such a neighbor would be demoted to an edit
+    product and, when its char happens to be in covered_chars, falsely
+    flagged. Residual window of the split (correct width math this time):
+    a replacement char that the engine mis-paints in a NEIGHBOR's font AND
+    that lands within 2pt of a same-char span already in that font is
+    distance-matched and escapes this check — reachable, since narrow
+    glyph advances drop under 2pt at small sizes (Helvetica 'i' = 1.998pt
+    at 9pt). Accepted as defense-in-depth: engine-side glyph validation
+    (PR #7) refuses to write wrong glyphs, and the tofu check's
+    pixel-verified path still scrutinizes that span.
+
     Pure function over already-fetched mutool spans; returns
-    ("fail_font_substituted", detail) or (None, None).
+    ("fail_font_substituted", detail) or (None, None). pixel_ctx is
+    accepted for signature symmetry but intentionally unused.
     """
+    del pixel_ctx  # distance-only by design; see docstring
     before_in, after_in, matched = match_untouched_neighbors(
-        before_spans, after_spans, edit_bbox, pixel_ctx=pixel_ctx)
+        before_spans, after_spans, edit_bbox)
     if not before_in:
         return None, None
 
