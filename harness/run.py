@@ -391,32 +391,38 @@ def build_territory(before_spans, after_spans, pre_edit_bbox, new_text):
             out.append(cur)
         return out, False
 
-    # RIGHT BOUNDARY from pre-edit right neighbors, decided by
-    # PER-CANDIDATE PREFIX ALIGNMENT (round 15): a global alignment run
-    # before the boundary is chosen can BORROW the true suffix when a
-    # product character is missing from stext (intended products ABCB,
-    # right neighbor C, mutool drops the second product char -> band
-    # ACBC: the global alignment claims indices 0,2,3, stealing the true
-    # suffix at 3, so the true boundary candidate looked
-    # product-claimed and the impostor at 1 survived). The boundary
-    # hypothesis therefore comes FIRST and the alignment is constrained
-    # by it:
-    #   1. rigid-shift candidates as before (ordered before-side right
-    #      neighbors re-found in the after band, one rigid delta_x);
-    #   2. for each candidate, new_text is aligned ONLY against the band
-    #      prefix left of the candidate; the candidate is valid when
-    #      that prefix alignment anchors at the pre-edit x0 AND its
-    #      equal coverage is not below the global alignment's;
-    #   3. the boundary is the RIGHTMOST valid candidate and its prefix
-    #      alignment IS the product sequence (missing judgement runs on
-    #      it — in the example, C at index 1 aligns as a product and the
-    #      dropped B is correctly reported missing);
-    #   4. no valid candidate while before right neighbors exist ->
-    #      abstain (right_boundary_lost); a second valid candidate
-    #      starting beyond the expected product extent -> abstain
-    #      (right_boundary_ambiguous).
-    # End-of-line edits (no before right neighbors) use the plain global
-    # alignment as before.
+    # RIGHT BOUNDARY decision (round 16). Ordering and semantics:
+    #
+    # 0. PERFORMANCE CAPS: a band over 512 spans abstains outright
+    #    (band_too_large) — every alignment is O(len(new_text) x band),
+    #    and at most K=8 boundary candidates are ever evaluated, so the
+    #    total work is bounded by O(K x 512 x len(new_text)).
+    # 1. EMPTY/UNANCHORED PRODUCTS FIRST (round-16 regression fix): if
+    #    the global alignment finds nothing, or nothing at the pre-edit
+    #    x0, there are no anchorable products — the caller reports
+    #    missing (with a confirmed before target) BEFORE any boundary
+    #    reasoning; a vanished edit output must never degrade into a
+    #    boundary abstention.
+    # 2. CANDIDATE PLAUSIBILITY: a rigid right-neighbor match is only a
+    #    candidate if its uniform delta_x is physically plausible — the
+    #    suffix shift equals the width change of the rewritten segment,
+    #    so |delta| must not exceed |est_new_width - old_width| plus
+    #    max(2pt, 30% of old_width) slack (est_new_width =
+    #    len(new_text) x median char width). This is a monotone physical
+    #    bound, not a scoring heuristic: it rejects impostor candidates
+    #    sitting deep inside the product territory (their implied shift
+    #    is the full width of the territory).
+    # 3. VALIDITY = per-candidate prefix alignment anchored at the
+    #    pre-edit x0 (round 15; the coverage comparison is retired per
+    #    round-16 review — non-monotone scoring is out).
+    # 4. Candidates are evaluated RIGHTMOST-FIRST, at most K=8. A unique
+    #    valid candidate (or several sharing one product hypothesis)
+    #    decides the boundary; two or more valid candidates with
+    #    DIFFERENT product hypotheses mean repeated text has made the
+    #    product/suffix split inherently undecidable -> abstain
+    #    (right_boundary_ambiguous). No valid candidate: abstain
+    #    (right_boundary_ambiguous if unevaluated candidates remained
+    #    beyond K, else right_boundary_lost).
     before_rn_seq = sorted(
         (s for s in before_band if s[2][0] >= x1 - 0.5),
         key=lambda s: (s[2][0] + s[2][2]) / 2)
@@ -425,103 +431,93 @@ def build_territory(before_spans, after_spans, pre_edit_bbox, new_text):
                if not s[0].isspace() and s[2][2] > s[2][0]]
     med_w = sorted(_widths)[len(_widths) // 2] if _widths else 0.0
 
+    if len(after_band) > 512:
+        return (orig_font_raw, before_core, [], [], False, "band_too_large")
+
     band_str = "".join(c for c, _, _ in after_band)
 
     def _align(text, upto=None):
         """difflib-align `text` against the band prefix of length `upto`
-        (whole band when None). Returns (first, last, coverage): first/
-        last aligned band indices and the total equal-char count."""
+        (whole band when None). Returns (first, last): first/last aligned
+        band indices (None/-1 when nothing aligns)."""
         seg = band_str if upto is None else band_str[:upto]
         smx = difflib.SequenceMatcher(a=text, b=seg, autojunk=False)
-        f, l, cov = None, -1, 0
+        f, l = None, -1
         for tag, _a0, _a1, b0, b1 in smx.get_opcodes():
             if tag == "equal":
                 if f is None:
                     f = b0
                 l = max(l, b1 - 1)
-                cov += b1 - b0
-        return f, l, cov
-
-    g_first = None
-    g_last = -1
-    g_cov = 0
-    if new_text:
-        g_first, g_last, g_cov = _align(new_text)
-
-    rigid_cands = []
-    if before_rn_seq:
-        n = len(before_rn_seq)
-        for i in range(len(after_band) - n + 1):
-            deltas = []
-            ok = True
-            for j, (bc, bf, bbox_) in enumerate(before_rn_seq):
-                ac, af, abox = after_band[i + j]
-                if ac != bc or af != bf:
-                    ok = False
-                    break
-                deltas.append(abox[0] - bbox_[0])
-            if ok and max(deltas) - min(deltas) <= 0.5:
-                rigid_cands.append(i)
+        return f, l
 
     anchor_failed = False
     ambiguous_reason = None
-    first_rn = None
+    product_seq = []
     chosen = None  # (first, last) of the selected candidate's prefix alignment
-    if before_rn_seq:
-        if new_text:
+
+    if new_text:
+        g_first, g_last = _align(new_text)
+        if g_first is None:
+            product_seq = []  # nothing of the edit output found: missing path
+        elif abs(after_band[g_first][2][0] - x0) > BAND_PAD:
+            product_seq = []
+            anchor_failed = True  # nothing anchored at x0: missing path
+        elif before_rn_seq:
+            n = len(before_rn_seq)
+            cands = []  # (i, mean_delta)
+            for i in range(len(after_band) - n + 1):
+                deltas = []
+                ok = True
+                for j, (bc, bf, bbox_) in enumerate(before_rn_seq):
+                    ac, af, abox = after_band[i + j]
+                    if ac != bc or af != bf:
+                        ok = False
+                        break
+                    deltas.append(abox[0] - bbox_[0])
+                if ok and max(deltas) - min(deltas) <= 0.5:
+                    cands.append((i, sum(deltas) / len(deltas)))
+            old_w = x1 - x0
+            est_new_w = len(new_text) * med_w
+            shift_bound = max(2.0, 0.3 * old_w) + abs(est_new_w - old_w)
+            plausible = sorted(
+                (i for i, d in cands if abs(d) <= shift_bound), reverse=True)
+            K = 8
+            evaluated = plausible[:K]
             valid = []
-            for i in rigid_cands:
-                pf, pl, pcov = _align(new_text, upto=i)
+            for i in evaluated:
+                pf, pl = _align(new_text, upto=i)
                 if pf is None:
                     continue
                 if abs(after_band[pf][2][0] - x0) > BAND_PAD:
-                    continue  # prefix alignment not anchored at the target
-                if pcov < g_cov:
-                    continue  # alignment quality below the global level
+                    continue
                 valid.append((i, pf, pl))
-            if not valid:
-                ambiguous_reason = "right_boundary_lost"
-            else:
+            hyps = {(pf, pl) for _i, pf, pl in valid}
+            if len(hyps) == 1:
                 i_sel, pf_sel, pl_sel = max(valid, key=lambda t: t[0])
-                expected_right = x0 + 1.3 * len(new_text) * med_w + 2.0
-                for i, _pf, _pl in valid:
-                    if i != i_sel and after_band[i][2][0] > expected_right:
-                        ambiguous_reason = "right_boundary_ambiguous"
-                        break
-                if ambiguous_reason is None:
-                    first_rn = i_sel
-                    chosen = (pf_sel, pl_sel)
-        else:
-            if not rigid_cands:
-                ambiguous_reason = "right_boundary_lost"
+                chosen = (pf_sel, pl_sel)
+            elif len(hyps) >= 2:
+                ambiguous_reason = "right_boundary_ambiguous"
+            elif len(plausible) > K:
+                ambiguous_reason = "right_boundary_ambiguous"
             else:
-                first_rn = max(rigid_cands)
+                ambiguous_reason = "right_boundary_lost"
+        # else: anchored, no right neighbors -> plain global products below
 
-    if ambiguous_reason:
-        product_seq = []
-    elif new_text:
-        if chosen is not None:
+        if ambiguous_reason:
+            product_seq = []
+        elif chosen is not None:
             _pf, pl = chosen
             product_seq, gap_amb = truncate_continuous(after_band[: pl + 1])
             if gap_amb:
                 product_seq = []
                 ambiguous_reason = "gap_ambiguous"
-        elif g_first is None:
-            product_seq = []
-        elif abs(after_band[g_first][2][0] - x0) > BAND_PAD:
-            # LEFT ANCHOR (no right neighbors): the first aligned span
-            # must sit at the target's left edge or no product identity
-            # exists — the caller reports missing or abstains, never
-            # extends rightward.
-            product_seq = []
-            anchor_failed = True
-        else:
+        elif g_first is not None and not anchor_failed:
             product_seq, gap_amb = truncate_continuous(after_band[: g_last + 1])
             if gap_amb:
                 product_seq = []
                 ambiguous_reason = "gap_ambiguous"
     else:
-        product_seq = after_band if first_rn is None else after_band[:first_rn]
+        product_seq = after_band
         if product_seq and abs(product_seq[0][2][0] - x0) > BAND_PAD:
             product_seq = []
             anchor_failed = True
