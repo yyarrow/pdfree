@@ -325,10 +325,12 @@ def build_territory(before_spans, after_spans, pre_edit_bbox, new_text):
       legitimate borrowed-font product (engine used another document
       font for a glyph the target font lacks) and stays in the sequence.
 
-    Returns (orig_font_raw, before_core, product_seq, overlapping) where
-    orig_font_raw is None when the before core is empty, product_seq is
-    the bounded x-ordered after-span list, and overlapping is a list of
-    {char, font} dicts (non-empty => abstain).
+    Returns (orig_font_raw, before_core, product_seq, overlapping,
+    anchor_failed) where orig_font_raw is None when the before core is
+    empty, product_seq is the bounded x-ordered after-span list,
+    overlapping is a list of {char, font} dicts (non-empty => abstain),
+    and anchor_failed reports that aligned spans exist in the band but
+    none at the target's left edge (product identity not establishable).
     """
     x0, y0, x1, y1 = pre_edit_bbox
     before_core = [s for s in before_spans if _center_in(s[2], pre_edit_bbox)]
@@ -344,16 +346,36 @@ def build_territory(before_spans, after_spans, pre_edit_bbox, new_text):
         key=lambda s: (s[2][0] + s[2][2]) / 2)
     before_band = [s for s in before_spans if in_band(s[2])]
 
+    anchor_failed = False
     if new_text:
         band_str = "".join(c for c, _, _ in after_band)
         sm = difflib.SequenceMatcher(a=new_text, b=band_str, autojunk=False)
-        last = -1
+        first, last = None, -1
         for tag, _a0, _a1, b0, b1 in sm.get_opcodes():
             if tag == "equal":
+                if first is None:
+                    first = b0
                 last = max(last, b1 - 1)
-        product_seq = after_band[: last + 1] if last >= 0 else []
+        # LEFT ANCHOR: the band has no right edge, so alignment alone can
+        # lock onto an unrelated same-font run further right on the line
+        # (e.g. when the edited segment vanished entirely and that run
+        # happens to contain new_text) and silently vouch for the edit.
+        # The first aligned span must sit at the target's own left edge
+        # (pre-edit x0, same 2pt tolerance as the band itself); otherwise
+        # no product sequence is established at all — the caller reports
+        # the output missing or abstains, but never extends rightward.
+        if first is None:
+            product_seq = []
+        elif abs(after_band[first][2][0] - x0) > BAND_PAD:
+            product_seq = []
+            anchor_failed = True
+        else:
+            product_seq = after_band[: last + 1]
     else:
         product_seq = after_band
+        if product_seq and abs(product_seq[0][2][0] - x0) > BAND_PAD:
+            product_seq = []
+            anchor_failed = True
 
     overlapping = []
     for c, f, box in product_seq:
@@ -366,7 +388,7 @@ def build_territory(before_spans, after_spans, pre_edit_bbox, new_text):
             for bc, bf, bbox_ in before_band)
         if preexisting:
             overlapping.append({"char": c, "font": f})
-    return orig_font_raw, before_core, product_seq, overlapping
+    return orig_font_raw, before_core, product_seq, overlapping, anchor_failed
 
 
 def detect_font_substitution(before_spans, after_spans, edit_bbox,
@@ -391,7 +413,7 @@ def detect_font_substitution(before_spans, after_spans, edit_bbox,
     (None, None).
     """
     anchor = pre_edit_bbox if pre_edit_bbox is not None else edit_bbox
-    orig_font_raw, _before_core, product_seq, overlapping = build_territory(
+    orig_font_raw, _before_core, product_seq, overlapping, _anchor_failed = build_territory(
         before_spans, after_spans, anchor, new_text)
     if orig_font_raw is None:
         return None, None
@@ -429,18 +451,28 @@ def _center_in(box, bbox):
 def _masked_span(img, rect, punch_rects, glyph_pad=2, also_punch=None, protect_rect=None):
     """Luminance extrema span of img inside `rect` with every rect in
     punch_rects (padded glyph_pad px for antialias bleed) masked out;
-    also_punch (unpadded) is removed too when given. protect_rect
-    (unpadded) is re-included AFTER all punching — the glyph under test's
-    own core territory, which adjacent glyphs' padded punches must not
-    swallow (a narrow glyph a few px wide would otherwise lose its entire
-    quad to its neighbors' pads and read as blank). Returns hi-lo, or
-    None when no pixels survive the masking."""
+    also_punch (unpadded) is removed too when given.
+
+    protect_rect (unpadded) is the glyph-under-test's own core territory,
+    re-included AFTER the padded punching — adjacent glyphs' pads must not
+    swallow it wholesale (a narrow glyph a few px wide would otherwise
+    lose its entire quad to its neighbors' pads and read as blank). But
+    the protection is NOT a blanket re-light: pixels covered by another
+    glyph's UNPADDED quad belong to that glyph, not this one, and are
+    subtracted again — otherwise a foreign glyph overlapping the core
+    would have its ink resurrected and vouch for a blank glyph under it.
+
+    Returns (span, core_live, core_area): span is hi-lo of the surviving
+    pixels (None when nothing survives), core_live/core_area are the
+    surviving vs total pixel counts of protect_rect (both 0 when no
+    protect_rect) so callers can refuse to judge on a sliver of
+    attributable pixels."""
     w, h = img.size
     rx0, ry0, rx1, ry1 = rect
     rx0, ry0 = max(rx0, 0), max(ry0, 0)
     rx1, ry1 = min(rx1, w), min(ry1, h)
     if rx1 <= rx0 or ry1 <= ry0:
-        return None
+        return None, 0, 0
     crop = img.crop((rx0, ry0, rx1, ry1))
     mask = Image.new("L", crop.size, 255)
     draw = ImageDraw.Draw(mask)
@@ -458,14 +490,30 @@ def _masked_span(img, rect, punch_rects, glyph_pad=2, also_punch=None, protect_r
         paint(ax0, ay0, ax1, ay1, 0)
     for gx0, gy0, gx1, gy1 in punch_rects:
         paint(gx0 - glyph_pad, gy0 - glyph_pad, gx1 + glyph_pad, gy1 + glyph_pad, 0)
+
+    core_live = core_area = 0
     if protect_rect is not None:
         px0, py0, px1, py1 = protect_rect
         paint(px0, py0, px1, py1, 255)
+        # Foreign glyphs' own territory is not attributable to this glyph
+        # — subtract it back out of the protected core, with 1px of bleed
+        # slack (glyph ink antialiases to/just past its quad boundary; the
+        # full glyph_pad would re-starve narrow glyphs, which is what the
+        # protection exists to prevent).
+        for gx0, gy0, gx1, gy1 in punch_rects:
+            paint(gx0 - 1, gy0 - 1, gx1 + 1, gy1 + 1, 0)
+        cx0, cy0 = max(px0, rx0), max(py0, ry0)
+        cx1, cy1 = min(px1, rx1), min(py1, ry1)
+        if cx1 > cx0 and cy1 > cy0:
+            core_area = (cx1 - cx0) * (cy1 - cy0)
+            core_mask = mask.crop((cx0 - rx0, cy0 - ry0, cx1 - rx0, cy1 - ry0))
+            core_live = core_mask.histogram()[255]
+
     hist = crop.histogram(mask)
     live = [v for v, n in enumerate(hist[:256]) if n]
     if not live:
-        return None
-    return live[-1] - live[0]
+        return None, core_live, core_area
+    return live[-1] - live[0], core_live, core_area
 
 
 def _ring_contrast(img, quad_rect, glyph_rects, expand=3):
@@ -481,7 +529,8 @@ def _ring_contrast(img, quad_rect, glyph_rects, expand=3):
     """
     qx0, qy0, qx1, qy1 = quad_rect
     ring_rect = (qx0 - expand, qy0 - expand, qx1 + expand, qy1 + expand)
-    return _masked_span(img, ring_rect, glyph_rects, also_punch=quad_rect)
+    span, _live, _area = _masked_span(img, ring_rect, glyph_rects, also_punch=quad_rect)
+    return span
 
 
 def detect_glyph_tofu(after_img, page_box, before_spans, after_spans, edit_bbox, repl,
@@ -540,7 +589,7 @@ def detect_glyph_tofu(after_img, page_box, before_spans, after_spans, edit_bbox,
     anchor = pre_edit_bbox if pre_edit_bbox is not None else edit_bbox
     if new_text is None:
         new_text = repl
-    orig_font_raw, before_core, product_seq, overlapping = build_territory(
+    orig_font_raw, before_core, product_seq, overlapping, anchor_failed = build_territory(
         before_spans, after_spans, anchor, new_text)
     visible_repl = [ch for ch in repl if not ch.isspace()]
 
@@ -594,8 +643,10 @@ def detect_glyph_tofu(after_img, page_box, before_spans, after_spans, edit_bbox,
         if before_img is not None:
             if ImageChops.difference(
                     before_img.crop(rect), after_img.crop(rect)).getbbox() is None:
-                mc = _masked_span(after_img, rect, others, protect_rect=own_rect)
-                if mc is not None and mc >= 96:
+                mc, core_live, core_area = _masked_span(
+                    after_img, rect, others, protect_rect=own_rect)
+                if (mc is not None and mc >= 96
+                        and core_area > 0 and core_live >= max(4, 0.3 * core_area)):
                     continue  # unchanged in-place char, visibly inked
         ring = _ring_contrast(after_img, rect, glyph_rects)
         if ring is None or ring >= 96:
@@ -604,7 +655,17 @@ def detect_glyph_tofu(after_img, page_box, before_spans, after_spans, edit_bbox,
             # way — abstain on this char rather than guess.
             unknown.append(ch)
             continue
-        span_contrast = _masked_span(after_img, rect, others, protect_rect=own_rect)
+        span_contrast, core_live, core_area = _masked_span(
+            after_img, rect, others, protect_rect=own_rect)
+        if core_area > 0 and core_live < max(4, 0.3 * core_area):
+            # The glyph's own core exists but almost none of it remains
+            # attributable to THIS glyph (a foreign quad covers it):
+            # nothing judgeable — abstain rather than let the foreign ink
+            # vouch either way. (core_area == 0 is different: a BLANK
+            # glyph gets a degenerate zero-height quad from mutool, so
+            # the padded rect judged below is exactly what catches it.)
+            unknown.append(ch)
+            continue
         if span_contrast is None:
             # Fully masked by neighbors: nothing attributable — abstain.
             unknown.append(ch)
