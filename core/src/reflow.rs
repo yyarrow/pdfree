@@ -456,7 +456,17 @@ fn plan_new_run(
                 continue;
             }
             let Some(bytes) = font.encode(doc, new_text) else { continue };
-            if !font.cid && !bytes.iter().all(|&b| font.glyph_available(b)) {
+            // Same byte↔char alignment rule as replace_seg_internal: one
+            // byte per char for simple fonts, `None` (conservative) when a
+            // ligature-style mapping breaks the correspondence.
+            let chars: Vec<char> = new_text.chars().collect();
+            let aligned = bytes.len() == chars.len();
+            if !font.cid
+                && !bytes
+                    .iter()
+                    .enumerate()
+                    .all(|(i, &b)| font.glyph_available(doc, b, aligned.then(|| chars[i])))
+            {
                 continue;
             }
             let adv = font.advance(&bytes, new_text.chars().count());

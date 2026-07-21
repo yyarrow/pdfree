@@ -152,6 +152,108 @@ pub struct FontInfo<'a> {
     /// Type3 only: vertical extent from /FontBBox mapped through FontMatrix,
     /// per unit of font size (ascent above baseline, descent below).
     pub t3_vertical: Option<(f32, f32)>,
+    /// Lazily resolved embedded TrueType program (/FontDescriptor
+    /// /FontFile2). `None` until first consulted; `Some(None)` when absent
+    /// or unparseable (CFF, corrupt). Resolution goes through a small
+    /// thread-local cache keyed by a stream fingerprint, so a fragmented
+    /// run edit that rebuilds FontInfo per segment re-parses a
+    /// multi-megabyte font once, not once per segment.
+    embedded: std::cell::OnceCell<Option<std::rc::Rc<crate::ttf::TtfFont>>>,
+    /// FontDescriptor /Flags says Symbolic (bit 3 set, bit 6 Nonsymbolic
+    /// clear): such fonts resolve codes through their OWN byte-keyed cmap
+    /// (ISO 32000 9.6.6.4), not through unicode.
+    symbolic: bool,
+    /// Whether the font dict carries an /Encoding entry at all. Per ISO
+    /// 32000 9.6.6.4 a TrueType font with NO /Encoding resolves codes
+    /// through its built-in (3,0)/(1,0) cmap exactly like the symbolic
+    /// case, regardless of the Symbolic flag.
+    has_encoding: bool,
+}
+
+/// Embedded font-program parse results, cached per thread (engine and WASM
+/// are single-threaded) across FontInfo lifetimes. Tiny LRU: real documents
+/// use a handful of embedded fonts per page; the win is not re-decompressing
+/// a 10MB CJK font for every segment of one fragmented run edit.
+///
+/// Identity is exact, never sampled: an entry stores a copy of the RAW
+/// (still compressed) stream PLUS its decode configuration (/Filter,
+/// /DecodeParms — the same payload under different filters decodes to
+/// different programs), and a first hit requires byte equality with both.
+/// The sampled fingerprint is only a fast-reject filter. FAILED parses are
+/// cached too (value None): a corrupt or unsupported font must not
+/// re-decompress per segment either. Memory is bounded by the cap.
+///
+/// The full memcmp is then amortized to ONCE per font per edit operation:
+/// a verified entry records (buffer ptr, len, epoch); public edit entry
+/// points bump the epoch (`bump_ttf_cache_epoch`), and within one epoch
+/// the probing stream's buffer identity is proof enough — the document is
+/// borrowed for the whole edit, so the same allocation can't have changed
+/// bytes. A new epoch (or a different document) re-verifies with one full
+/// memcmp. This is exact: the O(1) shortcut never crosses an edit
+/// boundary, so allocator address reuse can't alias two fonts.
+const TTF_CACHE_CAP: usize = 4;
+struct TtfCacheEntry {
+    fingerprint: u64,
+    /// Serialized /Filter + /DecodeParms of the cached stream.
+    decode_cfg: String,
+    raw: std::rc::Rc<Vec<u8>>,
+    parsed: Option<std::rc::Rc<crate::ttf::TtfFont>>,
+    /// (buffer ptr, len, epoch) of the last full-verified probe.
+    verified: std::cell::Cell<(usize, usize, u64)>,
+}
+thread_local! {
+    static TTF_CACHE: std::cell::RefCell<Vec<TtfCacheEntry>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+    static TTF_CACHE_EPOCH: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static TTF_CACHE_OP_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// RAII scope marking one edit operation for the embedded-font cache. The
+/// pointer-identity shortcut is only honored while a guard is alive
+/// (depth > 0): within the guarded scope the document is borrowed for the
+/// whole edit, so equal buffer identity proves equal bytes. Probes outside
+/// any guard — load_fonts/glyph_available are public and free to be called
+/// standalone — always pay the full byte comparison, so allocator address
+/// reuse across dropped documents can never alias two fonts. Both
+/// construction and drop advance the epoch, killing shortcuts minted by
+/// neighboring operations in either direction.
+pub(crate) struct TtfCacheOpGuard(());
+
+impl TtfCacheOpGuard {
+    pub(crate) fn new() -> Self {
+        TTF_CACHE_EPOCH.with(|e| e.set(e.get().wrapping_add(1)));
+        TTF_CACHE_OP_DEPTH.with(|d| d.set(d.get() + 1));
+        TtfCacheOpGuard(())
+    }
+}
+
+impl Drop for TtfCacheOpGuard {
+    fn drop(&mut self) {
+        TTF_CACHE_OP_DEPTH.with(|d| d.set(d.get().saturating_sub(1)));
+        TTF_CACHE_EPOCH.with(|e| e.set(e.get().wrapping_add(1)));
+    }
+}
+
+/// Cheap fingerprint of a raw stream (length + first/last 1KB hashed) used
+/// as the cache's fast-reject filter. Probing stays O(1) for multi-megabyte
+/// font programs; equality is confirmed exactly on a filter hit.
+fn stream_fingerprint(raw: &[u8]) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    raw.len().hash(&mut h);
+    raw[..raw.len().min(1024)].hash(&mut h);
+    raw[raw.len().saturating_sub(1024)..].hash(&mut h);
+    h.finish()
+}
+
+/// The decode configuration that, together with the raw payload, fully
+/// determines `decompressed_content()`'s output.
+fn stream_decode_cfg(stream: &lopdf::Stream) -> String {
+    format!(
+        "{:?}|{:?}",
+        stream.dict.get(b"Filter").ok(),
+        stream.dict.get(b"DecodeParms").ok()
+    )
 }
 
 /// Map a BaseFont name (possibly subset-prefixed or an Arial/TimesNewRoman
@@ -219,9 +321,74 @@ impl<'a> FontInfo<'a> {
         total
     }
 
-    /// Whether byte code `b` maps to a glyph this font can actually render.
-    /// Conservative: no verifiable metrics means we can't guarantee it.
-    pub fn glyph_available(&self, b: u8) -> bool {
+    /// The embedded TrueType program, parsed on first use and shared via
+    /// the thread-local cache. Only fonts whose /FontDescriptor carries
+    /// /FontFile2 qualify; `TtfFont::parse` rejects CFF ('OTTO') data and
+    /// fonts with no usable cmap subtable of either kind.
+    fn embedded_ttf(&self, doc: &Document) -> Option<&crate::ttf::TtfFont> {
+        self.embedded
+            .get_or_init(|| {
+                let stream = (|| {
+                    let fd = doc.dereference(self.dict.get(b"FontDescriptor").ok()?).ok()?.1.as_dict().ok()?;
+                    doc.dereference(fd.get(b"FontFile2").ok()?).ok()?.1.as_stream().ok()
+                })()?;
+                let key = stream_fingerprint(&stream.content);
+                let cfg = stream_decode_cfg(stream);
+                let ident = (stream.content.as_ptr() as usize, stream.content.len());
+                let epoch = TTF_CACHE_EPOCH.with(std::cell::Cell::get);
+                let guarded = TTF_CACHE_OP_DEPTH.with(std::cell::Cell::get) > 0;
+                TTF_CACHE.with(|cache| {
+                    let mut cache = cache.borrow_mut();
+                    let pos = cache.iter().position(|e| {
+                        e.fingerprint == key
+                            && e.decode_cfg == cfg
+                            && ((guarded && e.verified.get() == (ident.0, ident.1, epoch))
+                                || e.raw.as_slice() == stream.content)
+                    });
+                    if let Some(pos) = pos {
+                        let hit = cache.remove(pos);
+                        hit.verified.set((ident.0, ident.1, epoch));
+                        let parsed = hit.parsed.clone();
+                        cache.push(hit); // move to most-recent slot
+                        return parsed;
+                    }
+                    // Miss: parse (or fail) ONCE and remember either way.
+                    let parsed = stream
+                        .decompressed_content()
+                        .ok()
+                        .and_then(crate::ttf::TtfFont::parse)
+                        .map(std::rc::Rc::new);
+                    if cache.len() >= TTF_CACHE_CAP {
+                        cache.remove(0);
+                    }
+                    cache.push(TtfCacheEntry {
+                        fingerprint: key,
+                        decode_cfg: cfg,
+                        raw: std::rc::Rc::new(stream.content.clone()),
+                        parsed: parsed.clone(),
+                        verified: std::cell::Cell::new((ident.0, ident.1, epoch)),
+                    });
+                    parsed
+                })
+            })
+            .as_deref()
+    }
+
+    /// Whether byte code `b` (decoding to `c` when the caller can align
+    /// bytes to characters) maps to a glyph this font can actually render.
+    ///
+    /// The embedded font program is the ground truth when present: a
+    /// shard-subsetting generator (reportlab et al.) writes /Widths for whole
+    /// 256-code shards including codes whose glyphs were never embedded, so a
+    /// positive width certifies nothing and trusting it writes invisible
+    /// tofu. Fonts without a parseable unicode-cmap'd FontFile2 (unembedded,
+    /// CFF, symbol) keep the width heuristics below — for them the embedded
+    /// check can neither confirm nor deny.
+    ///
+    /// Conservative both ways: no verifiable evidence means we can't
+    /// guarantee the glyph, and refusing (the caller falls back or errors)
+    /// beats silently emitting a blank character.
+    pub fn glyph_available(&self, doc: &Document, b: u8, c: Option<char>) -> bool {
         if self.type3 {
             // A Type3 glyph exists iff its code maps to a name that has an
             // actual drawing procedure (width may legitimately be anything).
@@ -229,6 +396,47 @@ impl<'a> FontInfo<'a> {
                 (Some(diffs), Some(procs)) => diffs.get(&b).is_some_and(|name| procs.contains(name)),
                 _ => false,
             };
+        }
+        if let Some(ttf) = self.embedded_ttf(doc) {
+            // Pick the lookup a renderer would actually use (ISO 32000
+            // 9.6.6.4) instead of OR-ing both: on a nonsymbolic dual-cmap
+            // font the byte and unicode keyings disagree outside ASCII
+            // (WinAnsi 0x80 is '€' while Mac (1,0) 0x80 is 'Ä'), so a
+            // byte-keyed hit does NOT prove the encoding's character will
+            // paint — approving it would emit the wrong glyph or tofu.
+            //
+            // - Symbolic fonts resolve codes through their own byte-keyed
+            //   cmap; unicode is only a last resort when they lack one.
+            // - Nonsymbolic fonts with a unicode subtable go through the
+            //   encoding's character value; alignment lost means we can't
+            //   look it up — refuse (the widths of an embedded font are
+            //   exactly the evidence that lies).
+            // - A byte-only table on a nonsymbolic font is the
+            //   reportlab-shard shape: the generator wrote encoding and
+            //   cmap together, the byte IS the font-internal code.
+            let ws = c.is_some_and(char::is_whitespace);
+            // Byte-keyed resolution applies when the Symbolic flag is set
+            // OR the font dict has no /Encoding at all — ISO 32000 9.6.6.4
+            // names both conditions; painting then goes through the
+            // built-in (3,0)/(1,0) cmap with the string byte. (ToUnicode
+            // still defines what the byte MEANS; the generator that wrote
+            // both tables is responsible for their consistency, so a real
+            // glyph at the byte is the correct renderability verdict.)
+            if self.symbolic || !self.has_encoding {
+                if let Some(v) = ttf.can_render_code(b, ws) {
+                    return v;
+                }
+                // No byte-keyed table to consult: fall back to the unicode
+                // verdict rather than refusing outright — viewers are
+                // lenient here and treat unicode-only fonts' codes as
+                // characters, so a hard refusal would push perfectly
+                // renderable text into the rescue/fallback path.
+                return c.map(|c| ttf.can_render_char(c)).unwrap_or(false);
+            }
+            if ttf.has_unicode_cmap() {
+                return c.map(|c| ttf.can_render_char(c)).unwrap_or(false);
+            }
+            return ttf.can_render_code(b, ws).unwrap_or(false);
         }
         if let Some((first, ws)) = &self.widths {
             let idx = b as i64 - first;
@@ -476,6 +684,16 @@ fn build_font_info<'a>(doc: &'a Document, dict: &'a Dictionary) -> FontInfo<'a> 
             Some(mw * if type3 { width_scale } else { 1.0 })
         })()
         .unwrap_or(500.0);
+        // /Flags bit 3 (value 4) Symbolic, bit 6 (value 32) Nonsymbolic
+        // (ISO 32000 9.8.2). Both set is contradictory; trust Nonsymbolic
+        // then, since the unicode path is the safer verifier.
+        let symbolic = (|| {
+            let fd = doc.dereference(dict.get(b"FontDescriptor").ok()?).ok()?.1.as_dict().ok()?;
+            let flags = doc.dereference(fd.get(b"Flags").ok()?).ok()?.1.as_i64().ok()?;
+            Some(flags & 4 != 0 && flags & 32 == 0)
+        })()
+        .unwrap_or(false);
+        let has_encoding = dict.has(b"Encoding");
         FontInfo {
             dict,
             cid,
@@ -488,6 +706,9 @@ fn build_font_info<'a>(doc: &'a Document, dict: &'a Dictionary) -> FontInfo<'a> 
             tounicode,
             default_width,
             t3_vertical,
+            embedded: std::cell::OnceCell::new(),
+            symbolic,
+            has_encoding,
         }
     }
 }
@@ -784,4 +1005,330 @@ fn show_string(
     }
 
     *tm = Mat::translate(width_text_space, 0.0).mul(tm);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use lopdf::{dictionary, Object, Stream};
+
+    /// Strict pyftsubset of the bundled Noto Sans SC covering exactly
+    /// " ()Ian元桓" (regenerate: `pyftsubset assets/NotoSansSC.ttf
+    /// --text="元桓 (Ian)" --output-file=...`). OFL-licensed derivative of
+    /// the font this repo already ships. Notably it has NO glyph for 'd' —
+    /// the tofu-repro character used throughout these tests.
+    const SUBSET_TTF: &[u8] = include_bytes!("testdata/noto_sc_subset_ian.ttf");
+
+    /// The same subset with its unicode cmap REPLACED by a (1,0) Mac
+    /// format-6 table keyed by the ASCII bytes — the exact shape
+    /// reportlab-style subsetters embed (they carry no unicode subtable at
+    /// all, so coverage must be provable per byte code).
+    const SUBSET_TTF_MAC: &[u8] = include_bytes!("testdata/noto_sc_subset_ian_mac_cmap.ttf");
+
+    /// The subset with BOTH a unicode cmap and a (1,0) Mac table whose byte
+    /// 0x80 maps to a real glyph (元's). On a nonsymbolic WinAnsi font, byte
+    /// 0x80 means '€' — absent from the unicode table — so a byte-keyed hit
+    /// must NOT authorize the code (crbot #7 round-1 finding 2).
+    const SUBSET_TTF_DUAL: &[u8] = include_bytes!("testdata/noto_sc_subset_dual_cmap.ttf");
+
+    /// A simple TrueType font dict whose /Widths LIE the way shard-based
+    /// subsetting generators do: every code in 32..=122 gets a positive
+    /// width, including 'd' (0x64) whose glyph is absent from the program.
+    fn font_dict_id_with(doc: &mut Document, fontfile: Option<&[u8]>) -> lopdf::ObjectId {
+        let mut font = dictionary! {
+            "Type" => "Font",
+            "Subtype" => "TrueType",
+            "BaseFont" => "AAAAAA+NotoSansSC-Thin",
+            "FirstChar" => 32,
+            "Widths" => (32..=122).map(|_| 500.into()).collect::<Vec<Object>>(),
+            "Encoding" => "WinAnsiEncoding",
+        };
+        if let Some(bytes) = fontfile {
+            let ff = doc.add_object(Stream::new(dictionary! {}, bytes.to_vec()));
+            let fd = doc.add_object(dictionary! {
+                "Type" => "FontDescriptor",
+                "FontName" => "AAAAAA+NotoSansSC-Thin",
+                "Flags" => 32,
+                "FontFile2" => Object::Reference(ff),
+            });
+            font.set("FontDescriptor", Object::Reference(fd));
+        }
+        doc.add_object(font)
+    }
+
+    fn font_dict_id(doc: &mut Document, with_fontfile: bool) -> lopdf::ObjectId {
+        font_dict_id_with(doc, with_fontfile.then_some(SUBSET_TTF))
+    }
+
+    fn font_info(doc: &Document, id: lopdf::ObjectId) -> FontInfo<'_> {
+        build_font_info(doc, doc.get_dictionary(id).unwrap())
+    }
+
+    #[test]
+    fn embedded_program_overrides_lying_widths() {
+        let mut doc = Document::with_version("1.7");
+        let id = font_dict_id(&mut doc, true);
+        let f = font_info(&doc, id);
+        // 'd' has a positive /Widths entry but no glyph in the program:
+        // trusting widths here is exactly the silent-tofu bug.
+        assert!(!f.glyph_available(&doc, b'd', Some('d')));
+        // Characters the subset really covers pass.
+        assert!(f.glyph_available(&doc, b'I', Some('I')));
+        assert!(f.glyph_available(&doc, b'a', Some('a')));
+        assert!(f.glyph_available(&doc, b'n', Some('n')));
+    }
+
+    #[test]
+    fn whitespace_with_empty_outline_is_renderable() {
+        let mut doc = Document::with_version("1.7");
+        let id = font_dict_id(&mut doc, true);
+        let f = font_info(&doc, id);
+        // The space glyph legitimately has no contours; it must not be
+        // mistaken for a stripped (tofu) glyph.
+        assert!(f.glyph_available(&doc, b' ', Some(' ')));
+    }
+
+    #[test]
+    fn cjk_beyond_widths_range_is_renderable() {
+        let mut doc = Document::with_version("1.7");
+        let id = font_dict_id(&mut doc, true);
+        let f = font_info(&doc, id);
+        // The embedded check is unicode-keyed: a char outside the /Widths
+        // range entirely still verifies through the font program.
+        assert!(f.glyph_available(&doc, 0, Some('元')));
+        assert!(!f.glyph_available(&doc, 0, Some('魔')));
+    }
+
+    #[test]
+    fn lost_alignment_is_conservative_with_embedded_font() {
+        let mut doc = Document::with_version("1.7");
+        let id = font_dict_id(&mut doc, true);
+        let f = font_info(&doc, id);
+        // No char to look up + an embedded font whose widths lie: refuse
+        // rather than risk tofu.
+        assert!(!f.glyph_available(&doc, b'I', None));
+    }
+
+    #[test]
+    fn mac_byte_cmap_font_overrides_lying_widths() {
+        // reportlab-style embed: (1,0) format-6 cmap only, keyed by the PDF
+        // string bytes. No unicode subtable at all — coverage must be
+        // provable per byte code or the check never engages.
+        let mut doc = Document::with_version("1.7");
+        let id = font_dict_id_with(&mut doc, Some(SUBSET_TTF_MAC));
+        let f = font_info(&doc, id);
+        assert!(!f.glyph_available(&doc, b'd', Some('d')));
+        assert!(f.glyph_available(&doc, b'I', Some('I')));
+        assert!(f.glyph_available(&doc, b' ', Some(' ')));
+        // Byte-keyed lookup doesn't need char alignment: verdicts hold even
+        // when the caller lost the byte↔char correspondence.
+        assert!(f.glyph_available(&doc, b'I', None));
+        assert!(!f.glyph_available(&doc, b'd', None));
+    }
+
+    #[test]
+    fn nonsymbolic_dual_cmap_byte_hit_does_not_authorize() {
+        // Nonsymbolic + unicode subtable present: the encoding's character
+        // value is the authoritative key. The Mac table's 0x80 -> real
+        // glyph must not approve WinAnsi 0x80 ('€', not in the font) — the
+        // old OR logic did, and the viewer would paint the wrong glyph.
+        let mut doc = Document::with_version("1.7");
+        let id = font_dict_id_with(&mut doc, Some(SUBSET_TTF_DUAL));
+        let f = font_info(&doc, id);
+        assert!(!f.symbolic, "fixture descriptor is nonsymbolic (Flags 32)");
+        assert!(!f.glyph_available(&doc, 0x80, Some('\u{20AC}')));
+        // Positive control: the unicode path still verifies real coverage.
+        assert!(f.glyph_available(&doc, b'I', Some('I')));
+        assert!(f.glyph_available(&doc, 0, Some('元')));
+    }
+
+    #[test]
+    fn symbolic_flag_prefers_byte_keyed_cmap() {
+        // Same dual-cmap font but flagged Symbolic (Flags 4): such fonts
+        // resolve codes through their own byte-keyed table (ISO 32000
+        // 9.6.6.4), so 0x80 — mapped to a real glyph there — is renderable.
+        let mut doc = Document::with_version("1.7");
+        let id = font_dict_id_with(&mut doc, Some(SUBSET_TTF_DUAL));
+        {
+            let font_dict = doc.get_dictionary(id).unwrap();
+            let fd_id = font_dict.get(b"FontDescriptor").unwrap().as_reference().unwrap();
+            doc.get_dictionary_mut(fd_id).unwrap().set("Flags", 4);
+        }
+        let f = font_info(&doc, id);
+        assert!(f.symbolic);
+        assert!(f.glyph_available(&doc, 0x80, None));
+        assert!(!f.glyph_available(&doc, 0x81, None), "unmapped byte still refused");
+    }
+
+    /// The subset with ONLY a (3,0) symbol cmap whose codes live in the
+    /// 0xF100 range — one of the four high-byte ranges ISO 32000 permits
+    /// for symbol tables (crbot #7 round-3 finding 1).
+    const SUBSET_TTF_SYM_F100: &[u8] = include_bytes!("testdata/noto_sc_subset_symbol_f100.ttf");
+
+    #[test]
+    fn symbol_cmap_f100_range_is_probed() {
+        let mut doc = Document::with_version("1.7");
+        let id = font_dict_id_with(&mut doc, Some(SUBSET_TTF_SYM_F100));
+        {
+            let font_dict = doc.get_dictionary(id).unwrap();
+            let fd_id = font_dict.get(b"FontDescriptor").unwrap().as_reference().unwrap();
+            doc.get_dictionary_mut(fd_id).unwrap().set("Flags", 4);
+        }
+        let f = font_info(&doc, id);
+        // 'I' lives at 0xF149; probing only 0xF000|b and the bare byte
+        // missed it and wrongly refused the whole font.
+        assert!(f.glyph_available(&doc, b'I', None));
+        assert!(!f.glyph_available(&doc, b'd', None), "absent glyph still refused");
+    }
+
+    /// (3,0) symbol table (F000 range) deliberately MISSING 'n', plus a
+    /// (1,0) Mac table that HAS 'n' (crbot #7 round-4 finding 1).
+    const SUBSET_TTF_SYM_NO_N: &[u8] = include_bytes!("testdata/noto_sc_subset_sym_missing_n.ttf");
+
+    #[test]
+    fn symbol_table_verdict_is_exclusive() {
+        // A renderer selects the (3,0) table exclusively when it exists;
+        // a byte it can't map paints .notdef even if (1,0) maps it, so
+        // falling through to Mac would authorize tofu.
+        let mut doc = Document::with_version("1.7");
+        let id = font_dict_id_with(&mut doc, Some(SUBSET_TTF_SYM_NO_N));
+        {
+            let font_dict = doc.get_dictionary(id).unwrap();
+            let fd_id = font_dict.get(b"FontDescriptor").unwrap().as_reference().unwrap();
+            doc.get_dictionary_mut(fd_id).unwrap().set("Flags", 4);
+        }
+        let f = font_info(&doc, id);
+        assert!(f.glyph_available(&doc, b'I', None), "symbol table covers 'I'");
+        assert!(
+            !f.glyph_available(&doc, b'n', None),
+            "'n' missing from (3,0) must refuse even though (1,0) maps it"
+        );
+    }
+
+    #[test]
+    fn missing_encoding_routes_through_byte_cmap() {
+        // ISO 32000 9.6.6.4: no /Encoding entry -> the built-in
+        // (3,0)/(1,0) cmap resolves the byte, same as the symbolic case,
+        // regardless of the Symbolic flag. The dual-cmap fixture maps Mac
+        // byte 0x80 to a real glyph, so WITHOUT /Encoding the byte is
+        // renderable; WITH /Encoding (nonsymbolic) the unicode table rules
+        // and 0x80/'€' stays refused (see the dual-cmap test above).
+        let mut doc = Document::with_version("1.7");
+        let id = font_dict_id_with(&mut doc, Some(SUBSET_TTF_DUAL));
+        doc.get_dictionary_mut(id).unwrap().remove(b"Encoding");
+        let f = font_info(&doc, id);
+        assert!(!f.symbolic && !f.has_encoding);
+        assert!(f.glyph_available(&doc, 0x80, Some('\u{20AC}')));
+        assert!(!f.glyph_available(&doc, 0x90, None), "unmapped byte still refused");
+    }
+
+    #[test]
+    fn embedded_font_parse_is_cached_across_font_infos() {
+        // crbot #7 round-1 finding 1: replace_run_inner rebuilds the font
+        // map per segment; the parsed program must be shared, not re-parsed
+        // (decompress+copy of a multi-MB font per segment froze WASM).
+        let mut doc = Document::with_version("1.7");
+        let id = font_dict_id_with(&mut doc, Some(SUBSET_TTF));
+        let f1 = font_info(&doc, id);
+        let f2 = font_info(&doc, id);
+        let p1 = f1.embedded_ttf(&doc).unwrap() as *const _;
+        let p2 = f2.embedded_ttf(&doc).unwrap() as *const _;
+        assert_eq!(p1, p2, "second FontInfo must reuse the cached parse");
+    }
+
+    #[test]
+    fn no_font_program_keeps_widths_heuristic() {
+        let mut doc = Document::with_version("1.7");
+        let id = font_dict_id(&mut doc, false);
+        let f = font_info(&doc, id);
+        // Without FontFile2 there is no ground truth; the pre-existing
+        // widths heuristic (and its false positives) is all we have.
+        assert!(f.glyph_available(&doc, b'd', Some('d')));
+        assert!(!f.glyph_available(&doc, 5, Some('\u{5}')));
+    }
+
+    /// End-to-end: replacing through the real pipeline must refuse (not
+    /// silently emit tofu) when the replacement introduces a character the
+    /// embedded subset has no glyph for, and still succeed when every
+    /// character is covered.
+    #[test]
+    fn replace_refuses_missing_glyph_instead_of_tofu() {
+        use crate::replace::{replace_text, ReplaceError};
+
+        let build = || {
+            let mut doc = Document::with_version("1.7");
+            let font_id = font_dict_id(&mut doc, true);
+            let content = doc.add_object(Stream::new(
+                dictionary! {},
+                b"BT /F1 24 Tf 72 700 Td (Ian) Tj ET".to_vec(),
+            ));
+            let pages_id = doc.new_object_id();
+            let page_id = doc.add_object(dictionary! {
+                "Type" => "Page",
+                "Parent" => Object::Reference(pages_id),
+                "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+                "Contents" => Object::Reference(content),
+                "Resources" => dictionary! {
+                    "Font" => dictionary! { "F1" => Object::Reference(font_id) },
+                },
+            });
+            doc.set_object(pages_id, dictionary! {
+                "Type" => "Pages",
+                "Kids" => vec![Object::Reference(page_id)],
+                "Count" => 1,
+            });
+            let catalog = doc.add_object(dictionary! {
+                "Type" => "Catalog",
+                "Pages" => Object::Reference(pages_id),
+            });
+            doc.trailer.set("Root", Object::Reference(catalog));
+            doc
+        };
+
+        // 'd' is absent from the subset: no fallback provided -> refuse.
+        let mut doc = build();
+        let err = replace_text(&mut doc, 1, "Ian", "Idn", None).unwrap_err();
+        assert!(matches!(err, ReplaceError::MissingGlyph), "got {err:?}");
+
+        // All replacement chars covered by the subset -> succeeds in the
+        // original font.
+        let mut doc = build();
+        replace_text(&mut doc, 1, "Ian", "nIa", None).unwrap();
+    }
+
+    /// Same end-to-end guarantee for the byte-keyed-cmap embed shape.
+    #[test]
+    fn replace_refuses_missing_glyph_with_mac_cmap_font() {
+        use crate::replace::{replace_text, ReplaceError};
+
+        let mut doc = Document::with_version("1.7");
+        let font_id = font_dict_id_with(&mut doc, Some(SUBSET_TTF_MAC));
+        let content = doc.add_object(Stream::new(
+            dictionary! {},
+            b"BT /F1 24 Tf 72 700 Td (Ian) Tj ET".to_vec(),
+        ));
+        let pages_id = doc.new_object_id();
+        let page_id = doc.add_object(dictionary! {
+            "Type" => "Page",
+            "Parent" => Object::Reference(pages_id),
+            "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+            "Contents" => Object::Reference(content),
+            "Resources" => dictionary! {
+                "Font" => dictionary! { "F1" => Object::Reference(font_id) },
+            },
+        });
+        doc.set_object(pages_id, dictionary! {
+            "Type" => "Pages",
+            "Kids" => vec![Object::Reference(page_id)],
+            "Count" => 1,
+        });
+        let catalog = doc.add_object(dictionary! {
+            "Type" => "Catalog",
+            "Pages" => Object::Reference(pages_id),
+        });
+        doc.trailer.set("Root", Object::Reference(catalog));
+
+        let err = replace_text(&mut doc, 1, "Ian", "Idn", None).unwrap_err();
+        assert!(matches!(err, ReplaceError::MissingGlyph), "got {err:?}");
+    }
 }
