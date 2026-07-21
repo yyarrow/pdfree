@@ -384,7 +384,8 @@ def mutool_probe(case, pdf_path, out_pdf, run, work):
     return page_box, before_spans, after_spans, before_img, after_img
 
 
-def detect_font_substitution(before_spans, after_spans, edit_bbox, pixel_ctx=None):
+def detect_font_substitution(before_spans, after_spans, edit_bbox, pixel_ctx=None,
+                             pre_edit_bbox=None):
     """Check 2: characters the ORIGINAL font already covered (drawn
     somewhere on the before-page in that font — a conservative black-box
     proof the font has the glyph) must keep the same base font after the
@@ -430,7 +431,11 @@ def detect_font_substitution(before_spans, after_spans, edit_bbox, pixel_ctx=Non
     if not before_in:
         return None, None
 
-    orig_font_raw = _target_font(before_in, edit_bbox)
+    # Anchor the target-font vote on the PRE-EDIT run bbox (ground truth
+    # from engine extract) when available; the post-edit report bbox can
+    # extend rightward for wider replacements and swallow neighbor votes.
+    orig_font_raw = _target_font(
+        before_in, pre_edit_bbox if pre_edit_bbox is not None else edit_bbox)
     orig_font = strip_subset_prefix(orig_font_raw)
 
     covered_chars = {c for c, f, _ in before_spans if strip_subset_prefix(f) == orig_font}
@@ -455,24 +460,33 @@ def _majority_font(spans):
     return max(counts, key=counts.get)
 
 
-def _target_font(before_in, edit_bbox):
-    """Raw font name of the EDIT TARGET, inferred from the CORE of the
-    reported edit bbox: only before spans whose center lies inside the
-    UNPADDED bbox vote. before_in was collected with a 2pt overlap pad, so
-    a long adjacent run in another font can outnumber a short edit target
-    in the padded set and flip a naive majority vote — inverting the
-    downstream classification (blank target glyphs dropped as ambiguous,
-    inked neighbors admitted to the alignment). Grazed neighbors' centers
-    fall outside the unpadded bbox, so the core vote is immune. Falls back
-    to the padded-majority vote if no span centers inside (degenerate
-    bboxes), which simply restores the previous behavior there.
+def _center_in(box, bbox):
+    """Whether a span box's center point lies inside bbox (both PDF user
+    space)."""
+    bx0, by0, bx1, by1 = bbox
+    cx, cy = (box[0] + box[2]) / 2, (box[1] + box[3]) / 2
+    return bx0 <= cx <= bx1 and by0 <= cy <= by1
+
+
+def _target_font(before_in, anchor_bbox):
+    """Raw font name of the EDIT TARGET, inferred from the spans anchored
+    in anchor_bbox: only before spans whose CENTER lies inside it vote.
+
+    anchor_bbox should be the PRE-EDIT target bbox (engine extract's
+    run["bbox"] — ground truth for where the edited segment sat before
+    the edit), not the post-edit report bbox: the report bbox can extend
+    RIGHTWARD when the replacement is wider than the find text, swallowing
+    genuine neighbor centers, and before_in is additionally collected with
+    a 2pt overlap pad — either way a long adjacent run in another font can
+    outnumber a short edit target and flip a naive majority vote,
+    inverting the downstream classification (blank target glyphs dropped
+    as ambiguous, inked neighbors admitted to the alignment). Neighbors'
+    centers fall outside the pre-edit bbox, so the anchored vote is
+    immune. Falls back to the padded-majority vote if no span centers
+    inside (degenerate bboxes), which simply restores the previous
+    behavior there.
     """
-    bx0, by0, bx1, by1 = edit_bbox
-    core = [
-        s for s in before_in
-        if bx0 <= (s[2][0] + s[2][2]) / 2 <= bx1
-        and by0 <= (s[2][1] + s[2][3]) / 2 <= by1
-    ]
+    core = [s for s in before_in if _center_in(s[2], anchor_bbox)]
     return _majority_font(core if core else before_in)
 
 
@@ -513,7 +527,7 @@ def _ring_contrast(img, quad_rect, glyph_rects, expand=3, glyph_pad=2):
 
 
 def detect_glyph_tofu(after_img, page_box, before_spans, after_spans, edit_bbox, repl,
-                      before_img=None):
+                      before_img=None, pre_edit_bbox=None):
     """Check 3: a replacement character can be encoded into a subset font
     that keeps the SAME font name (so check 2 sees nothing wrong) but lacks
     that glyph's outline — the text layer says the character is there
@@ -539,10 +553,11 @@ def detect_glyph_tofu(after_img, page_box, before_spans, after_spans, edit_bbox,
        is exactly the round-4/5 capture scenario: it must face the ink
        test). Joins the alignment string and is ink-tested.
     3. AMBIGUOUS — ACTIVELY pixel-vetoed (its candidate's turn came with
-       the twin unconsumed and the union-rect renders differed) AND in a
-       non-target font. Since distance candidates require the same base
-       font, a non-target-font span with a veto is not part of the edited
-       run, and its pixel difference is most likely adjacent edit ink
+       the twin unconsumed and the union-rect renders differed), in a
+       non-target font, AND with its center OUTSIDE the pre-edit target
+       bbox. Since distance candidates require the same base font, a
+       non-target-font span with a veto is not part of the edited run,
+       and its pixel difference is most likely adjacent edit ink
        swallowed by the union pad (italic overhang / antialias bleed). It
        is neither a trusted neighbor nor an edit product: excluded from
        the alignment string entirely — not ink-tested, and NOT allowed to
@@ -552,6 +567,20 @@ def detect_glyph_tofu(after_img, page_box, before_spans, after_spans, edit_bbox,
        alignment. Merely LOSING a twin to one-to-one consumption is not a
        veto: such spans (e.g. a legitimate borrowed-font glyph written
        within tol of an untouched same-font neighbor) stay class 2.
+
+    PRE-EDIT BBOX ANCHOR (ground truth from engine extract's run bbox):
+    any after span whose CENTER lies inside the pre-edit target bbox is
+    UNCONDITIONALLY an edit product — vetoed or not, anything inside the
+    target's own territory must face the ink test. This closes the
+    collateral-veto hole: a borrowed-font product whose ink bleeds into
+    its neighbor's union pad vetoes BOTH the neighbor's match and its own
+    candidate, but sitting inside the target bbox it can no longer be
+    dropped as ambiguous. Residual, documented and accepted: a vetoed
+    borrowed-font product placed in the RIGHT-EXTENSION zone of a wider
+    replacement (outside the pre-edit bbox, inside the report bbox) can
+    still classify ambiguous — full pixel attribution would be needed to
+    close that; judge()'s pixel checks and engine-side glyph validation
+    (PR #7) remain the backstop there.
        Residual window unchanged (documented in
        detect_font_substitution): a replacement char mis-painted in a
        neighbor's font within 2pt of a same-char span of that font is
@@ -605,15 +634,16 @@ def detect_glyph_tofu(after_img, page_box, before_spans, after_spans, edit_bbox,
             }
         return None, None
 
-    orig_font = strip_subset_prefix(_target_font(before_in, edit_bbox)) if before_in else None
+    anchor_bbox = pre_edit_bbox if pre_edit_bbox is not None else edit_bbox
+    orig_font = strip_subset_prefix(_target_font(before_in, anchor_bbox)) if before_in else None
 
     # Three-way classification -> (span, is_product) alignment sequence in
     # reading order; ambiguous spans are dropped entirely (see docstring).
-    # Ambiguity requires an ACTIVE pixel veto: a span that merely lost its
-    # twin to another span (one-to-one consumption) was never refuted by
-    # the renders and stays an edit product — e.g. a legitimate
-    # borrowed-font glyph written within tol of an untouched same-font
-    # neighbor must still be aligned and ink-tested, not dropped.
+    # Ambiguity requires an ACTIVE pixel veto AND a center outside the
+    # pre-edit target bbox: anything inside the target's own territory is
+    # unconditionally an edit product and must face the ink test; a span
+    # that merely lost its twin to one-to-one consumption was never
+    # refuted by the renders and stays an edit product too.
     seq = []
     ambiguous = []
     for i, span in enumerate(after_in):
@@ -622,7 +652,8 @@ def detect_glyph_tofu(after_img, page_box, before_spans, after_spans, edit_bbox,
                 seq.append((span, False))  # verified neighbor, target font
             continue  # verified other-font neighbor: excluded
         span_font = strip_subset_prefix(span[1])
-        if i in pixel_vetoed and orig_font is not None and span_font != orig_font:
+        if (i in pixel_vetoed and orig_font is not None and span_font != orig_font
+                and not _center_in(span[2], anchor_bbox)):
             ambiguous.append(span[0])  # class 3: excluded from alignment
             continue
         seq.append((span, True))  # class 2: edit product, ink-tested
@@ -908,16 +939,21 @@ def run_case(pdf_path: Path, work: Path):
         else:
             page_box, before_spans, after_spans, before_img, after_img = probe
             edit_bbox = tuple(report["bbox"])
+            # Ground truth: the edited run's PRE-EDIT bbox from engine
+            # extract — anchors target-font voting and product territory
+            # (the report bbox can extend rightward for wider repls).
+            pre_edit_bbox = tuple(run["bbox"])
             pixel_ctx = (before_img, after_img, page_box)
             try:
                 font_verdict, font_info = detect_font_substitution(
-                    before_spans, after_spans, edit_bbox, pixel_ctx=pixel_ctx)
+                    before_spans, after_spans, edit_bbox, pixel_ctx=pixel_ctx,
+                    pre_edit_bbox=pre_edit_bbox)
             except Exception:
                 font_verdict, font_info = None, None
             try:
                 tofu_verdict, tofu_info = detect_glyph_tofu(
                     after_img, page_box, before_spans, after_spans, edit_bbox, repl,
-                    before_img=before_img)
+                    before_img=before_img, pre_edit_bbox=pre_edit_bbox)
             except Exception:
                 tofu_verdict, tofu_info = None, None
 
