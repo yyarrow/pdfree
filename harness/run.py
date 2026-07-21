@@ -391,45 +391,42 @@ def build_territory(before_spans, after_spans, pre_edit_bbox, new_text):
             out.append(cur)
         return out, False
 
-    # RIGHT BOUNDARY decision (round 16). Ordering and semantics:
+    # RIGHT BOUNDARY — FINAL, deliberately conservative form (round 17).
+    # This corner no longer accepts heuristic enhancement: after physical
+    # shift bounds (round 16) were disproven — median-char-width estimates
+    # are unreliable in proportional fonts — the rule was downgraded to a
+    # pure uniqueness test. The boundary is used ONLY when it is
+    # unambiguous; every ambiguity is a visible abstention:
     #
     # 0. PERFORMANCE CAPS: a band over 512 spans abstains outright
-    #    (band_too_large) — every alignment is O(len(new_text) x band),
-    #    and at most K=8 boundary candidates are ever evaluated, so the
-    #    total work is bounded by O(K x 512 x len(new_text)).
-    # 1. EMPTY/UNANCHORED PRODUCTS FIRST (round-16 regression fix): if
-    #    the global alignment finds nothing, or nothing at the pre-edit
-    #    x0, there are no anchorable products — the caller reports
-    #    missing (with a confirmed before target) BEFORE any boundary
-    #    reasoning; a vanished edit output must never degrade into a
-    #    boundary abstention.
-    # 2. CANDIDATE PLAUSIBILITY: a rigid right-neighbor match is only a
-    #    candidate if its uniform delta_x is physically plausible — the
-    #    suffix shift equals the width change of the rewritten segment,
-    #    so |delta| must not exceed |est_new_width - old_width| plus
-    #    max(2pt, 30% of old_width) slack (est_new_width =
-    #    len(new_text) x median char width). This is a monotone physical
-    #    bound, not a scoring heuristic: it rejects impostor candidates
-    #    sitting deep inside the product territory (their implied shift
-    #    is the full width of the territory).
-    # 3. VALIDITY = per-candidate prefix alignment anchored at the
-    #    pre-edit x0 (round 15; the coverage comparison is retired per
-    #    round-16 review — non-monotone scoring is out).
-    # 4. Candidates are evaluated RIGHTMOST-FIRST, at most K=8. A unique
-    #    valid candidate (or several sharing one product hypothesis)
-    #    decides the boundary; two or more valid candidates with
-    #    DIFFERENT product hypotheses mean repeated text has made the
-    #    product/suffix split inherently undecidable -> abstain
-    #    (right_boundary_ambiguous). No valid candidate: abstain
-    #    (right_boundary_ambiguous if unevaluated candidates remained
-    #    beyond K, else right_boundary_lost).
+    #    (band_too_large); at most K=8 candidates are evaluated
+    #    (rightmost-first), more without a decision -> abstain. Total
+    #    work is O(K x 512 x len(new_text)).
+    # 1. EMPTY/UNANCHORED PRODUCTS FIRST: the global alignment finding
+    #    nothing, or nothing anchored at the pre-edit x0, goes straight
+    #    to the missing path before any boundary reasoning.
+    # 2. Rigid-shift candidates are collected with NO filtering, scoring
+    #    or physical bounds. Exactly one candidate -> it is the boundary
+    #    and its prefix alignment is the product sequence. Two or more
+    #    candidates whose prefix alignments give DIFFERENT product
+    #    hypotheses -> right_boundary_ambiguous, unconditionally
+    #    (repeated text makes the product/suffix split inherently
+    #    undecidable — the honest outcome is an abstention, never a
+    #    truncated-products missing verdict). Zero candidates while
+    #    before right neighbors exist -> right_boundary_lost.
+    #
+    # DELETION EDITS (round 17): new_text == "" declares the product
+    # sequence empty — nothing to ink-test, nothing for the font check,
+    # and the boundary logic must NOT run (the suffix legitimately
+    # shifts left into the vacated space; treating it as products would
+    # false-flag substitution). new_text is None keeps the legacy
+    # unbounded-band fallback for span-only fixtures.
+    if new_text == "":
+        return orig_font_raw, before_core, [], [], False, None
+
     before_rn_seq = sorted(
         (s for s in before_band if s[2][0] >= x1 - 0.5),
         key=lambda s: (s[2][0] + s[2][2]) / 2)
-
-    _widths = [s[2][2] - s[2][0] for s in after_band
-               if not s[0].isspace() and s[2][2] > s[2][0]]
-    med_w = sorted(_widths)[len(_widths) // 2] if _widths else 0.0
 
     if len(after_band) > 512:
         return (orig_font_raw, before_core, [], [], False, "band_too_large")
@@ -453,9 +450,9 @@ def build_territory(before_spans, after_spans, pre_edit_bbox, new_text):
     anchor_failed = False
     ambiguous_reason = None
     product_seq = []
-    chosen = None  # (first, last) of the selected candidate's prefix alignment
+    chosen = None  # (first, last) of the boundary's prefix alignment
 
-    if new_text:
+    if new_text is not None:
         g_first, g_last = _align(new_text)
         if g_first is None:
             product_seq = []  # nothing of the edit output found: missing path
@@ -464,7 +461,7 @@ def build_territory(before_spans, after_spans, pre_edit_bbox, new_text):
             anchor_failed = True  # nothing anchored at x0: missing path
         elif before_rn_seq:
             n = len(before_rn_seq)
-            cands = []  # (i, mean_delta)
+            cands = []
             for i in range(len(after_band) - n + 1):
                 deltas = []
                 ok = True
@@ -475,42 +472,32 @@ def build_territory(before_spans, after_spans, pre_edit_bbox, new_text):
                         break
                     deltas.append(abox[0] - bbox_[0])
                 if ok and max(deltas) - min(deltas) <= 0.5:
-                    cands.append((i, sum(deltas) / len(deltas)))
-            old_w = x1 - x0
-            est_new_w = len(new_text) * med_w
-            shift_bound = max(2.0, 0.3 * old_w) + abs(est_new_w - old_w)
-            plausible = sorted(
-                (i for i, d in cands if abs(d) <= shift_bound), reverse=True)
-            K = 8
-            evaluated = plausible[:K]
-            valid = []
-            for i in evaluated:
-                pf, pl = _align(new_text, upto=i)
-                if pf is None:
-                    continue
-                if abs(after_band[pf][2][0] - x0) > BAND_PAD:
-                    continue
-                valid.append((i, pf, pl))
-            hyps = {(pf, pl) for _i, pf, pl in valid}
-            if len(hyps) == 1:
-                i_sel, pf_sel, pl_sel = max(valid, key=lambda t: t[0])
-                chosen = (pf_sel, pl_sel)
-            elif len(hyps) >= 2:
-                ambiguous_reason = "right_boundary_ambiguous"
-            elif len(plausible) > K:
-                ambiguous_reason = "right_boundary_ambiguous"
-            else:
+                    cands.append(i)
+            if not cands:
                 ambiguous_reason = "right_boundary_lost"
+            elif len(cands) == 1:
+                chosen = _align(new_text, upto=cands[0])
+            else:
+                K = 8
+                evaluated = sorted(cands, reverse=True)[:K]
+                hyps = {_align(new_text, upto=i) for i in evaluated}
+                if len(cands) > K or len(hyps) >= 2:
+                    ambiguous_reason = "right_boundary_ambiguous"
+                else:
+                    chosen = next(iter(hyps))
         # else: anchored, no right neighbors -> plain global products below
 
         if ambiguous_reason:
             product_seq = []
         elif chosen is not None:
-            _pf, pl = chosen
-            product_seq, gap_amb = truncate_continuous(after_band[: pl + 1])
-            if gap_amb:
-                product_seq = []
-                ambiguous_reason = "gap_ambiguous"
+            pf, pl = chosen
+            if pf is None:
+                product_seq = []  # boundary set, nothing before it: missing path
+            else:
+                product_seq, gap_amb = truncate_continuous(after_band[: pl + 1])
+                if gap_amb:
+                    product_seq = []
+                    ambiguous_reason = "gap_ambiguous"
         elif g_first is not None and not anchor_failed:
             product_seq, gap_amb = truncate_continuous(after_band[: g_last + 1])
             if gap_amb:
