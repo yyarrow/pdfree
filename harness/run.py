@@ -392,29 +392,51 @@ def build_territory(before_spans, after_spans, pre_edit_bbox, new_text):
         return out, False
 
     # RIGHT BOUNDARY from pre-edit right neighbors (independent of the
-    # alignment): an after span that coincides with a BEFORE span at the
-    # same position (0.5pt, same char + base font) whose before position
-    # starts at/right of the pre-edit right edge is an UNTOUCHED RIGHT
-    # NEIGHBOR — text that was already beyond the edited segment. The
-    # product sequence must never reach the first right neighbor or
-    # anything past it; an alignment that would need to cross it is
-    # geometrically ambiguous (the edit's output cannot extend into text
-    # that provably predates the edit) -> abstain (crosses_preexisting).
-    def is_right_neighbor(span):
-        c, f, box = span
-        base = strip_subset_prefix(f)
-        for bc, bf, bbox_ in before_band:
-            if (bc == c and strip_subset_prefix(bf) == base
-                    and max(abs(p - q) for p, q in zip(box, bbox_)) <= 0.5
-                    and bbox_[0] >= x1 - 0.5):
-                return True
-        return False
+    # alignment), tolerant of a UNIFORM SHIFT (round 13): the engine's
+    # rewrite of ' / \" operators legally moves every downstream pen, so
+    # untouched right neighbors can sit far from their old positions —
+    # static +-0.5pt matching would lose the boundary and let the
+    # alignment absorb neighbor text. The before-band spans starting
+    # at/right of the pre-edit right edge form an ORDERED sequence; it is
+    # searched for in the after band as a contiguous run with the same
+    # chars and the same RAW fonts, in order, where every span moved by
+    # the same delta_x (spread <= 0.5pt — one rigid translation). Found:
+    # the run's first span is the right boundary, and the product
+    # sequence must never reach it (crosses_preexisting below). NOT
+    # found while before right neighbors exist: the topology cannot be
+    # re-established — neither in place nor rigidly shifted — so no
+    # boundary can be drawn and no product identity is safe: abstain
+    # (right_boundary_lost), never guess. End-of-line edits (no before
+    # right neighbors) are unaffected.
+    before_rn_seq = sorted(
+        (s for s in before_band if s[2][0] >= x1 - 0.5),
+        key=lambda s: (s[2][0] + s[2][2]) / 2)
 
-    first_rn = next((i for i, s in enumerate(after_band) if is_right_neighbor(s)), None)
+    first_rn = None
+    right_boundary_lost = False
+    if before_rn_seq:
+        n = len(before_rn_seq)
+        for i in range(len(after_band) - n + 1):
+            deltas = []
+            ok = True
+            for j, (bc, bf, bbox_) in enumerate(before_rn_seq):
+                ac, af, abox = after_band[i + j]
+                if ac != bc or af != bf:
+                    ok = False
+                    break
+                deltas.append(abox[0] - bbox_[0])
+            if ok and max(deltas) - min(deltas) <= 0.5:
+                first_rn = i
+                break
+        if first_rn is None:
+            right_boundary_lost = True
 
     anchor_failed = False
     ambiguous_reason = None
-    if new_text:
+    if right_boundary_lost:
+        product_seq = []
+        ambiguous_reason = "right_boundary_lost"
+    elif new_text:
         band_str = "".join(c for c, _, _ in after_band)
         sm = difflib.SequenceMatcher(a=new_text, b=band_str, autojunk=False)
         first, last = None, -1
@@ -704,7 +726,7 @@ def detect_glyph_tofu(after_img, page_box, before_spans, after_spans, edit_bbox,
     glyph_info = [(bbox_to_pixels(box, page_box, pad=0), f) for _, f, box in after_spans]
     glyph_rects = [g for g, _f in glyph_info]
 
-    def _overhang_risk(neighbor_font, own_base):
+    def _overhang_risk(neighbor_font, own_font):
         """Whether a neighbor's ink can plausibly bleed further than the
         standard 2px antialias pad (reviewed ruling, round 12 follow-up):
         upright glyphs paint outside their own quad only by ~1px of
@@ -712,14 +734,20 @@ def detect_glyph_tofu(after_img, page_box, before_spans, after_spans, edit_bbox,
         italic/oblique shear or from cross-font metric differences. The
         stricter 4px inner margin is therefore applied only to neighbors
         whose font name says Italic/Oblique (case-insensitive, covering
-        faux-italic naming variants) or whose base font differs from the
-        tested glyph's own. Known residuals, accepted: rare upright
+        faux-italic naming variants) or whose font identity differs from
+        the tested glyph's — compared by the RAW mutool-reported name,
+        NOT the subset-stripped base (round 13): ABCDEF+Foo and
+        GHIJKL+Foo are different subsets whose metrics/overhang can
+        differ, so they must not share the trusted 2px treatment.
+        Base-name comparison stays reserved for the font-substitution
+        check, whose question ("did the font family change?") is
+        semantic, not geometric. Known residuals, accepted: rare upright
         long-swash glyphs (long-f, script faces), and italic overhang
         beyond 4px."""
         nf = neighbor_font.lower()
         if "italic" in nf or "oblique" in nf:
             return True
-        return strip_subset_prefix(neighbor_font) != own_base
+        return neighbor_font != own_font
 
     w, h = after_img.size
     tofu = []
@@ -749,14 +777,14 @@ def detect_glyph_tofu(after_img, page_box, before_spans, after_spans, edit_bbox,
         # italic/oblique or cross-font neighbors get 4px in the inner
         # mask, demanding a 2px margin from their punch boundary.
         own_rect = bbox_to_pixels(cbox, page_box, pad=0)
-        own_base = strip_subset_prefix(span[1])
+        own_font = span[1]  # RAW name: subset identity matters for risk
 
         def _padded(r, p):
             return (r[0] - p, r[1] - p, r[2] + p, r[3] + p)
 
         others_meta = [(g, f) for g, f in glyph_info if g != own_rect]
         outer_rects = [_padded(g, 2) for g, _f in others_meta]
-        inner_rects = [_padded(g, 4 if _overhang_risk(f, own_base) else 2)
+        inner_rects = [_padded(g, 4 if _overhang_risk(f, own_font) else 2)
                        for g, f in others_meta]
         if before_img is not None:
             if ImageChops.difference(
