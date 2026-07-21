@@ -326,11 +326,14 @@ def build_territory(before_spans, after_spans, pre_edit_bbox, new_text):
       font for a glyph the target font lacks) and stays in the sequence.
 
     Returns (orig_font_raw, before_core, product_seq, overlapping,
-    anchor_failed) where orig_font_raw is None when the before core is
-    empty, product_seq is the bounded x-ordered after-span list,
-    overlapping is a list of {char, font} dicts (non-empty => abstain),
-    and anchor_failed reports that aligned spans exist in the band but
-    none at the target's left edge (product identity not establishable).
+    anchor_failed, ambiguous_reason) where orig_font_raw is None when
+    the before core is empty, product_seq is the bounded x-ordered
+    after-span list, overlapping is a list of {char, font} dicts
+    (non-empty => abstain), anchor_failed reports that aligned spans
+    exist in the band but none at the target's left edge (product
+    identity not establishable), and ambiguous_reason
+    ('gap_ambiguous' | 'crosses_preexisting' | None) reports that the
+    territory geometry is undecidable and the caller must abstain.
     """
     x0, y0, x1, y1 = pre_edit_bbox
     before_core = [s for s in before_spans if _center_in(s[2], pre_edit_bbox)]
@@ -346,34 +349,71 @@ def build_territory(before_spans, after_spans, pre_edit_bbox, new_text):
         key=lambda s: (s[2][0] + s[2][2]) / 2)
     before_band = [s for s in before_spans if in_band(s[2])]
 
+    before_band_sorted = sorted(before_band, key=lambda s: (s[2][0] + s[2][2]) / 2)
+
     def truncate_continuous(seq):
-        """GEOMETRIC CONTINUITY: the accepted product sequence must be
-        spatially contiguous. A left anchor alone is not enough — if the
-        first character survives at x0 while the rest of the segment
-        vanished, alignment happily splices an unrelated run further
-        right into the string, ignoring the spatial hole. Cut the
-        sequence at the first inter-span x gap exceeding
-        max(2pt, 1.5 x the band's median char width); gaps adjacent to a
-        SPACE character get twice that (word gaps are legitimately
-        wider). Everything past the cut — including any alignment that
-        pointed there — is discarded; the caller's missing/abstain logic
-        then applies to the truncated sequence."""
+        """GEOMETRIC CONTINUITY with pre-edit gap comparison: the accepted
+        product sequence must be spatially contiguous. A left anchor alone
+        is not enough — if the first character survives at x0 while the
+        rest of the segment vanished, alignment happily splices an
+        unrelated run further right into the string, ignoring the spatial
+        hole. A mid-sequence x gap exceeding max(2pt, 1.5 x the band's
+        median char width) (doubled next to a SPACE char — word gaps are
+        legitimately wider) is however NOT automatically a hole: wide
+        tracking (Tc / TJ adjustments) legally produces large inter-glyph
+        gaps. The gap is compared against the BEFORE band's gap at the
+        same ordinal position (tolerance max(30%, 1pt)): consistent ->
+        preserved legitimate spacing, continue; inconsistent -> a NEW hole
+        the pre-edit layout did not have, and whether glyphs went missing
+        or the alignment is about to splice unrelated text is undecidable
+        from geometry — ABSTAIN (gap_ambiguous), never assert missing
+        from a gap. (Missing stays reserved for the no-anchor-at-x0
+        case.) Returns (sequence, gap_ambiguous)."""
         if len(seq) <= 1:
-            return seq
+            return seq, False
         widths = [s[2][2] - s[2][0] for s in after_band
                   if not s[0].isspace() and s[2][2] > s[2][0]]
         med = sorted(widths)[len(widths) // 2] if widths else 0.0
         base_thr = max(2.0, 1.5 * med)
         out = [seq[0]]
-        for prev, cur in zip(seq, seq[1:]):
+        for idx, (prev, cur) in enumerate(zip(seq, seq[1:])):
             gap = cur[2][0] - prev[2][2]
             thr = base_thr * 2 if (prev[0].isspace() or cur[0].isspace()) else base_thr
             if gap > thr:
-                break
+                bgap = None
+                if idx + 1 < len(before_band_sorted):
+                    b_prev, b_cur = before_band_sorted[idx], before_band_sorted[idx + 1]
+                    bgap = b_cur[2][0] - b_prev[2][2]
+                if bgap is not None and abs(gap - bgap) <= max(0.3 * abs(bgap), 1.0):
+                    out.append(cur)
+                    continue  # matches the pre-edit layout: legal wide tracking
+                return out, True  # new hole: geometry is ambiguous
             out.append(cur)
-        return out
+        return out, False
+
+    # RIGHT BOUNDARY from pre-edit right neighbors (independent of the
+    # alignment): an after span that coincides with a BEFORE span at the
+    # same position (0.5pt, same char + base font) whose before position
+    # starts at/right of the pre-edit right edge is an UNTOUCHED RIGHT
+    # NEIGHBOR — text that was already beyond the edited segment. The
+    # product sequence must never reach the first right neighbor or
+    # anything past it; an alignment that would need to cross it is
+    # geometrically ambiguous (the edit's output cannot extend into text
+    # that provably predates the edit) -> abstain (crosses_preexisting).
+    def is_right_neighbor(span):
+        c, f, box = span
+        base = strip_subset_prefix(f)
+        for bc, bf, bbox_ in before_band:
+            if (bc == c and strip_subset_prefix(bf) == base
+                    and max(abs(p - q) for p, q in zip(box, bbox_)) <= 0.5
+                    and bbox_[0] >= x1 - 0.5):
+                return True
+        return False
+
+    first_rn = next((i for i, s in enumerate(after_band) if is_right_neighbor(s)), None)
 
     anchor_failed = False
+    ambiguous_reason = None
     if new_text:
         band_str = "".join(c for c, _, _ in after_band)
         sm = difflib.SequenceMatcher(a=new_text, b=band_str, autojunk=False)
@@ -383,28 +423,38 @@ def build_territory(before_spans, after_spans, pre_edit_bbox, new_text):
                 if first is None:
                     first = b0
                 last = max(last, b1 - 1)
-        # LEFT ANCHOR: the band has no right edge, so alignment alone can
-        # lock onto an unrelated same-font run further right on the line
-        # (e.g. when the edited segment vanished entirely and that run
-        # happens to contain new_text) and silently vouch for the edit.
-        # The first aligned span must sit at the target's own left edge
-        # (pre-edit x0, same 2pt tolerance as the band itself); otherwise
-        # no product sequence is established at all — the caller reports
-        # the output missing or abstains, but never extends rightward.
+        # LEFT ANCHOR: the band has no right edge of its own, so alignment
+        # alone can lock onto an unrelated same-font run further right on
+        # the line (e.g. when the edited segment vanished entirely and
+        # that run happens to contain new_text) and silently vouch for
+        # the edit. The first aligned span must sit at the target's own
+        # left edge (pre-edit x0, same 2pt tolerance as the band itself);
+        # otherwise no product sequence is established at all — the
+        # caller reports the output missing or abstains, but never
+        # extends rightward.
         if first is None:
             product_seq = []
         elif abs(after_band[first][2][0] - x0) > BAND_PAD:
             product_seq = []
             anchor_failed = True
+        elif first_rn is not None and last >= first_rn:
+            product_seq = []
+            ambiguous_reason = "crosses_preexisting"
         else:
-            product_seq = truncate_continuous(after_band[: last + 1])
+            product_seq, gap_amb = truncate_continuous(after_band[: last + 1])
+            if gap_amb:
+                product_seq = []
+                ambiguous_reason = "gap_ambiguous"
     else:
-        product_seq = after_band
+        product_seq = after_band if first_rn is None else after_band[:first_rn]
         if product_seq and abs(product_seq[0][2][0] - x0) > BAND_PAD:
             product_seq = []
             anchor_failed = True
         else:
-            product_seq = truncate_continuous(product_seq)
+            product_seq, gap_amb = truncate_continuous(product_seq)
+            if gap_amb:
+                product_seq = []
+                ambiguous_reason = "gap_ambiguous"
 
     overlapping = []
     for c, f, box in product_seq:
@@ -417,7 +467,7 @@ def build_territory(before_spans, after_spans, pre_edit_bbox, new_text):
             for bc, bf, bbox_ in before_band)
         if preexisting:
             overlapping.append({"char": c, "font": f})
-    return orig_font_raw, before_core, product_seq, overlapping, anchor_failed
+    return orig_font_raw, before_core, product_seq, overlapping, anchor_failed, ambiguous_reason
 
 
 def detect_font_substitution(before_spans, after_spans, edit_bbox,
@@ -442,10 +492,12 @@ def detect_font_substitution(before_spans, after_spans, edit_bbox,
     (None, None).
     """
     anchor = pre_edit_bbox if pre_edit_bbox is not None else edit_bbox
-    orig_font_raw, _before_core, product_seq, overlapping, _anchor_failed = build_territory(
-        before_spans, after_spans, anchor, new_text)
+    orig_font_raw, _before_core, product_seq, overlapping, _anchor_failed, ambiguous_reason = \
+        build_territory(before_spans, after_spans, anchor, new_text)
     if orig_font_raw is None:
         return None, None
+    if ambiguous_reason:
+        return "skip_font_oracle", {"territory_ambiguous": ambiguous_reason}
     if overlapping:
         return "skip_font_oracle", {"overlapping_text": overlapping}
     orig_font = strip_subset_prefix(orig_font_raw)
@@ -620,10 +672,14 @@ def detect_glyph_tofu(after_img, page_box, before_spans, after_spans, edit_bbox,
     anchor = pre_edit_bbox if pre_edit_bbox is not None else edit_bbox
     if new_text is None:
         new_text = repl
-    orig_font_raw, before_core, product_seq, overlapping, anchor_failed = build_territory(
-        before_spans, after_spans, anchor, new_text)
+    orig_font_raw, before_core, product_seq, overlapping, anchor_failed, ambiguous_reason = \
+        build_territory(before_spans, after_spans, anchor, new_text)
     visible_repl = [ch for ch in repl if not ch.isspace()]
 
+    if ambiguous_reason:
+        # Territory geometry undecidable (new spatial hole, or the
+        # alignment would cross an untouched right neighbor): abstain.
+        return "skip_font_oracle", {"territory_ambiguous": ambiguous_reason}
     if overlapping:
         return "skip_font_oracle", {"overlapping_text": overlapping}
     if not product_seq:
@@ -676,11 +732,12 @@ def detect_glyph_tofu(after_img, page_box, before_spans, after_spans, edit_bbox,
             if ImageChops.difference(
                     before_img.crop(rect), after_img.crop(rect)).getbbox() is None:
                 mc, _core_live, _core_area = _masked_span(
-                    after_img, rect, others, protect_rect=own_rect)
+                    after_img, rect, others, glyph_pad=4, protect_rect=own_rect)
                 if mc is not None and mc >= 96:
-                    # Unchanged in-place char with attributable ink; same
-                    # provenance argument as the ink test below — the
-                    # area floor does not gate the inked direction.
+                    # Unchanged in-place char with INNER-margin
+                    # attributable ink; same provenance + inner-margin
+                    # argument as the ink test below — the area floor
+                    # does not gate the inked direction.
                     continue
         ring = _ring_contrast(after_img, rect, glyph_rects)
         if ring is None or ring >= 96:
@@ -689,20 +746,32 @@ def detect_glyph_tofu(after_img, page_box, before_spans, after_spans, edit_bbox,
             # way — abstain on this char rather than guess.
             unknown.append(ch)
             continue
+        # INKED requires INNER-margin ink (round 12): italic overhang can
+        # bleed past the 2px punch pad, so ink surviving only in the 2px
+        # band right at a punch boundary may still be a neighbor's. The
+        # qualifying ink must sit >= 2px inside from every punched
+        # foreign region — measured by re-masking with the punches
+        # expanded a further 2px (glyph_pad=4). Known residual: an
+        # overhang longer than 4px total still reaches the inner region;
+        # fixed pads cannot bound arbitrary swash lengths. The sufficiency floor
+        # deliberately does NOT gate the inked branch (reviewed ruling,
+        # round 11 follow-up): inner-surviving ink is attributable by
+        # provenance regardless of how few pixels survive; the fringe
+        # outside the glyph pads is background the ring check already
+        # validated. The floor only guards the blank/unknown direction
+        # (and blank has the raw<96 requirement as its own second gate).
+        span_inner, _il, _ia = _masked_span(
+            after_img, rect, others, glyph_pad=4, protect_rect=own_rect)
+        if span_inner is not None and span_inner >= 96:
+            judged += 1  # inner-margin ink: attributable with slack
+            continue
         span_contrast, core_live, core_area = _masked_span(
             after_img, rect, others, protect_rect=own_rect)
         if span_contrast is not None and span_contrast >= 96:
-            # INKED — and the sufficiency floor deliberately does NOT
-            # gate this branch (reviewed ruling, round 11 follow-up):
-            # every surviving pixel has already passed the symmetric 2px
-            # subtraction, so whatever ink remains is attributable to
-            # this glyph REGARDLESS of how few pixels survived; the
-            # fringe outside the glyph pads is background the ring check
-            # already validated as uniform. Attributability is about
-            # provenance, not area. The floor only guards the
-            # blank/unknown direction below (and blank has the raw<96
-            # requirement as its own second gate).
-            judged += 1
+            # Ink exists only within the 2px boundary band next to a
+            # punched foreign region: could be this glyph's, could be
+            # the neighbor's overhang — unattributable, abstain.
+            unattributable.append(ch)
             continue
         if core_area > 0 and core_live < max(4, 0.3 * core_area):
             # Fast abstention: the glyph's own core exists but almost
