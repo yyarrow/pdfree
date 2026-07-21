@@ -284,15 +284,19 @@ def match_untouched_neighbors(before_spans, after_spans, edit_bbox, tol=2.0, pix
     union region and is forced through the ink test, where it fails. When
     pixel_ctx is None (span-only fixtures) matching is distance-only.
 
-    Returns (before_in, after_in, matched, had_candidate) where before_in /
+    Returns (before_in, after_in, matched, pixel_vetoed) where before_in /
     after_in are the in-bbox subsets (original span tuples, order kept),
     matched maps after_in index -> before_in index of its consumed twin,
-    and had_candidate is the set of after_in indices that had at least one
-    distance candidate (same char + same base font within tol) — an
-    unmatched index in had_candidate was either pixel-vetoed or lost its
-    twin to another span, which downstream checks classify differently
-    from a plain edit product (see detect_glyph_tofu's three-way
-    classification).
+    and pixel_vetoed is the set of after_in indices that ACTIVELY FAILED
+    pixel verification for a live candidate (its turn came in the greedy
+    loop with the twin still unconsumed, and the union-rect renders
+    differed). Losing a twin to another span is deliberately NOT a veto:
+    e.g. a legitimate borrowed-font edit product (engine writes FontB for
+    a glyph the target font lacks) can land within tol of an untouched
+    FontB neighbor that consumed its own twin — that new span was never
+    pixel-refuted and must be treated as a plain edit product downstream
+    (aligned + ink-tested), not classified ambiguous (see
+    detect_glyph_tofu).
     """
     in_bbox = _bbox_overlap_pred(edit_bbox)
     before_in = [(c, f, box) for c, f, box in before_spans if in_bbox(box)]
@@ -338,16 +342,18 @@ def match_untouched_neighbors(before_spans, after_spans, edit_bbox, tol=2.0, pix
         pixel_ok_cache[(i, j)] = ok
         return ok
 
-    had_candidate = {i for _, i, _ in candidates}
     matched, used_before = {}, set()
+    pixel_vetoed = set()
     for _, i, j in candidates:
         if i in matched or j in used_before:
             continue
         if not pixel_identical(i, j):
-            continue  # renders differ: not an untouched neighbor
+            pixel_vetoed.add(i)  # actively refuted by the renders
+            continue
         matched[i] = j
         used_before.add(j)
-    return before_in, after_in, matched, had_candidate
+    pixel_vetoed -= set(matched)  # a later candidate may still have matched it
+    return before_in, after_in, matched, pixel_vetoed
 
 
 def mutool_probe(case, pdf_path, out_pdf, run, work):
@@ -419,12 +425,12 @@ def detect_font_substitution(before_spans, after_spans, edit_bbox, pixel_ctx=Non
     accepted for signature symmetry but intentionally unused.
     """
     del pixel_ctx  # distance-only by design; see docstring
-    before_in, after_in, matched, _had_candidate = match_untouched_neighbors(
+    before_in, after_in, matched, _pixel_vetoed = match_untouched_neighbors(
         before_spans, after_spans, edit_bbox)
     if not before_in:
         return None, None
 
-    orig_font_raw = _majority_font(before_in)
+    orig_font_raw = _target_font(before_in, edit_bbox)
     orig_font = strip_subset_prefix(orig_font_raw)
 
     covered_chars = {c for c, f, _ in before_spans if strip_subset_prefix(f) == orig_font}
@@ -447,6 +453,27 @@ def _majority_font(spans):
     for _, f, _ in spans:
         counts[f] = counts.get(f, 0) + 1
     return max(counts, key=counts.get)
+
+
+def _target_font(before_in, edit_bbox):
+    """Raw font name of the EDIT TARGET, inferred from the CORE of the
+    reported edit bbox: only before spans whose center lies inside the
+    UNPADDED bbox vote. before_in was collected with a 2pt overlap pad, so
+    a long adjacent run in another font can outnumber a short edit target
+    in the padded set and flip a naive majority vote — inverting the
+    downstream classification (blank target glyphs dropped as ambiguous,
+    inked neighbors admitted to the alignment). Grazed neighbors' centers
+    fall outside the unpadded bbox, so the core vote is immune. Falls back
+    to the padded-majority vote if no span centers inside (degenerate
+    bboxes), which simply restores the previous behavior there.
+    """
+    bx0, by0, bx1, by1 = edit_bbox
+    core = [
+        s for s in before_in
+        if bx0 <= (s[2][0] + s[2][2]) / 2 <= bx1
+        and by0 <= (s[2][1] + s[2][3]) / 2 <= by1
+    ]
+    return _majority_font(core if core else before_in)
 
 
 def _ring_contrast(img, quad_rect, glyph_rects, expand=3, glyph_pad=2):
@@ -511,17 +538,20 @@ def detect_glyph_tofu(after_img, page_box, before_spans, after_spans, edit_bbox,
        but pixel-vetoed with a TARGET-font twin (a same-font twin nearby
        is exactly the round-4/5 capture scenario: it must face the ink
        test). Joins the alignment string and is ink-tested.
-    3. AMBIGUOUS — distance-matched but pixel-vetoed (or twin consumed)
-       where the twin is an OTHER-font span. Since distance candidates
-       require the same base font, this means the after span ITSELF is in
-       a non-target font: it is not part of the edited run, and its pixel
-       difference is most likely adjacent edit ink swallowed by the union
-       pad (italic overhang / antialias bleed). It is neither a trusted
-       neighbor nor an edit product: excluded from the alignment string
-       entirely — not ink-tested, and NOT allowed to account for repl
-       characters. A blank replacement glyph therefore stays the only
-       alignment candidate for its repl char and fails the ink test,
-       instead of the inked bled-into neighbor absorbing the alignment.
+    3. AMBIGUOUS — ACTIVELY pixel-vetoed (its candidate's turn came with
+       the twin unconsumed and the union-rect renders differed) AND in a
+       non-target font. Since distance candidates require the same base
+       font, a non-target-font span with a veto is not part of the edited
+       run, and its pixel difference is most likely adjacent edit ink
+       swallowed by the union pad (italic overhang / antialias bleed). It
+       is neither a trusted neighbor nor an edit product: excluded from
+       the alignment string entirely — not ink-tested, and NOT allowed to
+       account for repl characters. A blank replacement glyph therefore
+       stays the only alignment candidate for its repl char and fails the
+       ink test, instead of the inked bled-into neighbor absorbing the
+       alignment. Merely LOSING a twin to one-to-one consumption is not a
+       veto: such spans (e.g. a legitimate borrowed-font glyph written
+       within tol of an untouched same-font neighbor) stay class 2.
        Residual window unchanged (documented in
        detect_font_substitution): a replacement char mis-painted in a
        neighbor's font within 2pt of a same-char span of that font is
@@ -561,7 +591,7 @@ def detect_glyph_tofu(after_img, page_box, before_spans, after_spans, edit_bbox,
     (None, None).
     """
     pixel_ctx = (before_img, after_img, page_box) if before_img is not None else None
-    before_in, after_in, matched, had_candidate = match_untouched_neighbors(
+    before_in, after_in, matched, pixel_vetoed = match_untouched_neighbors(
         before_spans, after_spans, edit_bbox, pixel_ctx=pixel_ctx)
     visible_repl = [ch for ch in repl if not ch.isspace()]
 
@@ -575,10 +605,15 @@ def detect_glyph_tofu(after_img, page_box, before_spans, after_spans, edit_bbox,
             }
         return None, None
 
-    orig_font = strip_subset_prefix(_majority_font(before_in)) if before_in else None
+    orig_font = strip_subset_prefix(_target_font(before_in, edit_bbox)) if before_in else None
 
     # Three-way classification -> (span, is_product) alignment sequence in
     # reading order; ambiguous spans are dropped entirely (see docstring).
+    # Ambiguity requires an ACTIVE pixel veto: a span that merely lost its
+    # twin to another span (one-to-one consumption) was never refuted by
+    # the renders and stays an edit product — e.g. a legitimate
+    # borrowed-font glyph written within tol of an untouched same-font
+    # neighbor must still be aligned and ink-tested, not dropped.
     seq = []
     ambiguous = []
     for i, span in enumerate(after_in):
@@ -587,7 +622,7 @@ def detect_glyph_tofu(after_img, page_box, before_spans, after_spans, edit_bbox,
                 seq.append((span, False))  # verified neighbor, target font
             continue  # verified other-font neighbor: excluded
         span_font = strip_subset_prefix(span[1])
-        if i in had_candidate and orig_font is not None and span_font != orig_font:
+        if i in pixel_vetoed and orig_font is not None and span_font != orig_font:
             ambiguous.append(span[0])  # class 3: excluded from alignment
             continue
         seq.append((span, True))  # class 2: edit product, ink-tested
