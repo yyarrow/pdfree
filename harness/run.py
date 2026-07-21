@@ -246,7 +246,7 @@ def _bbox_overlap_pred(bbox, pad=2.0):
     return pred
 
 
-def match_untouched_neighbors(before_spans, after_spans, edit_bbox, tol=2.0):
+def match_untouched_neighbors(before_spans, after_spans, edit_bbox, tol=2.0, pixel_ctx=None):
     """ONE-TO-ONE greedy matching of in-bbox after spans to in-bbox before
     spans: a pair qualifies when char, base font, and all four bbox coords
     (each within `tol` pt) agree; closest pairs (by max coord delta) are
@@ -263,15 +263,22 @@ def match_untouched_neighbors(before_spans, after_spans, edit_bbox, tol=2.0):
     neighbor spans are consumed by their own before twins and cannot be
     mistaken for surviving replacement text.
 
-    KNOWN LIMITATION (reviewed; accepted by user decision, PR #8 round 3):
-    if a rewritten character happens to land within the 2pt tolerance of a
-    DIFFERENT sequence position that held the same char in the same base
-    font before the edit, it can be consumed as an "untouched neighbor"
-    and skip downstream scrutiny (e.g. the tofu ink test). Constructing
-    this requires two same-char/same-font twins within 2pt of each other —
-    only possible at tiny font sizes or with overlapping renders, since
-    normal glyph advances exceed 2pt at any size; judge()'s pixel-diff
-    checks still cover the window.
+    PIXEL VERIFICATION (pixel_ctx = (before_img, after_img, page_box)):
+    distance alone cannot be trusted — narrow glyphs advance less than tol
+    at ordinary sizes (Helvetica 'i' is 222/1000 em = 1.998pt at 9pt), so
+    a rewritten char CAN land within tol of a different same-char/same-font
+    twin's old position. "Untouched" is therefore verified against its own
+    definition: the after quad's pixel region must be RAW-identical between
+    the before and after renders (ImageChops.difference(...).getbbox() is
+    None — same no-threshold standard as the identity check). Any pixel
+    difference cancels the match and the span is treated as an edit
+    product. Mis-cancelling is cheap: a genuinely untouched char with ink
+    still passes the downstream ink test as an edit product, and blank
+    (whitespace) chars are skipped by that test anyway; whereas the
+    dangerous case — a newly written BLANK glyph sitting where an inked
+    twin used to be — necessarily differs from the before render and is
+    forced through the ink test, where it fails. When pixel_ctx is None
+    (span-only fixtures) matching is distance-only.
 
     Returns (before_in, after_in, matched) where before_in / after_in are
     the in-bbox subsets (original span tuples, order kept) and matched maps
@@ -292,39 +299,69 @@ def match_untouched_neighbors(before_spans, after_spans, edit_bbox, tol=2.0):
                 candidates.append((delta, i, j))
     candidates.sort(key=lambda t: t[0])  # distance-first greedy: order-stable
 
+    pixel_ok_cache = {}
+
+    def pixel_identical(i):
+        """Whether after_in[i]'s quad rendered identically before/after.
+        Depends only on the after span's quad, so cache per index."""
+        if pixel_ctx is None:
+            return True
+        if i in pixel_ok_cache:
+            return pixel_ok_cache[i]
+        before_img, after_img, page_box = pixel_ctx
+        w, h = after_img.size
+        px0, py0, px1, py1 = bbox_to_pixels(after_in[i][2], page_box, pad=0)
+        px0, py0 = max(px0, 0), max(py0, 0)
+        px1, py1 = min(px1, w), min(py1, h)
+        if px1 <= px0 or py1 <= py0:
+            ok = False  # degenerate/offpage quad: nothing verifiable
+        else:
+            rect = (px0, py0, px1, py1)
+            ok = ImageChops.difference(
+                before_img.crop(rect), after_img.crop(rect)).getbbox() is None
+        pixel_ok_cache[i] = ok
+        return ok
+
     matched, used_before = {}, set()
     for _, i, j in candidates:
         if i in matched or j in used_before:
             continue
+        if not pixel_identical(i):
+            continue  # renders differ: not an untouched neighbor
         matched[i] = j
         used_before.add(j)
     return before_in, after_in, matched
 
 
 def mutool_probe(case, pdf_path, out_pdf, run, work):
-    """Shared I/O for checks 2 and 3 (font substitution / glyph tofu): one
-    render (for the after-page bitmap + page_box) plus two mutool stext
-    calls (before/after), so the two checks don't each re-invoke mutool.
+    """Shared I/O for checks 2 and 3 (font substitution / glyph tofu):
+    before AND after page renders (the before bitmap feeds the pixel
+    verification of neighbor matches, see match_untouched_neighbors) plus
+    two mutool stext calls, so the two checks don't each re-invoke mutool.
 
-    Returns (page_box, before_spans, after_spans, after_img), or None on
-    any failure (render crash, mutool crash/timeout, unparseable XML) —
-    callers treat None as skip_font_oracle.
+    Returns (page_box, before_spans, after_spans, before_img, after_img),
+    or None on any failure (render crash, size mismatch, mutool
+    crash/timeout, unparseable XML) — callers treat None as
+    skip_font_oracle.
     """
     page_no = run["page"]
     try:
+        before_img, page_box_b, _ = render_page(pdf_path, page_no - 1, work / f"{case}_fontprobe_before.png")
         after_img, page_box, _ = render_page(out_pdf, page_no - 1, work / f"{case}_fontprobe_after.png")
     except RenderCrash:
         return None
-    if after_img is None or page_box is None:
+    if after_img is None or page_box is None or before_img is None:
         return None
+    if before_img.size != after_img.size:
+        return None  # quad regions wouldn't be comparable pixel-for-pixel
     before_spans = mutool_char_spans(pdf_path, page_no, page_box)
     after_spans = mutool_char_spans(out_pdf, page_no, page_box)
     if before_spans is None or after_spans is None:
         return None
-    return page_box, before_spans, after_spans, after_img
+    return page_box, before_spans, after_spans, before_img, after_img
 
 
-def detect_font_substitution(before_spans, after_spans, edit_bbox):
+def detect_font_substitution(before_spans, after_spans, edit_bbox, pixel_ctx=None):
     """Check 2: characters the ORIGINAL font already covered (drawn
     somewhere on the before-page in that font — a conservative black-box
     proof the font has the glyph) must keep the same base font after the
@@ -345,7 +382,8 @@ def detect_font_substitution(before_spans, after_spans, edit_bbox):
     Pure function over already-fetched mutool spans; returns
     ("fail_font_substituted", detail) or (None, None).
     """
-    before_in, after_in, matched = match_untouched_neighbors(before_spans, after_spans, edit_bbox)
+    before_in, after_in, matched = match_untouched_neighbors(
+        before_spans, after_spans, edit_bbox, pixel_ctx=pixel_ctx)
     if not before_in:
         return None, None
 
@@ -410,7 +448,8 @@ def _ring_contrast(img, quad_rect, glyph_rects, expand=3, glyph_pad=2):
     return live[-1] - live[0]
 
 
-def detect_glyph_tofu(after_img, page_box, before_spans, after_spans, edit_bbox, repl):
+def detect_glyph_tofu(after_img, page_box, before_spans, after_spans, edit_bbox, repl,
+                      before_img=None):
     """Check 3: a replacement character can be encoded into a subset font
     that keeps the SAME font name (so check 2 sees nothing wrong) but lacks
     that glyph's outline — the text layer says the character is there
@@ -454,17 +493,21 @@ def detect_glyph_tofu(after_img, page_box, before_spans, after_spans, edit_bbox,
     are simply not judged — tofu there goes undetected by THIS check
     (judge's pixel-diff checks still apply).
 
-    Neighbor-matching inherits match_untouched_neighbors()'s known 2pt-twin
-    limitation (see its docstring): a rewritten char within 2pt of a
-    same-char/same-font twin's old position can be misclassified as an
-    untouched neighbor and skip the ink test — accepted risk, judge()'s
-    pixel checks still apply.
+    Neighbor matches are pixel-verified when before_img is supplied (see
+    match_untouched_neighbors): a span only counts as an untouched
+    neighbor if its quad rendered raw-identical before and after, so a
+    newly written blank glyph landing on an inked twin's old position
+    (possible within the 2pt tolerance: narrow glyphs advance < 2pt at
+    ordinary sizes) is forced through the ink test instead of being
+    skipped.
 
-    Pure function except for PIL crops on the caller-supplied after_img;
+    Pure function except for PIL crops on the caller-supplied images;
     returns ("fail_glyph_tofu", detail), ("skip_font_oracle", detail), or
     (None, None).
     """
-    before_in, after_in, matched = match_untouched_neighbors(before_spans, after_spans, edit_bbox)
+    pixel_ctx = (before_img, after_img, page_box) if before_img is not None else None
+    before_in, after_in, matched = match_untouched_neighbors(
+        before_spans, after_spans, edit_bbox, pixel_ctx=pixel_ctx)
     visible_repl = [ch for ch in repl if not ch.isspace()]
 
     if all(i in matched for i in range(len(after_in))):
@@ -761,15 +804,18 @@ def run_case(pdf_path: Path, work: Path):
         if probe is None:
             skip_font_oracle = True
         else:
-            page_box, before_spans, after_spans, after_img = probe
+            page_box, before_spans, after_spans, before_img, after_img = probe
             edit_bbox = tuple(report["bbox"])
+            pixel_ctx = (before_img, after_img, page_box)
             try:
-                font_verdict, font_info = detect_font_substitution(before_spans, after_spans, edit_bbox)
+                font_verdict, font_info = detect_font_substitution(
+                    before_spans, after_spans, edit_bbox, pixel_ctx=pixel_ctx)
             except Exception:
                 font_verdict, font_info = None, None
             try:
                 tofu_verdict, tofu_info = detect_glyph_tofu(
-                    after_img, page_box, before_spans, after_spans, edit_bbox, repl)
+                    after_img, page_box, before_spans, after_spans, edit_bbox, repl,
+                    before_img=before_img)
             except Exception:
                 tofu_verdict, tofu_info = None, None
 

@@ -91,12 +91,15 @@ def main():
     if probe is None:
         print("mutool_probe returned None (mutool crash/timeout/parse failure) -- can't self-test")
         sys.exit(1)
-    page_box, before_spans, after_spans, after_img = probe
+    page_box, before_spans, after_spans, before_img, after_img = probe
     edit_bbox = tuple(report["bbox"])
+    pixel_ctx = (before_img, after_img, page_box)
 
-    font_verdict, font_info = R.detect_font_substitution(before_spans, after_spans, edit_bbox)
+    font_verdict, font_info = R.detect_font_substitution(
+        before_spans, after_spans, edit_bbox, pixel_ctx=pixel_ctx)
     tofu_verdict, tofu_info = R.detect_glyph_tofu(
-        after_img, page_box, before_spans, after_spans, edit_bbox, REPL)
+        after_img, page_box, before_spans, after_spans, edit_bbox, REPL,
+        before_img=before_img)
 
     print(f"check 2 (font substitution): {font_verdict} {font_info}")
     print(f"check 3 (glyph tofu):        {tofu_verdict} {tofu_info}")
