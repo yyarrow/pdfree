@@ -406,14 +406,18 @@ def build_territory(before_spans, after_spans, pre_edit_bbox, new_text):
     #    nothing, or nothing anchored at the pre-edit x0, goes straight
     #    to the missing path before any boundary reasoning.
     # 2. Rigid-shift candidates are collected with NO filtering, scoring
-    #    or physical bounds. Exactly one candidate -> it is the boundary
+    #    or physical bounds. A candidate is ACCEPTABLE only with an
+    #    anchored, non-empty prefix alignment (round 18): a candidate
+    #    overlapping the anchor position itself is a geometric ambiguity
+    #    (replacement left at x0 vs. suffix shifted onto x0) and is
+    #    invalid. Exactly one acceptable hypothesis -> it is the boundary
     #    and its prefix alignment is the product sequence. Two or more
-    #    candidates whose prefix alignments give DIFFERENT product
-    #    hypotheses -> right_boundary_ambiguous, unconditionally
-    #    (repeated text makes the product/suffix split inherently
-    #    undecidable — the honest outcome is an abstention, never a
-    #    truncated-products missing verdict). Zero candidates while
-    #    before right neighbors exist -> right_boundary_lost.
+    #    DIFFERENT acceptable product hypotheses ->
+    #    right_boundary_ambiguous, unconditionally (repeated text makes
+    #    the product/suffix split inherently undecidable — the honest
+    #    outcome is an abstention, never a truncated-products missing
+    #    verdict). No acceptable candidate while before right neighbors
+    #    exist -> right_boundary_lost.
     #
     # DELETION EDITS (round 17): new_text == "" declares the product
     # sequence empty — nothing to ink-test, nothing for the font check,
@@ -473,31 +477,43 @@ def build_territory(before_spans, after_spans, pre_edit_bbox, new_text):
                     deltas.append(abox[0] - bbox_[0])
                 if ok and max(deltas) - min(deltas) <= 0.5:
                     cands.append(i)
-            if not cands:
+            # ACCEPTANCE (round 18, completes the uniqueness rule): every
+            # candidate — including a unique one — must carry an ANCHORED,
+            # NON-EMPTY prefix alignment (at least one product span at the
+            # pre-edit x0). A candidate whose prefix is empty coincides
+            # with the anchor position itself: that geometry (replacement
+            # char left at x0 vs. vanished replacement with the suffix
+            # shifted onto x0) is inherently indistinguishable and belongs
+            # to the abstention class, never to missing and never to a
+            # decided boundary. All candidates invalid while before right
+            # neighbors exist -> right_boundary_lost.
+            K = 8
+            evaluated = sorted(cands, reverse=True)[:K]
+            valid = []
+            for i in evaluated:
+                pf, pl = _align(new_text, upto=i)
+                if pf is None:
+                    continue  # empty prefix: candidate sits on the anchor
+                if abs(after_band[pf][2][0] - x0) > BAND_PAD:
+                    continue  # prefix not anchored at the target
+                valid.append((pf, pl))
+            hyps = set(valid)
+            if not valid:
                 ambiguous_reason = "right_boundary_lost"
-            elif len(cands) == 1:
-                chosen = _align(new_text, upto=cands[0])
+            elif len(cands) > K or len(hyps) >= 2:
+                ambiguous_reason = "right_boundary_ambiguous"
             else:
-                K = 8
-                evaluated = sorted(cands, reverse=True)[:K]
-                hyps = {_align(new_text, upto=i) for i in evaluated}
-                if len(cands) > K or len(hyps) >= 2:
-                    ambiguous_reason = "right_boundary_ambiguous"
-                else:
-                    chosen = next(iter(hyps))
+                chosen = next(iter(hyps))
         # else: anchored, no right neighbors -> plain global products below
 
         if ambiguous_reason:
             product_seq = []
         elif chosen is not None:
-            pf, pl = chosen
-            if pf is None:
-                product_seq = []  # boundary set, nothing before it: missing path
-            else:
-                product_seq, gap_amb = truncate_continuous(after_band[: pl + 1])
-                if gap_amb:
-                    product_seq = []
-                    ambiguous_reason = "gap_ambiguous"
+            _pf, pl = chosen
+            product_seq, gap_amb = truncate_continuous(after_band[: pl + 1])
+            if gap_amb:
+                product_seq = []
+                ambiguous_reason = "gap_ambiguous"
         elif g_first is not None and not anchor_failed:
             product_seq, gap_amb = truncate_continuous(after_band[: g_last + 1])
             if gap_amb:
