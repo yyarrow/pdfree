@@ -1326,9 +1326,13 @@ mod tests {
         (doc, page_id)
     }
 
-    fn bundled_fallback() -> crate::ttf::TtfFont {
-        let data = std::fs::read("/Users/ian/Work/pdfree/assets/NotoSansSC.ttf").unwrap();
-        crate::ttf::TtfFont::parse(data).unwrap()
+    /// A committed pyftsubset fixture covering exactly "dxyz" — the tests'
+    /// fallback font. Hermetic: no dependency on the gitignored bundled
+    /// asset or any author-local path.
+    const FALLBACK_TTF: &[u8] = include_bytes!("testdata/noto_sc_subset_dxyz.ttf");
+
+    fn test_fallback() -> crate::ttf::TtfFont {
+        crate::ttf::TtfFont::parse(FALLBACK_TTF.to_vec()).unwrap()
     }
 
     /// Per-char fallback: a replacement mixing covered and missing chars
@@ -1338,7 +1342,7 @@ mod tests {
     fn split_fallback_keeps_covered_chars_in_original_font() {
         use crate::replace::replace_text;
         let (mut doc, page_id) = build_page_doc(Some(SUBSET_TTF));
-        let fb = bundled_fallback();
+        let fb = test_fallback();
         // 'd' is missing from the subset; 'I' and 'n' are covered.
         replace_text(&mut doc, 1, "Ian", "Idn", Some(&fb)).unwrap();
         let (_, segs) = crate::walk::walk_page(&doc, page_id, 1).unwrap();
@@ -1354,13 +1358,45 @@ mod tests {
         assert!(segs[1].bbox[2] <= segs[2].bbox[0] + 0.5);
     }
 
+    /// crbot #9 round-1 finding 1: a split the fallback can't fully cover
+    /// must NOT claim the rescue — the borrow path keeps the chance it had
+    /// before the split existed. 'q' is missing from BOTH the subset and
+    /// the dxyz fallback fixture, but the page carries an unembedded
+    /// standard-14 Helvetica that renders the whole replacement.
+    #[test]
+    fn uncoverable_split_falls_through_to_borrow() {
+        use crate::replace::replace_text;
+        let (mut doc, page_id) = build_page_doc(Some(SUBSET_TTF));
+        // Second /Font resource: plain Helvetica (std14, no font program).
+        let helv = doc.add_object(dictionary! {
+            "Type" => "Font",
+            "Subtype" => "Type1",
+            "BaseFont" => "Helvetica",
+            "Encoding" => "WinAnsiEncoding",
+        });
+        {
+            let page = doc.get_dictionary_mut(page_id).unwrap();
+            let res = page.get_mut(b"Resources").unwrap().as_dict_mut().unwrap();
+            let fonts = res.get_mut(b"Font").unwrap().as_dict_mut().unwrap();
+            fonts.set("F2", Object::Reference(helv));
+        }
+        let fb = test_fallback();
+        // 'I'/'n' native, 'q' missing everywhere -> preflight rejects the
+        // split -> borrow renders the whole segment in Helvetica.
+        replace_text(&mut doc, 1, "Ian", "Iqn", Some(&fb)).unwrap();
+        let (_, segs) = crate::walk::walk_page(&doc, page_id, 1).unwrap();
+        assert_eq!(segs.len(), 1, "borrowed whole-segment rendition");
+        assert_eq!(segs[0].font, "F2", "borrowed the document's Helvetica");
+        assert_eq!(segs[0].text, "Iqn");
+    }
+
     /// No covered chars at all -> the split doesn't apply and the whole
     /// segment falls back exactly as before.
     #[test]
     fn all_missing_replacement_takes_whole_fallback() {
         use crate::replace::replace_text;
         let (mut doc, page_id) = build_page_doc(Some(SUBSET_TTF));
-        let fb = bundled_fallback();
+        let fb = test_fallback();
         // None of these chars are in the subset ('元' is, but '素'/'表' are
         // not in " ()Ian元桓" — use fully-missing text to hit the whole path).
         replace_text(&mut doc, 1, "Ian", "xyz", Some(&fb)).unwrap();

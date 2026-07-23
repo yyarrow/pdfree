@@ -214,7 +214,7 @@ pub(crate) fn replace_seg_internal(
             // gaps — the visible font change shrinks to the missing
             // characters instead of swallowing the whole segment.
             if let Some(ttf) = fallback {
-                if let Some(spans) = partition_native(doc, page_id, &seg, &new_text) {
+                if let Some(spans) = partition_native(doc, page_id, &seg, &new_text, ttf) {
                     return replace_with_fallback_split(
                         doc, page_id, page_no, content, seg, &new_text, spans, old_adv, ttf,
                     );
@@ -368,11 +368,19 @@ fn try_borrow(
 /// `None` also for CID and Type3 originals: CID codes are multi-byte and
 /// per-byte reasoning doesn't hold; Type3 originals interact with the
 /// weird-scale size calibration that the whole-segment path owns.
+///
+/// PREFLIGHT: the split may only claim the rescue when it is guaranteed to
+/// succeed — every missing character must be renderable by the fallback
+/// font, and the distinct missing set must fit a Type3 font's 255 byte
+/// codes. Otherwise `None`, so the borrow rescue keeps the chance it had
+/// before the split path existed (a mixed replacement the bundled fallback
+/// can't fully cover may still be rendered whole by another document font).
 fn partition_native(
     doc: &Document,
     page_id: ObjectId,
     seg: &Seg,
     new_text: &str,
+    ttf: &TtfFont,
 ) -> Option<Vec<(bool, String)>> {
     let fonts = load_fonts(doc, page_id);
     let font = fonts.get(seg.font.as_bytes())?;
@@ -381,6 +389,7 @@ fn partition_native(
     }
     let mut spans: Vec<(bool, String)> = Vec::new();
     let (mut any_native, mut any_fb) = (false, false);
+    let mut fb_chars: std::collections::HashSet<char> = std::collections::HashSet::new();
     for c in new_text.chars() {
         let native = font.encode(doc, &c.to_string()).is_some_and(|bytes| {
             !bytes.is_empty()
@@ -388,11 +397,22 @@ fn partition_native(
                     .iter()
                     .all(|&b| seg.bytes.contains(&b) || font.glyph_available(doc, b, Some(c)))
         });
-        if native { any_native = true } else { any_fb = true }
+        if native {
+            any_native = true
+        } else {
+            if !ttf.can_render_char(c) {
+                return None; // fallback can't cover this gap: leave the rescue order alone
+            }
+            fb_chars.insert(c);
+            any_fb = true
+        }
         match spans.last_mut() {
             Some((n, s)) if *n == native => s.push(c),
             _ => spans.push((native, c.to_string())),
         }
+    }
+    if fb_chars.len() > 255 {
+        return None; // Type3 codes are single bytes
     }
     (any_native && any_fb).then_some(spans)
 }
