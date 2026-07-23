@@ -207,12 +207,22 @@ pub(crate) fn replace_seg_internal(
     let (new_bytes, old_adv, new_adv) = match encoded {
         Ok(v) => v,
         Err((e @ (ReplaceError::Unencodable | ReplaceError::MissingGlyph), old_adv)) => {
-            // The segment's own font can't express the replacement; both
-            // rescue paths rewrite the whole segment with `new_text`.
+            // The segment's own font can't express the replacement.
             let seg = seg.clone();
-            // First choice: borrow another font already in the document —
-            // its glyphs match the document's typography exactly. Only then
-            // synthesize a Type3 fallback from the bundled font.
+            // First choice: keep every character the original font CAN
+            // paint in that font and synthesize the fallback only for the
+            // gaps — the visible font change shrinks to the missing
+            // characters instead of swallowing the whole segment.
+            if let Some(ttf) = fallback {
+                if let Some(spans) = partition_native(doc, page_id, &seg, &new_text, ttf) {
+                    return replace_with_fallback_split(
+                        doc, page_id, page_no, content, seg, &new_text, spans, old_adv, ttf,
+                    );
+                }
+            }
+            // Second: borrow another font already in the document — its
+            // glyphs match the document's typography exactly. Only then
+            // rewrite the whole segment in a synthesized Type3 fallback.
             if let Some((res_name, bytes, new_adv)) = try_borrow(doc, page_id, &segs, &seg, &new_text) {
                 let size = seg.font_size;
                 return finish_swap(
@@ -351,6 +361,169 @@ fn try_borrow(
     candidates.into_iter().next().map(|(_, n, b, a)| (n, b, a))
 }
 
+/// Split `new_text` into maximal runs the segment's OWN font can render
+/// natively vs runs that need the fallback. `Some(spans)` only when there is
+/// at least one of each — all-native never reaches the rescue path, and
+/// no-native means the whole-segment fallback is the honest rendition.
+/// `None` also for CID and Type3 originals: CID codes are multi-byte and
+/// per-byte reasoning doesn't hold; Type3 originals interact with the
+/// weird-scale size calibration that the whole-segment path owns.
+///
+/// PREFLIGHT: the split may only claim the rescue when it is guaranteed to
+/// succeed — every missing character must be renderable by the fallback
+/// font, and the distinct missing set must fit a Type3 font's 255 byte
+/// codes. Otherwise `None`, so the borrow rescue keeps the chance it had
+/// before the split path existed (a mixed replacement the bundled fallback
+/// can't fully cover may still be rendered whole by another document font).
+fn partition_native(
+    doc: &Document,
+    page_id: ObjectId,
+    seg: &Seg,
+    new_text: &str,
+    ttf: &TtfFont,
+) -> Option<Vec<(bool, String)>> {
+    let fonts = load_fonts(doc, page_id);
+    let font = fonts.get(seg.font.as_bytes())?;
+    if font.cid || font.type3 {
+        return None;
+    }
+    let mut spans: Vec<(bool, String)> = Vec::new();
+    let (mut any_native, mut any_fb) = (false, false);
+    let mut fb_chars: std::collections::HashSet<char> = std::collections::HashSet::new();
+    for c in new_text.chars() {
+        let native = font.encode(doc, &c.to_string()).is_some_and(|bytes| {
+            !bytes.is_empty()
+                && bytes
+                    .iter()
+                    .all(|&b| seg.bytes.contains(&b) || font.glyph_available(doc, b, Some(c)))
+        });
+        if native {
+            any_native = true
+        } else {
+            if !ttf.can_render_char(c) {
+                return None; // fallback can't cover this gap: leave the rescue order alone
+            }
+            fb_chars.insert(c);
+            any_fb = true
+        }
+        match spans.last_mut() {
+            Some((n, s)) if *n == native => s.push(c),
+            _ => spans.push((native, c.to_string())),
+        }
+    }
+    if fb_chars.len() > 255 {
+        return None; // Type3 codes are single bytes
+    }
+    (any_native && any_fb).then_some(spans)
+}
+
+/// Per-character fallback: every run the original font can paint stays in
+/// the original font; only the gaps render in the synthesized Type3. The
+/// show op becomes an alternation of Tf switches and TJ strings, with one
+/// net width-compensation number at the end, so the visible font change is
+/// confined to exactly the characters the document's own font lacks.
+#[allow(clippy::too_many_arguments)]
+fn replace_with_fallback_split(
+    doc: &mut Document,
+    page_id: ObjectId,
+    page_no: u32,
+    mut content: lopdf::content::Content,
+    seg: Seg,
+    with: &str,
+    spans: Vec<(bool, String)>,
+    old_adv: f32,
+    ttf: &TtfFont,
+) -> Result<ReplaceReport, ReplaceError> {
+    // Phase 1 (immutable): encode the native runs through the segment's own
+    // font, char by char — exactly the encoding partition_native verified —
+    // so any surprise fails BEFORE the document is touched.
+    // plan: (native, bytes, advance in em-1000 at seg.font_size).
+    let mut plan: Vec<(bool, Vec<u8>, f32)> = Vec::with_capacity(spans.len());
+    {
+        let fonts = load_fonts(doc, page_id);
+        let font = fonts.get(seg.font.as_bytes()).ok_or(ReplaceError::Unencodable)?;
+        for (native, s) in &spans {
+            if *native {
+                let mut bytes = Vec::new();
+                for c in s.chars() {
+                    bytes.extend(font.encode(doc, &c.to_string()).ok_or(ReplaceError::Unencodable)?);
+                }
+                let adv = font.advance(&bytes, s.chars().count());
+                plan.push((true, bytes, adv));
+            } else {
+                plan.push((false, Vec::new(), 0.0));
+            }
+        }
+    }
+
+    // Phase 2 (mutable): synthesize the fallback for ONLY the missing chars.
+    let fb_chars: Vec<char> = spans.iter().filter(|(n, _)| !*n).flat_map(|(_, s)| s.chars()).collect();
+    let fb = build_type3_font(doc, ttf, &fb_chars).ok_or(ReplaceError::Unencodable)?;
+    let fb_name = add_font_resource(doc, page_id, fb.font_id)?;
+    for (i, (native, s)) in spans.iter().enumerate() {
+        if !*native {
+            plan[i].1 = s.chars().map(|c| fb.codes[&c]).collect();
+            plan[i].2 = s.chars().map(|c| fb.advances[&c] / fb.units_per_em * 1000.0).sum();
+        }
+    }
+
+    let ctx = swap_context(doc, page_id, &content, &seg)?;
+    let fb_tf = Operation::new(
+        "Tf",
+        vec![Object::Name(fb_name.into_bytes()), Object::Real(seg.font_size)],
+    );
+
+    let mut ops: Vec<Operation> = ctx.prelude;
+    if !ctx.before.is_empty() {
+        ops.push(Operation::new("TJ", vec![Object::Array(ctx.before)]));
+    }
+    // The original font is the active state on entry; emit a Tf only when
+    // the class actually changes, and restore at the end if we left off in
+    // the fallback.
+    let mut cur_native = true;
+    for (native, bytes, _) in &plan {
+        if *native != cur_native {
+            ops.push(if *native { ctx.restore_op.clone() } else { fb_tf.clone() });
+            cur_native = *native;
+        }
+        ops.push(Operation::new(
+            "TJ",
+            vec![Object::Array(vec![Object::String(bytes.clone(), lopdf::StringFormat::Literal)])],
+        ));
+    }
+    if !cur_native {
+        ops.push(ctx.restore_op.clone());
+    }
+    // Everything renders at seg.font_size (the fallback is em-normalized and
+    // Type3 originals are excluded from splitting), so advances share one
+    // unit space and the net compensation is a plain difference, emitted
+    // while the restored original state is active.
+    let new_adv: f32 = plan.iter().map(|(_, _, a)| a).sum();
+    let delta = new_adv - old_adv;
+    if delta.abs() > 0.01 {
+        ops.push(Operation::new("TJ", vec![Object::Array(vec![Object::Real(delta)])]));
+    }
+    if !ctx.after.is_empty() {
+        ops.push(Operation::new("TJ", vec![Object::Array(ctx.after)]));
+    }
+
+    content.operations.splice(seg.op_idx..seg.op_idx + 1, ops);
+    let encoded = content.encode()?;
+    set_page_content(doc, page_id, encoded)?;
+
+    let mut bbox = seg.bbox;
+    let width_ratio = if old_adv > 0.0 { new_adv / old_adv } else { 1.0 };
+    if width_ratio > 1.0 {
+        bbox[2] = bbox[0] + (bbox[2] - bbox[0]) * width_ratio;
+    }
+    Ok(ReplaceReport {
+        page: page_no,
+        old_text: seg.text,
+        new_text: with.to_string(),
+        bbox,
+    })
+}
+
 /// Whole-segment replacement rendered in a synthesized Type3 fallback font.
 #[allow(clippy::too_many_arguments)]
 fn replace_with_fallback(
@@ -407,6 +580,76 @@ fn replace_with_fallback(
     )
 }
 
+/// The pieces shared by every swap-style rewrite of a segment's show op:
+/// the Tf that restores the ORIGINAL text state, the untouched sibling TJ
+/// elements around the edited string, and the prelude ops that reproduce a
+/// '/" operator's side effects.
+struct SwapContext {
+    restore_op: Operation,
+    prelude: Vec<Operation>,
+    before: Vec<Object>,
+    after: Vec<Object>,
+}
+
+/// Compute the swap context for `seg`'s show op. Fonts carried by an
+/// ExtGState have no /Font name a Tf could reference — and replaying the
+/// gs would also replay unrelated state it carries (opacity, blend mode) —
+/// so the same font object gets registered under a real /Font name instead.
+fn swap_context(
+    doc: &mut Document,
+    page_id: ObjectId,
+    content: &lopdf::content::Content,
+    seg: &Seg,
+) -> Result<SwapContext, ReplaceError> {
+    let restore_op = if seg.font.starts_with("gs:") {
+        match crate::walk::gs_fonts_for_restore(doc, page_id).remove(&seg.font) {
+            Some((id, dict)) => {
+                // Direct (non-reference) font dicts get materialized as an
+                // object; replaying the gs is never an option.
+                let fid = id.unwrap_or_else(|| doc.add_object(Object::Dictionary(dict)));
+                let n = add_font_resource(doc, page_id, fid)?;
+                Operation::new("Tf", vec![Object::Name(n.into_bytes()), Object::Real(seg.font_size)])
+            }
+            None => return Err(ReplaceError::Unencodable),
+        }
+    } else {
+        Operation::new(
+            "Tf",
+            vec![Object::Name(seg.font.clone().into_bytes()), Object::Real(seg.font_size)],
+        )
+    };
+    let op = &content.operations[seg.op_idx];
+    // For a multi-string TJ, the untouched sibling elements stay in the
+    // original font: the array is split around the edited element and the
+    // halves become their own TJ ops (Tf between them doesn't move the pen).
+    let (before, after) = match op.operator.as_str() {
+        "Tj" | "'" | "\"" => (Vec::new(), Vec::new()),
+        "TJ" => {
+            let arr = op.operands[0].as_array().map_err(ReplaceError::Pdf)?;
+            let pos = arr
+                .iter()
+                .enumerate()
+                .filter(|(_, o)| matches!(o, Object::String(..)))
+                .map(|(i, _)| i)
+                .nth(seg.str_idx)
+                .ok_or_else(|| ReplaceError::UnsupportedOperator("TJ".into()))?;
+            (arr[..pos].to_vec(), arr[pos + 1..].to_vec())
+        }
+        other => return Err(ReplaceError::UnsupportedOperator(other.to_string())),
+    };
+    let mut prelude = Vec::new();
+    match op.operator.as_str() {
+        "'" => prelude.push(Operation::new("T*", vec![])),
+        "\"" => {
+            prelude.push(Operation::new("Tw", vec![op.operands[0].clone()]));
+            prelude.push(Operation::new("Tc", vec![op.operands[1].clone()]));
+            prelude.push(Operation::new("T*", vec![]));
+        }
+        _ => {}
+    }
+    Ok(SwapContext { restore_op, prelude, before, after })
+}
+
 /// Rewrite the segment's show op to render `string_bytes` in the font
 /// resource `res_name`: the op becomes [before-TJ] Tf(res) TJ[(bytes) comp]
 /// Tf(original) [after-TJ], so sibling TJ elements keep their font and
@@ -425,50 +668,8 @@ fn finish_swap(
     old_adv: f32,
     swap_size: f32,
 ) -> Result<ReplaceReport, ReplaceError> {
-    // Restore op for the original text state, computed up front (it may
-    // need to register resources). Fonts carried by an ExtGState have no
-    // /Font name a Tf could reference — and replaying the gs would also
-    // replay unrelated state it carries (opacity, blend mode) — so the same
-    // font object gets registered under a real /Font name instead.
-    let restore_op = if seg.font.starts_with("gs:") {
-        match crate::walk::gs_fonts_for_restore(doc, page_id).remove(&seg.font) {
-            Some((id, dict)) => {
-                // Direct (non-reference) font dicts get materialized as an
-                // object; replaying the gs is never an option — it would
-                // also replay unrelated state the ExtGState carries.
-                let fid = id.unwrap_or_else(|| doc.add_object(Object::Dictionary(dict)));
-                let n = add_font_resource(doc, page_id, fid)?;
-                Operation::new("Tf", vec![Object::Name(n.into_bytes()), Object::Real(seg.font_size)])
-            }
-            None => return Err(ReplaceError::Unencodable),
-        }
-    } else {
-        Operation::new(
-            "Tf",
-            vec![Object::Name(seg.font.clone().into_bytes()), Object::Real(seg.font_size)],
-        )
-    };
-    let op_kind = content.operations[seg.op_idx].operator.clone();
-    // For a multi-string TJ, the untouched sibling elements stay in the
-    // original font: the array is split around the edited element and the
-    // halves become their own TJ ops (Tf between them doesn't move the pen).
-    let (before, after) = match op_kind.as_str() {
-        "Tj" | "'" | "\"" => (Vec::new(), Vec::new()),
-        "TJ" => {
-            let arr = content.operations[seg.op_idx].operands[0]
-                .as_array()
-                .map_err(ReplaceError::Pdf)?;
-            let pos = arr
-                .iter()
-                .enumerate()
-                .filter(|(_, o)| matches!(o, Object::String(..)))
-                .map(|(i, _)| i)
-                .nth(seg.str_idx)
-                .ok_or_else(|| ReplaceError::UnsupportedOperator("TJ".into()))?;
-            (arr[..pos].to_vec(), arr[pos + 1..].to_vec())
-        }
-        other => return Err(ReplaceError::UnsupportedOperator(other.to_string())),
-    };
+    let ctx = swap_context(doc, page_id, &content, &seg)?;
+    let SwapContext { restore_op, prelude, before, after } = ctx;
 
     // The TJ compensation number acts at the ACTIVE font size (swap_size);
     // old_adv was measured at seg.font_size — rescale so the text-space
@@ -479,17 +680,7 @@ fn finish_swap(
         new_adv - old_adv
     };
 
-    let mut ops: Vec<Operation> = Vec::new();
-    match op_kind.as_str() {
-        "'" => ops.push(Operation::new("T*", vec![])),
-        "\"" => {
-            let o = &content.operations[seg.op_idx].operands;
-            ops.push(Operation::new("Tw", vec![o[0].clone()]));
-            ops.push(Operation::new("Tc", vec![o[1].clone()]));
-            ops.push(Operation::new("T*", vec![]));
-        }
-        _ => {}
-    }
+    let mut ops: Vec<Operation> = prelude;
     if !before.is_empty() {
         ops.push(Operation::new("TJ", vec![Object::Array(before)]));
     }
