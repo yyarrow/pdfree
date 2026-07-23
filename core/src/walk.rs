@@ -1296,6 +1296,81 @@ mod tests {
         replace_text(&mut doc, 1, "Ian", "nIa", None).unwrap();
     }
 
+    fn build_page_doc(fontfile: Option<&[u8]>) -> (Document, lopdf::ObjectId) {
+        let mut doc = Document::with_version("1.7");
+        let font_id = font_dict_id_with(&mut doc, fontfile);
+        let content = doc.add_object(Stream::new(
+            dictionary! {},
+            b"BT /F1 24 Tf 72 700 Td (Ian) Tj ET".to_vec(),
+        ));
+        let pages_id = doc.new_object_id();
+        let page_id = doc.add_object(dictionary! {
+            "Type" => "Page",
+            "Parent" => Object::Reference(pages_id),
+            "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+            "Contents" => Object::Reference(content),
+            "Resources" => dictionary! {
+                "Font" => dictionary! { "F1" => Object::Reference(font_id) },
+            },
+        });
+        doc.set_object(pages_id, dictionary! {
+            "Type" => "Pages",
+            "Kids" => vec![Object::Reference(page_id)],
+            "Count" => 1,
+        });
+        let catalog = doc.add_object(dictionary! {
+            "Type" => "Catalog",
+            "Pages" => Object::Reference(pages_id),
+        });
+        doc.trailer.set("Root", Object::Reference(catalog));
+        (doc, page_id)
+    }
+
+    fn bundled_fallback() -> crate::ttf::TtfFont {
+        let data = std::fs::read("/Users/ian/Work/pdfree/assets/NotoSansSC.ttf").unwrap();
+        crate::ttf::TtfFont::parse(data).unwrap()
+    }
+
+    /// Per-char fallback: a replacement mixing covered and missing chars
+    /// keeps the covered ones in the ORIGINAL font; only the gap renders in
+    /// the synthesized Type3. Verified through the engine's own walker.
+    #[test]
+    fn split_fallback_keeps_covered_chars_in_original_font() {
+        use crate::replace::replace_text;
+        let (mut doc, page_id) = build_page_doc(Some(SUBSET_TTF));
+        let fb = bundled_fallback();
+        // 'd' is missing from the subset; 'I' and 'n' are covered.
+        replace_text(&mut doc, 1, "Ian", "Idn", Some(&fb)).unwrap();
+        let (_, segs) = crate::walk::walk_page(&doc, page_id, 1).unwrap();
+        let texts: Vec<&str> = segs.iter().map(|s| s.text.as_str()).collect();
+        assert_eq!(texts, vec!["I", "d", "n"], "three alternating spans");
+        assert_eq!(segs[0].font, "F1", "covered prefix stays in the original font");
+        assert_eq!(segs[2].font, "F1", "covered suffix stays in the original font");
+        assert_ne!(segs[1].font, "F1", "missing char renders in the fallback resource");
+        assert!(segs[1].type3, "fallback span is the synthesized Type3");
+        // Layout: the compensation must keep the total advance sane — the
+        // three spans sit left-to-right without overlap.
+        assert!(segs[0].bbox[2] <= segs[1].bbox[0] + 0.5);
+        assert!(segs[1].bbox[2] <= segs[2].bbox[0] + 0.5);
+    }
+
+    /// No covered chars at all -> the split doesn't apply and the whole
+    /// segment falls back exactly as before.
+    #[test]
+    fn all_missing_replacement_takes_whole_fallback() {
+        use crate::replace::replace_text;
+        let (mut doc, page_id) = build_page_doc(Some(SUBSET_TTF));
+        let fb = bundled_fallback();
+        // None of these chars are in the subset ('元' is, but '素'/'表' are
+        // not in " ()Ian元桓" — use fully-missing text to hit the whole path).
+        replace_text(&mut doc, 1, "Ian", "xyz", Some(&fb)).unwrap();
+        let (_, segs) = crate::walk::walk_page(&doc, page_id, 1).unwrap();
+        assert_eq!(segs.len(), 1, "single span, whole-segment fallback");
+        assert_ne!(segs[0].font, "F1");
+        assert!(segs[0].type3);
+        assert_eq!(segs[0].text, "xyz");
+    }
+
     /// Same end-to-end guarantee for the byte-keyed-cmap embed shape.
     #[test]
     fn replace_refuses_missing_glyph_with_mac_cmap_font() {
