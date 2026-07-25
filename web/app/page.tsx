@@ -95,6 +95,9 @@ export default function Home() {
   const [dragOver, setDragOver] = useState(false);
   const [rects, setRects] = useState<RunRect[]>([]);
   const [edited, setEdited] = useState(false);
+  // True from the moment an edit is submitted until the engine has
+  // serialized it: the downloadable bytes are stale for that stretch.
+  const [committing, setCommitting] = useState(false);
   // Shown instantly at the edit position while the real render catches up.
   const [optimistic, setOptimistic] = useState<{ l: number; t: number; w: number; h: number; text: string } | null>(
     null,
@@ -106,6 +109,15 @@ export default function Home() {
   const docRef = useRef<any>(null);
   const sessionRef = useRef<DocSession | null>(null);
   const toastTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // Serialized bytes of the newest committed edit. `pdfBytes` only catches
+  // up once the matching pdf.js document has loaded, so downloading during
+  // that window would hand back a file missing the edit the user just made.
+  const latestBytesRef = useRef<Uint8Array | null>(null);
+  // Generation token for document-changing operations. Every open/edit
+  // takes a number; an async continuation may only install its results
+  // while it still holds the newest one, so an abandoned load can never
+  // resurrect a replaced document or desync docRef/sessionRef/pdfBytes.
+  const opSeqRef = useRef(0);
 
   const showToast = useCallback((text: string, err = false) => {
     setToast({ text, err });
@@ -123,21 +135,33 @@ export default function Home() {
       cMapUrl: "/pdfjs/cmaps/",
       cMapPacked: true,
     }).promise;
+    return doc;
+  }, []);
+
+  /// Install a freshly loaded document as the render source, retiring the
+  /// previous one. Callers must check their generation token first.
+  const installDoc = useCallback((doc: any) => {
     docRef.current?.destroy?.();
     docRef.current = doc;
-    return doc;
   }, []);
 
   const openPdf = useCallback(
     async (bytes: Uint8Array, name: string) => {
       setBusy("正在解析…");
       setPopover(null);
+      const myOp = ++opSeqRef.current;
       try {
         const engine = await loadEngine();
-        sessionRef.current?.free?.();
-        const session = new engine.DocSession(bytes);
-        sessionRef.current = session;
+        if (opSeqRef.current !== myOp) return; // superseded while loading
         const doc = await loadPdfjsDoc(bytes);
+        if (opSeqRef.current !== myOp) {
+          doc.destroy?.();
+          return;
+        }
+        sessionRef.current?.free?.();
+        sessionRef.current = new engine.DocSession(bytes);
+        installDoc(doc);
+        latestBytesRef.current = bytes;
         setPdfBytes(bytes);
         setFileName(name);
         setPageCount(doc.numPages);
@@ -148,7 +172,7 @@ export default function Home() {
         setBusy("");
       }
     },
-    [showToast, loadPdfjsDoc],
+    [showToast, loadPdfjsDoc, installDoc],
   );
 
   const onFile = useCallback(
@@ -229,9 +253,21 @@ export default function Home() {
     };
   }, [page, pdfBytes]);
 
-  const clickRun = useCallback((rect: RunRect) => {
-    setPopover({ rect, x: rect.left, y: rect.top + rect.h + 6, value: rect.run.text });
-  }, []);
+  const clickRun = useCallback(
+    (rect: RunRect) => {
+      // Edits are strictly serial: a submitted edit isn't in the engine
+      // until save() returns, and starting another one meanwhile would
+      // supersede the first — silently dropping a change the user already
+      // confirmed. The window is only human-visible when the fallback font
+      // has to be fetched, which is exactly when it must not be lost.
+      if (committing) {
+        showToast("上一处修改还在提交，请稍候");
+        return;
+      }
+      setPopover({ rect, x: rect.left, y: rect.top + rect.h + 6, value: rect.run.text });
+    },
+    [committing, showToast],
+  );
 
   const applyEdit = useCallback(async () => {
     const session = sessionRef.current;
@@ -245,6 +281,11 @@ export default function Home() {
     // canvas refresh below swaps in the real render and clears it.
     setOptimistic({ l: rect.left, t: rect.top, w: rect.w, h: rect.h, text: value });
     setPopover(null);
+    const myOp = ++opSeqRef.current;
+    // The engine holds this edit only from save() onwards; until then the
+    // downloadable bytes still predate it, so exporting must wait (the
+    // fallback-font load below can make that window human-visible).
+    setCommitting(true);
     try {
       try {
         session.replace_run(page, rect.b, rect.l, rect.r, value);
@@ -253,27 +294,56 @@ export default function Home() {
         if (!msg.includes("cannot represent") || session.has_fallback()) throw e;
         // Fonts lack the glyphs — load the fallback once and retry.
         setBusy("原字体缺字形，正在加载兜底字体…");
-        session.set_fallback_font(await loadFallbackFont());
+        const fallbackFont = await loadFallbackFont();
+        // Re-check BEFORE touching the session: a newer edit (or a reset)
+        // may have landed during the load, and this stale continuation
+        // must not mutate the shared session or publish its bytes.
+        if (opSeqRef.current !== myOp || sessionRef.current !== session) return;
         setBusy("");
+        session.set_fallback_font(fallbackFont);
         session.replace_run(page, rect.b, rect.l, rect.r, value);
       }
-      // pdf.js needs fresh full bytes; the model refresh happens in the
-      // render effect once pdfBytes changes.
+      // pdf.js needs fresh full bytes. Load the new document BEFORE the
+      // state change: the render effect reads docRef (a ref, not state),
+      // so publishing pdfBytes first would let it repaint from the stale
+      // document and leave the new one with nothing to trigger a redraw —
+      // the edit would only appear on the NEXT edit's render pass.
       const bytes = session.save();
-      setPdfBytes(bytes);
-      await loadPdfjsDoc(bytes);
+      // Publish the downloadable bytes IMMEDIATELY: the edit is committed
+      // in the engine, so a download during the render load below must
+      // include it. Only the on-screen state waits for the document.
+      latestBytesRef.current = bytes;
       setEdited(true);
+      setCommitting(false); // bytes now include this edit; export is safe
+      const doc = await loadPdfjsDoc(bytes);
+      if (opSeqRef.current !== myOp) {
+        // Superseded (another edit, or a different file was opened) —
+        // discard this render, whoever came last owns the screen.
+        doc.destroy?.();
+        return;
+      }
+      installDoc(doc);
+      setPdfBytes(bytes);
     } catch (e) {
       setOptimistic(null);
       showToast(friendlyError(e instanceof Error ? e.message : String(e)), true);
     } finally {
-      setBusy("");
+      // Only the operation that still owns the generation may clear the
+      // shared busy/committing flags — a superseded continuation would
+      // otherwise unblock export while the newer edit is mid-flight.
+      if (opSeqRef.current === myOp) {
+        setBusy("");
+        setCommitting(false);
+      }
     }
-  }, [popover, page, showToast, loadPdfjsDoc]);
+  }, [popover, page, showToast, loadPdfjsDoc, installDoc]);
 
   const download = useCallback(() => {
-    if (!pdfBytes) return;
-    const blob = new Blob([pdfBytes.slice()], { type: "application/pdf" });
+    // The freshest committed bytes, which may be one render ahead of the
+    // on-screen document (see latestBytesRef).
+    const bytes = latestBytesRef.current ?? pdfBytes;
+    if (!bytes) return;
+    const blob = new Blob([bytes.slice()], { type: "application/pdf" });
     const url = URL.createObjectURL(blob);
     const a = document.createElement("a");
     a.href = url;
@@ -351,14 +421,26 @@ export default function Home() {
             <button
               className="btn secondary"
               onClick={() => {
+                // Reset is a document-changing operation too: bump the
+                // generation so an edit still awaiting its render can't
+                // reinstall the document we are dropping here.
+                opSeqRef.current += 1;
                 docRef.current?.destroy?.();
                 docRef.current = null;
                 sessionRef.current?.free?.();
                 sessionRef.current = null;
+                latestBytesRef.current = null;
                 setPdfBytes(null);
                 setRects([]);
                 setPopover(null);
                 setOptimistic(null);
+                setEdited(false);
+                // The superseded operation's finally deliberately skips
+                // shared-flag cleanup, so reset owns it: otherwise the
+                // fallback-font message would sit on the drop screen and
+                // `committing` would follow into the next document.
+                setBusy("");
+                setCommitting(false);
               }}
             >
               ← 换个文件
@@ -379,7 +461,7 @@ export default function Home() {
               ›
             </button>
             <span className="spacer" />
-            <button className="btn accent" disabled={!edited} onClick={download}>
+            <button className="btn accent" disabled={!edited || committing} onClick={download}>
               下载修改后的 PDF
             </button>
           </div>
