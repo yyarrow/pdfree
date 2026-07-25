@@ -257,11 +257,14 @@ export default function Home() {
         setBusy("");
         session.replace_run(page, rect.b, rect.l, rect.r, value);
       }
-      // pdf.js needs fresh full bytes; the model refresh happens in the
-      // render effect once pdfBytes changes.
+      // pdf.js needs fresh full bytes. Load the new document BEFORE the
+      // state change: the render effect reads docRef (a ref, not state),
+      // so publishing pdfBytes first would let it repaint from the stale
+      // document and leave the new one with nothing to trigger a redraw —
+      // the edit would only appear on the NEXT edit's render pass.
       const bytes = session.save();
-      setPdfBytes(bytes);
       await loadPdfjsDoc(bytes);
+      setPdfBytes(bytes);
       setEdited(true);
     } catch (e) {
       setOptimistic(null);
