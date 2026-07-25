@@ -253,9 +253,21 @@ export default function Home() {
     };
   }, [page, pdfBytes]);
 
-  const clickRun = useCallback((rect: RunRect) => {
-    setPopover({ rect, x: rect.left, y: rect.top + rect.h + 6, value: rect.run.text });
-  }, []);
+  const clickRun = useCallback(
+    (rect: RunRect) => {
+      // Edits are strictly serial: a submitted edit isn't in the engine
+      // until save() returns, and starting another one meanwhile would
+      // supersede the first — silently dropping a change the user already
+      // confirmed. The window is only human-visible when the fallback font
+      // has to be fetched, which is exactly when it must not be lost.
+      if (committing) {
+        showToast("上一处修改还在提交，请稍候");
+        return;
+      }
+      setPopover({ rect, x: rect.left, y: rect.top + rect.h + 6, value: rect.run.text });
+    },
+    [committing, showToast],
+  );
 
   const applyEdit = useCallback(async () => {
     const session = sessionRef.current;
@@ -423,6 +435,12 @@ export default function Home() {
                 setPopover(null);
                 setOptimistic(null);
                 setEdited(false);
+                // The superseded operation's finally deliberately skips
+                // shared-flag cleanup, so reset owns it: otherwise the
+                // fallback-font message would sit on the drop screen and
+                // `committing` would follow into the next document.
+                setBusy("");
+                setCommitting(false);
               }}
             >
               ← 换个文件
