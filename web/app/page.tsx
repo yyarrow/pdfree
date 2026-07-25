@@ -106,6 +106,15 @@ export default function Home() {
   const docRef = useRef<any>(null);
   const sessionRef = useRef<DocSession | null>(null);
   const toastTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // Serialized bytes of the newest committed edit. `pdfBytes` only catches
+  // up once the matching pdf.js document has loaded, so downloading during
+  // that window would hand back a file missing the edit the user just made.
+  const latestBytesRef = useRef<Uint8Array | null>(null);
+  // Generation token for document-changing operations. Every open/edit
+  // takes a number; an async continuation may only install its results
+  // while it still holds the newest one, so an abandoned load can never
+  // resurrect a replaced document or desync docRef/sessionRef/pdfBytes.
+  const opSeqRef = useRef(0);
 
   const showToast = useCallback((text: string, err = false) => {
     setToast({ text, err });
@@ -123,21 +132,33 @@ export default function Home() {
       cMapUrl: "/pdfjs/cmaps/",
       cMapPacked: true,
     }).promise;
+    return doc;
+  }, []);
+
+  /// Install a freshly loaded document as the render source, retiring the
+  /// previous one. Callers must check their generation token first.
+  const installDoc = useCallback((doc: any) => {
     docRef.current?.destroy?.();
     docRef.current = doc;
-    return doc;
   }, []);
 
   const openPdf = useCallback(
     async (bytes: Uint8Array, name: string) => {
       setBusy("正在解析…");
       setPopover(null);
+      const myOp = ++opSeqRef.current;
       try {
         const engine = await loadEngine();
-        sessionRef.current?.free?.();
-        const session = new engine.DocSession(bytes);
-        sessionRef.current = session;
+        if (opSeqRef.current !== myOp) return; // superseded while loading
         const doc = await loadPdfjsDoc(bytes);
+        if (opSeqRef.current !== myOp) {
+          doc.destroy?.();
+          return;
+        }
+        sessionRef.current?.free?.();
+        sessionRef.current = new engine.DocSession(bytes);
+        installDoc(doc);
+        latestBytesRef.current = bytes;
         setPdfBytes(bytes);
         setFileName(name);
         setPageCount(doc.numPages);
@@ -148,7 +169,7 @@ export default function Home() {
         setBusy("");
       }
     },
-    [showToast, loadPdfjsDoc],
+    [showToast, loadPdfjsDoc, installDoc],
   );
 
   const onFile = useCallback(
@@ -245,6 +266,7 @@ export default function Home() {
     // canvas refresh below swaps in the real render and clears it.
     setOptimistic({ l: rect.left, t: rect.top, w: rect.w, h: rect.h, text: value });
     setPopover(null);
+    const myOp = ++opSeqRef.current;
     try {
       try {
         session.replace_run(page, rect.b, rect.l, rect.r, value);
@@ -263,20 +285,34 @@ export default function Home() {
       // document and leave the new one with nothing to trigger a redraw —
       // the edit would only appear on the NEXT edit's render pass.
       const bytes = session.save();
-      await loadPdfjsDoc(bytes);
-      setPdfBytes(bytes);
+      // Publish the downloadable bytes IMMEDIATELY: the edit is committed
+      // in the engine, so a download during the render load below must
+      // include it. Only the on-screen state waits for the document.
+      latestBytesRef.current = bytes;
       setEdited(true);
+      const doc = await loadPdfjsDoc(bytes);
+      if (opSeqRef.current !== myOp) {
+        // Superseded (another edit, or a different file was opened) —
+        // discard this render, whoever came last owns the screen.
+        doc.destroy?.();
+        return;
+      }
+      installDoc(doc);
+      setPdfBytes(bytes);
     } catch (e) {
       setOptimistic(null);
       showToast(friendlyError(e instanceof Error ? e.message : String(e)), true);
     } finally {
       setBusy("");
     }
-  }, [popover, page, showToast, loadPdfjsDoc]);
+  }, [popover, page, showToast, loadPdfjsDoc, installDoc]);
 
   const download = useCallback(() => {
-    if (!pdfBytes) return;
-    const blob = new Blob([pdfBytes.slice()], { type: "application/pdf" });
+    // The freshest committed bytes, which may be one render ahead of the
+    // on-screen document (see latestBytesRef).
+    const bytes = latestBytesRef.current ?? pdfBytes;
+    if (!bytes) return;
+    const blob = new Blob([bytes.slice()], { type: "application/pdf" });
     const url = URL.createObjectURL(blob);
     const a = document.createElement("a");
     a.href = url;
