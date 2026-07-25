@@ -95,6 +95,9 @@ export default function Home() {
   const [dragOver, setDragOver] = useState(false);
   const [rects, setRects] = useState<RunRect[]>([]);
   const [edited, setEdited] = useState(false);
+  // True from the moment an edit is submitted until the engine has
+  // serialized it: the downloadable bytes are stale for that stretch.
+  const [committing, setCommitting] = useState(false);
   // Shown instantly at the edit position while the real render catches up.
   const [optimistic, setOptimistic] = useState<{ l: number; t: number; w: number; h: number; text: string } | null>(
     null,
@@ -267,6 +270,10 @@ export default function Home() {
     setOptimistic({ l: rect.left, t: rect.top, w: rect.w, h: rect.h, text: value });
     setPopover(null);
     const myOp = ++opSeqRef.current;
+    // The engine holds this edit only from save() onwards; until then the
+    // downloadable bytes still predate it, so exporting must wait (the
+    // fallback-font load below can make that window human-visible).
+    setCommitting(true);
     try {
       try {
         session.replace_run(page, rect.b, rect.l, rect.r, value);
@@ -275,8 +282,13 @@ export default function Home() {
         if (!msg.includes("cannot represent") || session.has_fallback()) throw e;
         // Fonts lack the glyphs — load the fallback once and retry.
         setBusy("原字体缺字形，正在加载兜底字体…");
-        session.set_fallback_font(await loadFallbackFont());
+        const fallbackFont = await loadFallbackFont();
+        // Re-check BEFORE touching the session: a newer edit (or a reset)
+        // may have landed during the load, and this stale continuation
+        // must not mutate the shared session or publish its bytes.
+        if (opSeqRef.current !== myOp || sessionRef.current !== session) return;
         setBusy("");
+        session.set_fallback_font(fallbackFont);
         session.replace_run(page, rect.b, rect.l, rect.r, value);
       }
       // pdf.js needs fresh full bytes. Load the new document BEFORE the
@@ -290,6 +302,7 @@ export default function Home() {
       // include it. Only the on-screen state waits for the document.
       latestBytesRef.current = bytes;
       setEdited(true);
+      setCommitting(false); // bytes now include this edit; export is safe
       const doc = await loadPdfjsDoc(bytes);
       if (opSeqRef.current !== myOp) {
         // Superseded (another edit, or a different file was opened) —
@@ -303,7 +316,13 @@ export default function Home() {
       setOptimistic(null);
       showToast(friendlyError(e instanceof Error ? e.message : String(e)), true);
     } finally {
-      setBusy("");
+      // Only the operation that still owns the generation may clear the
+      // shared busy/committing flags — a superseded continuation would
+      // otherwise unblock export while the newer edit is mid-flight.
+      if (opSeqRef.current === myOp) {
+        setBusy("");
+        setCommitting(false);
+      }
     }
   }, [popover, page, showToast, loadPdfjsDoc, installDoc]);
 
@@ -390,14 +409,20 @@ export default function Home() {
             <button
               className="btn secondary"
               onClick={() => {
+                // Reset is a document-changing operation too: bump the
+                // generation so an edit still awaiting its render can't
+                // reinstall the document we are dropping here.
+                opSeqRef.current += 1;
                 docRef.current?.destroy?.();
                 docRef.current = null;
                 sessionRef.current?.free?.();
                 sessionRef.current = null;
+                latestBytesRef.current = null;
                 setPdfBytes(null);
                 setRects([]);
                 setPopover(null);
                 setOptimistic(null);
+                setEdited(false);
               }}
             >
               ← 换个文件
@@ -418,7 +443,7 @@ export default function Home() {
               ›
             </button>
             <span className="spacer" />
-            <button className="btn accent" disabled={!edited} onClick={download}>
+            <button className="btn accent" disabled={!edited || committing} onClick={download}>
               下载修改后的 PDF
             </button>
           </div>
