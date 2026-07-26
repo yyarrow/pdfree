@@ -151,20 +151,21 @@ pub struct CidMetrics {
 }
 
 impl CidMetrics {
+    /// O(log n) per glyph: this runs once per code unit while walking a
+    /// page, so a linear scan would make a sparse font with thousands of
+    /// singleton entries quadratic. Valid /W ranges don't overlap (ISO
+    /// 32000 9.7.4.3), so only the nearest range starting at or before
+    /// `cid` can contain it — checking that one is sufficient.
+    ///
+    /// Overlapping ranges are malformed; `parse_cid_metrics` resolves them
+    /// at build time (later definitions win, matching sequential /W
+    /// application) so this lookup stays a single probe.
     pub fn width(&self, cid: u32) -> f32 {
-        // Rightmost range whose start is <= cid; ranges may not overlap per
-        // spec, and on the pathological overlap the later entry wins (last
-        // definition seen, matching how viewers apply /W sequentially).
         let idx = self.ranges.partition_point(|&(first, _, _)| first <= cid);
-        for &(first, last, w) in self.ranges[..idx].iter().rev() {
-            if cid >= first && cid <= last {
-                return w;
-            }
-            // Ranges are sorted by `first`; once a start is far behind and
-            // its end didn't reach cid, earlier ones may still (spans can
-            // nest), so keep scanning — bounded by the entry count.
+        match idx.checked_sub(1).and_then(|i| self.ranges.get(i)) {
+            Some(&(_, last, w)) if cid <= last => w,
+            _ => self.dw,
         }
-        self.dw
     }
 }
 
@@ -789,7 +790,12 @@ fn build_font_info<'a>(doc: &'a Document, dict: &'a Dictionary) -> FontInfo<'a> 
 /// wrong widths on real text, so those keep the approximation.
 fn parse_cid_metrics(doc: &Document, dict: &Dictionary) -> Option<CidMetrics> {
     let enc = doc.dereference(dict.get(b"Encoding").ok()?).ok()?.1.as_name().ok()?;
-    if !enc.starts_with(b"Identity") {
+    // Identity-H ONLY. Identity-V is a vertical writing mode: its glyphs
+    // advance along -y and their metrics live in /W2 and /DW2, not /W//DW.
+    // The walker and reflow both model advances as +x, so trusting /W for a
+    // vertical column would regenerate following segments at wrong
+    // positions. Vertical support needs /W2 plus direction-aware walking.
+    if enc != b"Identity-H" {
         return None;
     }
     let desc = doc.dereference(dict.get(b"DescendantFonts").ok()?).ok()?.1;
@@ -851,7 +857,34 @@ fn parse_cid_metrics(doc: &Document, dict: &Dictionary) -> Option<CidMetrics> {
     }
     // An empty /W is legal — every CID then takes /DW, which is still real
     // information (and often 1000 for CJK, matching the old guess).
-    ranges.sort_by_key(|&(first, _, _)| first);
+    //
+    // Ranges enter in /W order and are made DISJOINT here so the hot-path
+    // lookup can be a single probe. Valid /W never overlaps; when a
+    // malformed font does, the later entry wins (sequential application,
+    // what a viewer would do) by carving the earlier one around it.
+    let mut disjoint: std::collections::BTreeMap<u32, (u32, f32)> = std::collections::BTreeMap::new();
+    for (s, e, w) in ranges {
+        // The map is disjoint, so `end` grows with `start`: scanning left
+        // from `e` can stop at the first entry that ends before `s`.
+        let mut clipped: Vec<(u32, u32, f32)> = Vec::new();
+        for (&ks, &(ke, kw)) in disjoint.range(..=e).rev() {
+            if ke < s {
+                break;
+            }
+            clipped.push((ks, ke, kw));
+        }
+        for (ks, ke, kw) in clipped {
+            disjoint.remove(&ks);
+            if ks < s {
+                disjoint.insert(ks, (s - 1, kw)); // ks < s implies s >= 1
+            }
+            if ke > e {
+                disjoint.insert(e + 1, (ke, kw));
+            }
+        }
+        disjoint.insert(s, (e, w));
+    }
+    let ranges = disjoint.into_iter().map(|(s, (e, w))| (s, e, w)).collect();
     Some(CidMetrics { dw, ranges })
 }
 
@@ -1668,13 +1701,48 @@ mod cid_tests {
     }
 
     #[test]
-    fn identity_without_w_still_trusts_dw() {
+    fn identity_h_without_w_still_trusts_dw() {
         // /W is optional; every CID then legitimately takes /DW.
-        let (doc, id) = type0_doc("Identity-V", false);
+        let (doc, id) = type0_doc("Identity-H", false);
         let f = info(&doc, id);
-        let m = f.cid_metrics.as_ref().expect("Identity-V is an identity mapping");
+        let m = f.cid_metrics.as_ref().expect("Identity-H is an identity mapping");
         assert_eq!(m.width(7), 1000.0);
         assert!(f.cid_widths_trusted());
+    }
+
+    #[test]
+    fn identity_v_is_refused_because_metrics_are_vertical() {
+        // crbot #13 round-1: Identity-V advances along -y with /W2//DW2
+        // metrics. The walker models +x advances only, so trusting /W here
+        // would misplace regenerated segments in a vertical column.
+        let (doc, id) = type0_doc("Identity-V", true);
+        let f = info(&doc, id);
+        assert!(f.cid_metrics.is_none(), "vertical writing must not use /W");
+        assert!(!f.cid_widths_trusted());
+    }
+
+    #[test]
+    fn malformed_overlapping_w_entries_resolve_to_the_later_one() {
+        // Valid /W never overlaps; when it does, the later entry wins and
+        // the lookup must stay a single probe (no linear rescan).
+        let mut doc = Document::with_version("1.7");
+        let cid_id = doc.add_object(dictionary! {
+            "Type" => "Font", "Subtype" => "CIDFontType2", "BaseFont" => "T", "DW" => 1000,
+            // 10..30 = 400, then 15..20 = 900 overlapping it.
+            "W" => vec![10.into(), 30.into(), 400.into(), 15.into(), 20.into(), 900.into()],
+        });
+        let font_id = doc.add_object(dictionary! {
+            "Type" => "Font", "Subtype" => "Type0", "BaseFont" => "T",
+            "Encoding" => "Identity-H",
+            "DescendantFonts" => vec![Object::Reference(cid_id)],
+        });
+        let f = info(&doc, font_id);
+        let m = f.cid_metrics.as_ref().unwrap();
+        assert_eq!(m.width(12), 400.0, "outside the overlap keeps the first span");
+        assert_eq!(m.width(15), 900.0, "overlap start takes the later entry");
+        assert_eq!(m.width(20), 900.0, "overlap end takes the later entry");
+        assert_eq!(m.width(25), 400.0, "right remainder keeps the first span");
+        assert_eq!(m.width(31), 1000.0, "beyond both -> /DW");
     }
 
     #[test]
