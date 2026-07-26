@@ -39,6 +39,9 @@ pub struct Seg {
     pub bbox: [f32; 4],
     /// True when the font is a Type0/CID font (multi-byte codes).
     pub cid: bool,
+    /// False only for a CID font still on the 1000-per-char width guess;
+    /// length-changing edits refuse on those (see reflow's guard).
+    pub cid_widths_trusted: bool,
     /// False for invisible text (render mode 3, e.g. OCR layers).
     pub visible: bool,
     /// True for Type3 fonts, whose glyphs are inline drawing procedures;
@@ -130,6 +133,42 @@ fn cmyk_to_rgb(c: f32, m: f32, y: f32, k: f32) -> [f32; 3] {
     [(1.0 - c) * (1.0 - k), (1.0 - m) * (1.0 - k), (1.0 - y) * (1.0 - k)]
 }
 
+/// CID glyph metrics from a CIDFont's /W array plus its /DW default
+/// (ISO 32000 9.7.4.3). Widths are in 1000ths of em, like simple fonts'
+/// /Widths.
+///
+/// /W has two alternating forms: `c [w1 w2 …]` (consecutive CIDs starting
+/// at c) and `cFirst cLast w` (one width for the whole span). The first is
+/// expanded — its length bounds it — while spans are kept as ranges: a
+/// font may legally cover `0 65535 1000`, and expanding that would be
+/// megabytes of nothing.
+#[derive(Debug, Clone)]
+pub struct CidMetrics {
+    /// /DW, or the spec default of 1000 when absent.
+    pub dw: f32,
+    /// (first, last, width), sorted by `first` for binary search.
+    ranges: Vec<(u32, u32, f32)>,
+}
+
+impl CidMetrics {
+    /// O(log n) per glyph: this runs once per code unit while walking a
+    /// page, so a linear scan would make a sparse font with thousands of
+    /// singleton entries quadratic. Valid /W ranges don't overlap (ISO
+    /// 32000 9.7.4.3), so only the nearest range starting at or before
+    /// `cid` can contain it — checking that one is sufficient.
+    ///
+    /// Overlapping ranges are malformed; `parse_cid_metrics` resolves them
+    /// at build time (later definitions win, matching sequential /W
+    /// application) so this lookup stays a single probe.
+    pub fn width(&self, cid: u32) -> f32 {
+        let idx = self.ranges.partition_point(|&(first, _, _)| first <= cid);
+        match idx.checked_sub(1).and_then(|i| self.ranges.get(i)) {
+            Some(&(_, last, w)) if cid <= last => w,
+            _ => self.dw,
+        }
+    }
+}
+
 pub struct FontInfo<'a> {
     pub dict: &'a Dictionary,
     pub cid: bool,
@@ -168,6 +207,11 @@ pub struct FontInfo<'a> {
     /// through its built-in (3,0)/(1,0) cmap exactly like the symbolic
     /// case, regardless of the Symbolic flag.
     has_encoding: bool,
+    /// Type0 only: real per-CID widths, present only when the code→CID
+    /// mapping is one we can compute (Identity-H/V: CID = the 2-byte code).
+    /// `None` leaves `advance` on its 1000-per-char approximation, which
+    /// callers must treat as untrustworthy — see `cid_widths_trusted`.
+    pub cid_metrics: Option<CidMetrics>,
 }
 
 /// Embedded font-program parse results, cached per thread (engine and WASM
@@ -301,9 +345,32 @@ fn std14_lookup(base_font: &[u8]) -> Option<&'static [f32; 256]> {
 }
 
 impl<'a> FontInfo<'a> {
+    /// Whether a CID font's advances come from its real /W metrics rather
+    /// than the 1000-per-char guess. Length-changing edits must not be
+    /// attempted on a guessed width: it poisons both the old span and the
+    /// new one (see reflow's cid-width-unavailable guard).
+    pub fn cid_widths_trusted(&self) -> bool {
+        !self.cid || self.cid_metrics.is_some()
+    }
+
     pub fn advance(&self, bytes: &[u8], decoded_chars: usize) -> f32 {
         if self.cid {
-            // v0: assume 1000/1000 em per decoded char (typical for CJK).
+            // Identity encodings make the 2-byte code the CID itself, so
+            // /W gives the true advance; anything else keeps the historical
+            // 1000-per-char approximation (and stays refused for reflow).
+            if let Some(m) = &self.cid_metrics {
+                let mut total = 0.0;
+                for pair in bytes.chunks(2) {
+                    let cid = match pair {
+                        [hi, lo] => ((*hi as u32) << 8) | *lo as u32,
+                        [only] => *only as u32, // truncated final byte: best effort
+                        _ => continue,
+                    };
+                    total += m.width(cid);
+                }
+                return total;
+            }
+            // v0 fallback: assume 1000/1000 em per decoded char (typical CJK).
             return decoded_chars as f32 * 1000.0;
         }
         let mut total = 0.0;
@@ -694,6 +761,7 @@ fn build_font_info<'a>(doc: &'a Document, dict: &'a Dictionary) -> FontInfo<'a> 
         })()
         .unwrap_or(false);
         let has_encoding = dict.has(b"Encoding");
+        let cid_metrics = if cid { parse_cid_metrics(doc, dict) } else { None };
         FontInfo {
             dict,
             cid,
@@ -709,8 +777,115 @@ fn build_font_info<'a>(doc: &'a Document, dict: &'a Dictionary) -> FontInfo<'a> 
             embedded: std::cell::OnceCell::new(),
             symbolic,
             has_encoding,
+            cid_metrics,
         }
     }
+}
+
+/// Parse a Type0 font's descendant CIDFont metrics (/DW + /W), but ONLY
+/// when the code→CID mapping is computable: /Encoding must be a name in
+/// the Identity family, where the 2-byte code IS the CID. Embedded CMap
+/// streams and the predefined CJK CMaps (GBK-EUC-H, UniGB-UCS2-H, …) map
+/// codes to CIDs through tables we don't parse; guessing there would put
+/// wrong widths on real text, so those keep the approximation.
+fn parse_cid_metrics(doc: &Document, dict: &Dictionary) -> Option<CidMetrics> {
+    let enc = doc.dereference(dict.get(b"Encoding").ok()?).ok()?.1.as_name().ok()?;
+    // Identity-H ONLY. Identity-V is a vertical writing mode: its glyphs
+    // advance along -y and their metrics live in /W2 and /DW2, not /W//DW.
+    // The walker and reflow both model advances as +x, so trusting /W for a
+    // vertical column would regenerate following segments at wrong
+    // positions. Vertical support needs /W2 plus direction-aware walking.
+    if enc != b"Identity-H" {
+        return None;
+    }
+    let desc = doc.dereference(dict.get(b"DescendantFonts").ok()?).ok()?.1;
+    let first = desc.as_array().ok()?.first()?;
+    let cid_font = doc.dereference(first).ok()?.1.as_dict().ok()?;
+
+    let dw = cid_font
+        .get(b"DW")
+        .ok()
+        .and_then(|o| doc.dereference(o).ok())
+        .and_then(|(_, o)| o.as_float().ok())
+        .filter(|w| *w > 0.0)
+        .unwrap_or(1000.0);
+
+    let mut ranges: Vec<(u32, u32, f32)> = Vec::new();
+    if let Some(arr) = cid_font
+        .get(b"W")
+        .ok()
+        .and_then(|o| doc.dereference(o).ok())
+        .and_then(|(_, o)| o.as_array().ok().cloned())
+    {
+        // Resolve indirect elements up front so the two forms can be told
+        // apart by shape (number+array vs number+number+number).
+        let items: Vec<Object> = arr
+            .iter()
+            .map(|o| doc.dereference(o).map(|(_, v)| v.clone()).unwrap_or(Object::Null))
+            .collect();
+        let num = |o: &Object| o.as_float().ok();
+        let mut i = 0;
+        while i < items.len() {
+            let Some(c_first) = num(&items[i]) else { break };
+            let c_first = c_first.max(0.0) as u32;
+            match items.get(i + 1) {
+                // Form A: c [w1 w2 …] — consecutive CIDs from c.
+                Some(Object::Array(ws)) => {
+                    for (k, w) in ws.iter().enumerate() {
+                        let w = doc.dereference(w).ok().and_then(|(_, v)| v.as_float().ok());
+                        if let Some(w) = w {
+                            let cid = c_first.saturating_add(k as u32);
+                            ranges.push((cid, cid, w));
+                        }
+                    }
+                    i += 2;
+                }
+                // Form B: cFirst cLast w — one width across the span.
+                Some(second) => {
+                    let (Some(c_last), Some(w)) = (num(second), items.get(i + 2).and_then(num)) else {
+                        break; // malformed tail: keep what parsed cleanly
+                    };
+                    let c_last = c_last.max(0.0) as u32;
+                    if c_last >= c_first {
+                        ranges.push((c_first, c_last, w));
+                    }
+                    i += 3;
+                }
+                None => break,
+            }
+        }
+    }
+    // An empty /W is legal — every CID then takes /DW, which is still real
+    // information (and often 1000 for CJK, matching the old guess).
+    //
+    // Ranges enter in /W order and are made DISJOINT here so the hot-path
+    // lookup can be a single probe. Valid /W never overlaps; when a
+    // malformed font does, the later entry wins (sequential application,
+    // what a viewer would do) by carving the earlier one around it.
+    let mut disjoint: std::collections::BTreeMap<u32, (u32, f32)> = std::collections::BTreeMap::new();
+    for (s, e, w) in ranges {
+        // The map is disjoint, so `end` grows with `start`: scanning left
+        // from `e` can stop at the first entry that ends before `s`.
+        let mut clipped: Vec<(u32, u32, f32)> = Vec::new();
+        for (&ks, &(ke, kw)) in disjoint.range(..=e).rev() {
+            if ke < s {
+                break;
+            }
+            clipped.push((ks, ke, kw));
+        }
+        for (ks, ke, kw) in clipped {
+            disjoint.remove(&ks);
+            if ks < s {
+                disjoint.insert(ks, (s - 1, kw)); // ks < s implies s >= 1
+            }
+            if ke > e {
+                disjoint.insert(e + 1, (ke, kw));
+            }
+        }
+        disjoint.insert(s, (e, w));
+    }
+    let ranges = disjoint.into_iter().map(|(s, (e, w))| (s, e, w)).collect();
+    Some(CidMetrics { dw, ranges })
 }
 
 fn op_f32(op: &Object) -> f32 {
@@ -987,6 +1162,7 @@ fn show_string(
             font_size: gs.font_size,
             bbox,
             cid,
+            cid_widths_trusted: font.map(|f| f.cid_widths_trusted()).unwrap_or(!cid),
             visible: gs.render_mode != 3,
             type3,
             color: gs.fill_color,
@@ -1441,5 +1617,140 @@ mod tests {
 
         let err = replace_text(&mut doc, 1, "Ian", "Idn", None).unwrap_err();
         assert!(matches!(err, ReplaceError::MissingGlyph), "got {err:?}");
+    }
+}
+
+#[cfg(test)]
+mod cid_tests {
+    use super::*;
+    use lopdf::{dictionary, Object};
+
+    /// Type0/Identity-H font whose descendant carries /DW + /W in both
+    /// legal forms: `1 [500 600]` (consecutive) and `10 20 750` (span).
+    fn type0_doc(encoding: &str, with_w: bool) -> (Document, lopdf::ObjectId) {
+        let mut doc = Document::with_version("1.7");
+        let mut cid_font = dictionary! {
+            "Type" => "Font",
+            "Subtype" => "CIDFontType2",
+            "BaseFont" => "AAAAAA+TestCJK",
+            "DW" => 1000,
+        };
+        if with_w {
+            cid_font.set(
+                "W",
+                vec![
+                    1.into(),
+                    Object::Array(vec![500.into(), 600.into()]),
+                    10.into(),
+                    20.into(),
+                    750.into(),
+                ],
+            );
+        }
+        let cid_id = doc.add_object(cid_font);
+        let font_id = doc.add_object(dictionary! {
+            "Type" => "Font",
+            "Subtype" => "Type0",
+            "BaseFont" => "AAAAAA+TestCJK",
+            "Encoding" => Object::Name(encoding.as_bytes().to_vec()),
+            "DescendantFonts" => vec![Object::Reference(cid_id)],
+        });
+        (doc, font_id)
+    }
+
+    fn info(doc: &Document, id: lopdf::ObjectId) -> FontInfo<'_> {
+        build_font_info(doc, doc.get_dictionary(id).unwrap())
+    }
+
+    #[test]
+    fn parses_both_w_forms_and_dw() {
+        let (doc, id) = type0_doc("Identity-H", true);
+        let f = info(&doc, id);
+        let m = f.cid_metrics.as_ref().expect("Identity-H must yield metrics");
+        assert_eq!(m.width(1), 500.0, "form A first entry");
+        assert_eq!(m.width(2), 600.0, "form A second entry");
+        assert_eq!(m.width(10), 750.0, "span start");
+        assert_eq!(m.width(15), 750.0, "inside span");
+        assert_eq!(m.width(20), 750.0, "span end");
+        assert_eq!(m.width(21), 1000.0, "outside every range -> /DW");
+        assert_eq!(m.width(0), 1000.0, "below every range -> /DW");
+        assert!(f.cid_widths_trusted());
+    }
+
+    #[test]
+    fn advance_sums_real_cid_widths() {
+        let (doc, id) = type0_doc("Identity-H", true);
+        let f = info(&doc, id);
+        // CIDs 1 and 2 as 2-byte codes: 500 + 600.
+        assert_eq!(f.advance(&[0x00, 0x01, 0x00, 0x02], 2), 1100.0);
+        // A CID with no /W entry falls to /DW.
+        assert_eq!(f.advance(&[0x00, 0x63], 1), 1000.0);
+        // Mixed: 750 (span) + 500 (form A).
+        assert_eq!(f.advance(&[0x00, 0x0F, 0x00, 0x01], 2), 1250.0);
+    }
+
+    #[test]
+    fn non_identity_encoding_keeps_the_guess_and_is_untrusted() {
+        // A predefined CJK CMap maps codes to CIDs through tables we don't
+        // parse; widths must stay approximate AND be flagged as such.
+        let (doc, id) = type0_doc("UniGB-UCS2-H", true);
+        let f = info(&doc, id);
+        assert!(f.cid_metrics.is_none());
+        assert!(!f.cid_widths_trusted(), "must refuse length-changing edits");
+        assert_eq!(f.advance(&[0x00, 0x01], 1), 1000.0, "1000-per-char guess");
+    }
+
+    #[test]
+    fn identity_h_without_w_still_trusts_dw() {
+        // /W is optional; every CID then legitimately takes /DW.
+        let (doc, id) = type0_doc("Identity-H", false);
+        let f = info(&doc, id);
+        let m = f.cid_metrics.as_ref().expect("Identity-H is an identity mapping");
+        assert_eq!(m.width(7), 1000.0);
+        assert!(f.cid_widths_trusted());
+    }
+
+    #[test]
+    fn identity_v_is_refused_because_metrics_are_vertical() {
+        // crbot #13 round-1: Identity-V advances along -y with /W2//DW2
+        // metrics. The walker models +x advances only, so trusting /W here
+        // would misplace regenerated segments in a vertical column.
+        let (doc, id) = type0_doc("Identity-V", true);
+        let f = info(&doc, id);
+        assert!(f.cid_metrics.is_none(), "vertical writing must not use /W");
+        assert!(!f.cid_widths_trusted());
+    }
+
+    #[test]
+    fn malformed_overlapping_w_entries_resolve_to_the_later_one() {
+        // Valid /W never overlaps; when it does, the later entry wins and
+        // the lookup must stay a single probe (no linear rescan).
+        let mut doc = Document::with_version("1.7");
+        let cid_id = doc.add_object(dictionary! {
+            "Type" => "Font", "Subtype" => "CIDFontType2", "BaseFont" => "T", "DW" => 1000,
+            // 10..30 = 400, then 15..20 = 900 overlapping it.
+            "W" => vec![10.into(), 30.into(), 400.into(), 15.into(), 20.into(), 900.into()],
+        });
+        let font_id = doc.add_object(dictionary! {
+            "Type" => "Font", "Subtype" => "Type0", "BaseFont" => "T",
+            "Encoding" => "Identity-H",
+            "DescendantFonts" => vec![Object::Reference(cid_id)],
+        });
+        let f = info(&doc, font_id);
+        let m = f.cid_metrics.as_ref().unwrap();
+        assert_eq!(m.width(12), 400.0, "outside the overlap keeps the first span");
+        assert_eq!(m.width(15), 900.0, "overlap start takes the later entry");
+        assert_eq!(m.width(20), 900.0, "overlap end takes the later entry");
+        assert_eq!(m.width(25), 400.0, "right remainder keeps the first span");
+        assert_eq!(m.width(31), 1000.0, "beyond both -> /DW");
+    }
+
+    #[test]
+    fn simple_font_is_always_trusted() {
+        let mut doc = Document::with_version("1.7");
+        let id = doc.add_object(dictionary! {
+            "Type" => "Font", "Subtype" => "TrueType", "BaseFont" => "Helvetica",
+        });
+        assert!(info(&doc, id).cid_widths_trusted());
     }
 }

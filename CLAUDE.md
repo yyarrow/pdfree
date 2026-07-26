@@ -30,6 +30,7 @@
 
 - 链路：原字体表达不了 → `ttf.rs`（只读 TTF 解析，glyf/cmap4+12/复合字形）取思源黑体轮廓 → `type3gen.rs` 现场合成 Type3 字体（轮廓转 PDF 路径 + ToUnicode）→ 注入页面资源，整段改写、TJ 拆三段保排版
 - 字形源：`assets/NotoSansSC.ttf`（静态 Regular 实例 10.6MB，由 google/fonts 的 glyf 版变量字体经 fontTools instancer wght=400 生成——原变量字体默认实例是 **Thin(100)**，直接用会让所有兜底文字变细体；**拉丁子集切片没有中文**，别下错）；web 端在 `web/public/fonts/` 懒加载，与 assets/ 必须同一份文件
+- **CID 字宽（已做）**：Type0/Identity-H|V 字体解析 descendant CIDFont 的 `/W`（两种形式：`c [w1 w2…]` 逐字、`cFirst cLast w` 区间，后者不展开）+ `/DW`，替换掉原来「每字 1000/em」的假宽度；非 Identity 编码（UniGB-UCS2-H 等预定义 CMap 需码表映射）仍用近似值并**标记为不可信**，变长编辑照旧拒绝（`cid-width-unavailable`）。判据在 `FontInfo::cid_widths_trusted()` / `Seg.cid_widths_trusted`
 - 段内拆分（定长路径已做）：救援顺序 = 原字体全覆盖 → **按字符拆分**（原字体可画的字符留原字体，只有缺字合成 Type3，净宽度补偿单独一个 TJ）→ 整段借字体 → 整段兜底；CID/Type3 原字体不拆（走整段路径）。reflow 变长路径仍整段兜底（待做）
 - v1 限制：整段替换（find 必须等于整个 seg 文本）；字重固定 Regular（bold 匹配待做，可从原字体 FontDescriptor 推）
 

@@ -35,6 +35,9 @@ struct NewRunPlan {
     /// True when the CHOSEN font is CID (2-byte codes) — may differ from the
     /// original segment's font, so spacing counts use this, not the seg's.
     cid: bool,
+    /// False only for a CID font whose advances are still the 1000-per-char
+    /// guess (no /W, or a non-Identity CMap we can't resolve to CIDs).
+    widths_trusted: bool,
 }
 
 pub(crate) fn replace_run_reflow(
@@ -290,7 +293,11 @@ pub(crate) fn replace_run_reflow(
     // positions — and thus old_w's span — were laid out with the fabricated
     // width even when the replacement font is simple. Refuse if either the
     // chosen or any source-run font is CID (until /W parsing lands).
-    if plan.cid || run_segs.iter().any(|&si| segs[si].cid) {
+    // A guessed CID advance poisons BOTH sides of the delta: the chosen
+    // font's new_w AND the original run, whose glyph positions (and thus
+    // old_w's span) were laid out with the guess. Real /W metrics on both
+    // sides make the geometry sound, so only untrusted widths refuse.
+    if !plan.widths_trusted || run_segs.iter().any(|&si| !segs[si].cid_widths_trusted) {
         return Err(ReplaceError::NeedsReflow("cid-width-unavailable"));
     }
     let delta = new_w - old_w;
@@ -449,7 +456,7 @@ fn plan_new_run(
                 candidates.push(name);
             }
         }
-        let mut found: Option<(String, Vec<u8>, f32, bool)> = None;
+        let mut found: Option<(String, Vec<u8>, f32, bool, bool)> = None;
         for cand in &candidates {
             let Some(font) = fonts.get(cand.as_bytes()) else { continue };
             if font.cid && !segs.iter().any(|s| &s.font == cand) {
@@ -473,12 +480,12 @@ fn plan_new_run(
             if adv <= 0.0 {
                 continue;
             }
-            found = Some((cand.clone(), bytes, adv, font.cid));
+            found = Some((cand.clone(), bytes, adv, font.cid, font.cid_widths_trusted()));
             break;
         }
         found
     };
-    if let Some((key, bytes, adv, cid)) = chosen {
+    if let Some((key, bytes, adv, cid, widths_trusted)) = chosen {
         // gs-carried fonts must be materialized under a real /Font name.
         let res_name = if key.starts_with("gs:") {
             let (id, dict) = gs_fonts_for_restore(doc, page_id)
@@ -490,7 +497,7 @@ fn plan_new_run(
         } else {
             key
         };
-        return Ok(NewRunPlan { res_name, string_bytes: bytes, size, adv_em: adv, cid });
+        return Ok(NewRunPlan { res_name, string_bytes: bytes, size, adv_em: adv, cid, widths_trusted });
     }
 
     // Fallback synthesis, with the same weird-scale calibration policy as
@@ -520,7 +527,7 @@ fn plan_new_run(
         }
     }
     // The synthesized fallback Type3 font is single-byte.
-    Ok(NewRunPlan { res_name, string_bytes, size: fb_size, adv_em, cid: false })
+    Ok(NewRunPlan { res_name, string_bytes, size: fb_size, adv_em, cid: false, widths_trusted: true })
 }
 
 /// fill-color + Tf + Tm + TJ for one positioned chunk. `dx` shifts the
