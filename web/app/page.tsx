@@ -75,8 +75,20 @@ function friendlyError(msg: string): string {
   if (msg.includes("cannot represent")) {
     return "字体缺少所需字形且兜底失败，这段暂时改不了";
   }
-  if (msg.includes("reflow") || msg.includes("length differs")) {
-    return "改完这一行放不下了（超出段落或页面宽度）；段内自动换行还在开发中";
+  // The engine names WHY a length-changing edit was refused; the reasons
+  // are not interchangeable — reporting them all as "doesn't fit" told
+  // users to shorten text that had been refused for a structural reason.
+  if (msg.includes("reflow refused") || msg.includes("length differs")) {
+    if (msg.includes("width-overflow") || msg.includes("push-target-overflow")) {
+      return "改完这一行放不下了（超出页面或段落宽度）；自动换行还在开发中";
+    }
+    if (msg.includes("pattern-fill")) {
+      return "这行文字用了特殊颜色或底纹（专色/图案填充），改长度会串色，暂时不支持";
+    }
+    if (msg.includes("clipping-render-mode")) {
+      return "这行文字带裁剪效果，改长度暂时不支持";
+    }
+    return "这一行的排版结构比较特殊（多段拼接或状态穿插），改长度暂时不支持；等长替换可以用";
   }
   if (msg.includes("not found")) {
     return "没有定位到这段文字，可能刚被改过，请重试";

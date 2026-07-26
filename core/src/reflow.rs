@@ -62,18 +62,18 @@ pub(crate) fn replace_run_reflow(
         if line_ops.contains(&s.op_idx) {
             // Every segment of a touched op must belong to this line.
             if !line_segs.contains(&i) {
-                return Err(ReplaceError::NeedsReflow);
+                return Err(ReplaceError::NeedsReflow("op-segments-outside-line"));
             }
             let op = &content.operations[s.op_idx];
             if op.operator != "Tj" && op.operator != "TJ" {
-                return Err(ReplaceError::NeedsReflow);
+                return Err(ReplaceError::NeedsReflow("non-tj-show-op"));
             }
         }
     }
     // The edited run must own its segments completely (no straddling).
     for other in mline.runs.iter().enumerate().filter(|(i, _)| *i != run).map(|(_, r)| r) {
         if other.glyphs.iter().any(|g| run_segs.contains(&g.seg)) {
-            return Err(ReplaceError::NeedsReflow);
+            return Err(ReplaceError::NeedsReflow("run-straddles-segment"));
         }
     }
     // Anchor from the VISUALLY leftmost segment of the run, not the lowest
@@ -91,7 +91,7 @@ pub(crate) fn replace_run_reflow(
     // applies; regenerating the shows before one ET would union clips from
     // several text objects. We don't model clip paths — refuse.
     if line_segs.iter().any(|&si| segs[si].render_mode >= 4) {
-        return Err(ReplaceError::NeedsReflow);
+        return Err(ReplaceError::NeedsReflow("clipping-render-mode"));
     }
 
     // Byte-coverage: a segment the run owns may contain glyphs whose decoded
@@ -101,7 +101,7 @@ pub(crate) fn replace_run_reflow(
     for &si in &run_segs {
         let covered: usize = mrun.glyphs.iter().filter(|g| g.seg == si).map(|g| g.byte_len).sum();
         if covered != segs[si].bytes.len() {
-            return Err(ReplaceError::NeedsReflow);
+            return Err(ReplaceError::NeedsReflow("byte-coverage-gap"));
         }
     }
 
@@ -113,7 +113,7 @@ pub(crate) fn replace_run_reflow(
     for (i, s) in segs.iter().enumerate() {
         let pos = (s.op_idx, s.str_idx);
         if pos > run_lo && pos < run_hi && !run_segs.contains(&i) {
-            return Err(ReplaceError::NeedsReflow);
+            return Err(ReplaceError::NeedsReflow("paint-order-interleaved"));
         }
     }
 
@@ -121,7 +121,7 @@ pub(crate) fn replace_run_reflow(
     // with non-UTF-8 bytes round-trips to replacement characters and would
     // name a nonexistent /Font. Refuse rather than emit a broken Tf.
     if line_segs.iter().any(|&si| segs[si].font.contains('\u{FFFD}')) {
-        return Err(ReplaceError::NeedsReflow);
+        return Err(ReplaceError::NeedsReflow("non-utf8-font-name"));
     }
 
     // CTM-uniformity guard: regenerated ops are all spliced at the first
@@ -133,10 +133,10 @@ pub(crate) fn replace_run_reflow(
     for &si in &line_segs {
         let c = segs[si].ctm;
         if (0..6).any(|i| (c[i] - anchor_ctm[i]).abs() > 1e-4) {
-            return Err(ReplaceError::NeedsReflow);
+            return Err(ReplaceError::NeedsReflow("ctm-differs"));
         }
         if segs[si].pattern_fill {
-            return Err(ReplaceError::NeedsReflow);
+            return Err(ReplaceError::NeedsReflow("pattern-fill"));
         }
     }
 
@@ -151,7 +151,7 @@ pub(crate) fn replace_run_reflow(
             let a = anchor_ref.0;
             let diff = (0..4).map(|i| (m[i] - a[i]).abs()).fold(0.0_f32, f32::max);
             if diff > 1e-3 {
-                return Err(ReplaceError::NeedsReflow);
+                return Err(ReplaceError::NeedsReflow("following-run-transform"));
             }
         }
     }
@@ -171,7 +171,7 @@ pub(crate) fn replace_run_reflow(
                 || (s.h_scale - s0.h_scale).abs() > 1e-4
                 || s.render_mode != s0.render_mode
             {
-                return Err(ReplaceError::NeedsReflow);
+                return Err(ReplaceError::NeedsReflow("spacing-state-differs"));
             }
         }
         // Tr excluded from the allowlist: a later Tr would change the render
@@ -188,7 +188,7 @@ pub(crate) fn replace_run_reflow(
                 // corrupting its inherited state. Refuse.
                 "Tj" | "TJ" | "'" | "\"" => {
                     if !line_ops.contains(&i) {
-                        return Err(ReplaceError::NeedsReflow);
+                        return Err(ReplaceError::NeedsReflow("foreign-show-op"));
                     }
                     // Every String element of a line op must map to a modeled
                     // segment; an undecodable string yields no seg and would
@@ -205,10 +205,10 @@ pub(crate) fn replace_run_reflow(
                         .sum::<usize>();
                     let n_segs = segs.iter().filter(|s| s.op_idx == i).count();
                     if n_strings != n_segs {
-                        return Err(ReplaceError::NeedsReflow);
+                        return Err(ReplaceError::NeedsReflow("string-segment-count-mismatch"));
                     }
                 }
-                _ => return Err(ReplaceError::NeedsReflow),
+                _ => return Err(ReplaceError::NeedsReflow("state-op-between-chunks")),
             }
         }
     }
@@ -236,7 +236,7 @@ pub(crate) fn replace_run_reflow(
         // shares this text object.
         for op in &content.operations[last_line_op + 1..et] {
             if matches!(op.operator.as_str(), "Tj" | "TJ" | "'" | "\"") {
-                return Err(ReplaceError::NeedsReflow);
+                return Err(ReplaceError::NeedsReflow("plan-failed"));
             }
         }
     }
@@ -253,7 +253,7 @@ pub(crate) fn replace_run_reflow(
     // later applied as +x to following runs, valid only for +x text.)
     let x_dir = anchor.0[0] * plan.size * segs[first_run_seg].h_scale;
     if x_dir <= 1e-6 {
-        return Err(ReplaceError::NeedsReflow);
+        return Err(ReplaceError::NeedsReflow("gs-font-unresolvable"));
     }
     let x_scale = (anchor.0[0].powi(2) + anchor.0[1].powi(2)).sqrt().max(1e-6);
     // Vertical user-space scale, for the affected-region height.
@@ -291,7 +291,7 @@ pub(crate) fn replace_run_reflow(
     // width even when the replacement font is simple. Refuse if either the
     // chosen or any source-run font is CID (until /W parsing lands).
     if plan.cid || run_segs.iter().any(|&si| segs[si].cid) {
-        return Err(ReplaceError::NeedsReflow);
+        return Err(ReplaceError::NeedsReflow("width-overflow"));
     }
     let delta = new_w - old_w;
 
@@ -304,13 +304,13 @@ pub(crate) fn replace_run_reflow(
     };
     let slack = (mblock.bbox[2] - mblock.bbox[0]).abs().max(10.0) * 0.03 + 3.0;
     if new_line_end > mblock.bbox[2] + slack {
-        return Err(ReplaceError::NeedsReflow);
+        return Err(ReplaceError::NeedsReflow("push-target-transform"));
     }
     // Never push text past the page's VISIBLE right edge (CropBox, which may
     // be narrower than MediaBox): beyond it the text renders clipped.
     if let Some(page_right) = page_visible_right(doc, page_id) {
         if new_line_end > page_right - 2.0 {
-            return Err(ReplaceError::NeedsReflow);
+            return Err(ReplaceError::NeedsReflow("push-target-overflow"));
         }
     }
 
