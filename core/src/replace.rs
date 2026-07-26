@@ -33,8 +33,8 @@ pub enum ReplaceError {
     UnsupportedOperator(String),
     #[error("run not found in page model")]
     RunNotFound,
-    #[error("replacement length differs from original; line reflow lands in Phase B")]
-    NeedsReflow,
+    #[error("line reflow refused: {0}")]
+    NeedsReflow(&'static str),
     #[error("encrypted documents are not supported yet (saving would strip the encryption)")]
     EncryptedUnsupported,
 }
