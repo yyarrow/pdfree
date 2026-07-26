@@ -6,6 +6,14 @@ set -e
 cd "$(dirname "$0")/.."
 
 mkdir -p public/wasm public/pdfjs
+# Staleness guard: copying an old wasm/pkg silently ships a build that
+# predates the engine sources — the site then runs code nobody wrote
+# recently, and the mismatch is invisible in review (it happened once:
+# reason labels fixed in Rust, old labels still served to users).
+if [ -n "$(find ../core/src ../wasm/src -name '*.rs' -newer ../wasm/pkg/pdfree_wasm_bg.wasm -print -quit 2>/dev/null)" ]; then
+  echo "error: wasm/pkg is older than Rust sources — run 'wasm-pack build --target web --release' in ../wasm first" >&2
+  exit 1
+fi
 cp ../wasm/pkg/pdfree_wasm.js ../wasm/pkg/pdfree_wasm_bg.wasm public/wasm/
 cp node_modules/pdfjs-dist/build/pdf.min.mjs node_modules/pdfjs-dist/build/pdf.worker.min.mjs public/pdfjs/
 # standard font data + cmaps: pdf.js needs these to render non-embedded
