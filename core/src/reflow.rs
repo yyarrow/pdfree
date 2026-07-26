@@ -236,7 +236,7 @@ pub(crate) fn replace_run_reflow(
         // shares this text object.
         for op in &content.operations[last_line_op + 1..et] {
             if matches!(op.operator.as_str(), "Tj" | "TJ" | "'" | "\"") {
-                return Err(ReplaceError::NeedsReflow("plan-failed"));
+                return Err(ReplaceError::NeedsReflow("following-show-in-text-object"));
             }
         }
     }
@@ -253,7 +253,7 @@ pub(crate) fn replace_run_reflow(
     // later applied as +x to following runs, valid only for +x text.)
     let x_dir = anchor.0[0] * plan.size * segs[first_run_seg].h_scale;
     if x_dir <= 1e-6 {
-        return Err(ReplaceError::NeedsReflow("gs-font-unresolvable"));
+        return Err(ReplaceError::NeedsReflow("nonpositive-x-advance"));
     }
     let x_scale = (anchor.0[0].powi(2) + anchor.0[1].powi(2)).sqrt().max(1e-6);
     // Vertical user-space scale, for the affected-region height.
@@ -291,7 +291,7 @@ pub(crate) fn replace_run_reflow(
     // width even when the replacement font is simple. Refuse if either the
     // chosen or any source-run font is CID (until /W parsing lands).
     if plan.cid || run_segs.iter().any(|&si| segs[si].cid) {
-        return Err(ReplaceError::NeedsReflow("width-overflow"));
+        return Err(ReplaceError::NeedsReflow("cid-width-unavailable"));
     }
     let delta = new_w - old_w;
 
@@ -304,7 +304,7 @@ pub(crate) fn replace_run_reflow(
     };
     let slack = (mblock.bbox[2] - mblock.bbox[0]).abs().max(10.0) * 0.03 + 3.0;
     if new_line_end > mblock.bbox[2] + slack {
-        return Err(ReplaceError::NeedsReflow("push-target-transform"));
+        return Err(ReplaceError::NeedsReflow("width-overflow"));
     }
     // Never push text past the page's VISIBLE right edge (CropBox, which may
     // be narrower than MediaBox): beyond it the text renders clipped.

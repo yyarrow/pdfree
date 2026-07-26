@@ -82,6 +82,9 @@ function friendlyError(msg: string): string {
     if (msg.includes("width-overflow") || msg.includes("push-target-overflow")) {
       return "改完这一行放不下了（超出页面或段落宽度）；自动换行还在开发中";
     }
+    if (msg.includes("cid-width-unavailable")) {
+      return "这行用的是中文/多字节字体，改变字数还差字宽表支持（等长替换可以用）";
+    }
     if (msg.includes("pattern-fill")) {
       return "这行文字用了特殊颜色或底纹（专色/图案填充），改长度会串色，暂时不支持";
     }
