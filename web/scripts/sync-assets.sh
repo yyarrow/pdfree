@@ -10,8 +10,19 @@ mkdir -p public/wasm public/pdfjs
 # predates the engine sources — the site then runs code nobody wrote
 # recently, and the mismatch is invisible in review (it happened once:
 # reason labels fixed in Rust, old labels still served to users).
-if [ -n "$(find ../core/src ../wasm/src -name '*.rs' -newer ../wasm/pkg/pdfree_wasm_bg.wasm -print -quit 2>/dev/null)" ]; then
-  echo "error: wasm/pkg is older than Rust sources — run 'wasm-pack build --target web --release' in ../wasm first" >&2
+# Build inputs, not just sources: a dependency bump or feature toggle in a
+# manifest/lockfile changes the binary while every .rs stays older.
+STALE=$(find ../core/src ../wasm/src -name '*.rs' -newer ../wasm/pkg/pdfree_wasm_bg.wasm -print -quit 2>/dev/null)
+if [ -z "$STALE" ]; then
+  for f in ../core/Cargo.toml ../wasm/Cargo.toml ../core/Cargo.lock ../wasm/Cargo.lock ../Cargo.toml ../Cargo.lock; do
+    if [ -f "$f" ] && [ "$f" -nt ../wasm/pkg/pdfree_wasm_bg.wasm ]; then
+      STALE=$f
+      break
+    fi
+  done
+fi
+if [ -n "$STALE" ]; then
+  echo "error: wasm/pkg is older than build input $STALE — run 'wasm-pack build --target web --release' in ../wasm first" >&2
   exit 1
 fi
 cp ../wasm/pkg/pdfree_wasm.js ../wasm/pkg/pdfree_wasm_bg.wasm public/wasm/
