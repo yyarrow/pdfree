@@ -363,7 +363,7 @@ pub(crate) fn replace_run_reflow(
         }
     }
 
-    let wrappers = actualtext_wrappers(doc, page_id, &content);
+    let (wrappers, nested_at) = actualtext_wrappers(doc, page_id, &content);
     // A single /ActualText block describes all the text inside it. If one
     // block covers BOTH the edited run and text we keep, no re-emission is
     // faithful: keeping the block would leave the OLD edited text dictating
@@ -374,16 +374,15 @@ pub(crate) fn replace_run_reflow(
     {
         // Nested /ActualText spans would have to be re-emitted as nesting,
         // and their overrides compose in ways we don't model — refuse.
-        if line_segs.iter().any(|&si| wrappers.get(&segs[si].op_idx).is_some_and(|c| c.len() > 1)) {
+        if line_segs.iter().any(|&si| nested_at.contains(&segs[si].op_idx)) {
             return Err(ReplaceError::NeedsReflow("nested-actualtext"));
         }
-        let chain = |si: usize| wrappers.get(&segs[si].op_idx).cloned().unwrap_or_default();
         let edited_blocks: std::collections::HashSet<usize> =
-            run_segs.iter().flat_map(|&si| chain(si)).collect();
+            run_segs.iter().filter_map(|&si| wrappers.get(&segs[si].op_idx).copied()).collect();
         let kept_blocks: std::collections::HashSet<usize> = line_segs
             .iter()
             .filter(|si| !run_segs.contains(si))
-            .flat_map(|&si| chain(si))
+            .filter_map(|&si| wrappers.get(&segs[si].op_idx).copied())
             .collect();
         if edited_blocks.intersection(&kept_blocks).next().is_some() {
             return Err(ReplaceError::NeedsReflow("actualtext-span-straddles-edit"));
@@ -437,7 +436,7 @@ pub(crate) fn replace_run_reflow(
         // once per block, not once per chunk (duplicating it would make the
         // text extract twice). The edited run needs no wrapper: its
         // replacement is encoded through a font whose ToUnicode we control.
-        let blk = wrappers.get(&s.op_idx).and_then(|c| c.first().copied());
+        let blk = wrappers.get(&s.op_idx).copied();
         if blk != cur_block {
             if cur_block.is_some() {
                 ops_new.push(Operation::new("EMC", vec![]));
@@ -742,34 +741,49 @@ fn actualtext_wrappers(
     doc: &Document,
     page_id: ObjectId,
     content: &lopdf::content::Content,
-) -> HashMap<usize, Vec<usize>> {
+) -> (HashMap<usize, usize>, std::collections::HashSet<usize>) {
     // (BDC index, is-BDC, carries /ActualText)
     let mut stack: Vec<(usize, bool, bool)> = Vec::new();
+    // Indices of the /ActualText blocks currently open, innermost last.
+    let mut open_at: Vec<usize> = Vec::new();
     let mut map = HashMap::new();
+    let mut nested = std::collections::HashSet::new();
     for (i, op) in content.operations.iter().enumerate() {
         match op.operator.as_str() {
             "BDC" => {
                 let has = bdc_has_actual_text(doc, page_id, op);
                 stack.push((i, true, has));
+                if has {
+                    open_at.push(i);
+                }
             }
             "BMC" => stack.push((i, false, false)),
             "EMC" => {
-                stack.pop();
+                if let Some((_, _, has)) = stack.pop() {
+                    if has {
+                        open_at.pop();
+                    }
+                }
             }
             "Tj" | "TJ" | "'" | "\"" => {
-                // EVERY enclosing /ActualText block, outermost first: a
-                // nested span means an outer block can cover both edited
-                // and kept text while the innermost blocks differ.
-                let chain: Vec<usize> =
-                    stack.iter().filter(|(_, _, has)| *has).map(|(idx, _, _)| *idx).collect();
-                if !chain.is_empty() {
-                    map.insert(i, chain);
+                // Nesting is refused wholesale, so the depth is all that
+                // matters beyond one — recording the full ancestor chain
+                // per show would be O(shows x depth) memory for state we
+                // immediately discard.
+                match open_at.len() {
+                    0 => {}
+                    1 => {
+                        map.insert(i, open_at[0]);
+                    }
+                    _ => {
+                        nested.insert(i);
+                    }
                 }
             }
             _ => {}
         }
     }
-    map
+    (map, nested)
 }
 
 /// Marked-content blocks (BDC/BMC … EMC) whose shown text belongs ENTIRELY
