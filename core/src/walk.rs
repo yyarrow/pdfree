@@ -922,6 +922,7 @@ fn walk_page_inner(
 
     let mut segs = Vec::new();
     let mut blank_ops: BTreeSet<usize> = BTreeSet::new();
+    let mut undecodable_ops: BTreeSet<usize> = BTreeSet::new();
 
     let mut gs = GfxState::new();
     let mut tm = Mat::identity(); // text matrix
@@ -1069,7 +1070,7 @@ fn walk_page_inner(
                     gs.char_spacing = op_f32(&ops[1]);
                 }
                 if let Some(Object::String(bytes, _)) = s_op {
-                    show_string(doc, &fonts, &gs, &mut tm, bytes, page_no, op_idx, 0, &mut segs, &mut blank_ops);
+                    show_string(doc, &fonts, &gs, &mut tm, bytes, page_no, op_idx, 0, &mut segs, &mut blank_ops, &mut undecodable_ops);
                 }
             }
             "TJ" if ops.len() == 1 => {
@@ -1078,7 +1079,7 @@ fn walk_page_inner(
                     for el in arr {
                         match el {
                             Object::String(bytes, _) => {
-                                show_string(doc, &fonts, &gs, &mut tm, bytes, page_no, op_idx, str_idx, &mut segs, &mut blank_ops);
+                                show_string(doc, &fonts, &gs, &mut tm, bytes, page_no, op_idx, str_idx, &mut segs, &mut blank_ops, &mut undecodable_ops);
                                 str_idx += 1;
                             }
                             _ => {
@@ -1099,6 +1100,9 @@ fn walk_page_inner(
         }
     }
 
+    // An operator counts as blank only when EVERY one of its strings
+    // decoded successfully to whitespace.
+    blank_ops.retain(|op| !undecodable_ops.contains(op));
     Ok((content, segs, blank_ops))
 }
 
@@ -1114,6 +1118,7 @@ fn show_string(
     str_idx: usize,
     segs: &mut Vec<Seg>,
     blank_ops: &mut BTreeSet<usize>,
+    undecodable_ops: &mut BTreeSet<usize>,
 ) {
     let font = fonts.get(&gs.font_key);
     let (cid, type3) = font.map(|f| (f.cid, f.type3)).unwrap_or((false, false));
@@ -1173,6 +1178,13 @@ fn show_string(
     let (x1a, y1a) = trm.apply(width_text_space, asc * gs.font_size);
     let bbox = [x0.min(x1a), y0.min(y1a), x0.max(x1a), y0.max(y1a)];
 
+    if text.is_empty() {
+        // Decoding produced nothing: the font was missing or the bytes are
+        // unmappable, which says nothing about what they PAINT. Poison the
+        // whole operator — one unmappable string in a TJ must not ride
+        // along on a sibling string that happened to decode to a space.
+        undecodable_ops.insert(op_idx);
+    }
     if !text.is_empty() && text.trim().is_empty() {
         // Blank shows are dropped from the model (nothing to edit), but
         // reflow must still tell them apart from unmodeled foreign text:

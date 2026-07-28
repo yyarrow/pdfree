@@ -364,7 +364,27 @@ pub(crate) fn replace_run_reflow(
     }
 
     let wrappers = actualtext_wrappers(doc, page_id, &content);
+    // A single /ActualText block describes all the text inside it. If one
+    // block covers BOTH the edited run and text we keep, no re-emission is
+    // faithful: keeping the block would leave the OLD edited text dictating
+    // extraction for the kept chunk, and dropping it would erase the kept
+    // chunk's only machine-readable text. Rewriting the override to match
+    // the new text is possible in principle but needs per-glyph semantics
+    // we don't model — refuse.
+    {
+        let edited_blocks: std::collections::HashSet<usize> =
+            run_segs.iter().filter_map(|&si| wrappers.get(&segs[si].op_idx).copied()).collect();
+        let kept_blocks: std::collections::HashSet<usize> = line_segs
+            .iter()
+            .filter(|si| !run_segs.contains(si))
+            .filter_map(|&si| wrappers.get(&segs[si].op_idx).copied())
+            .collect();
+        if edited_blocks.intersection(&kept_blocks).next().is_some() {
+            return Err(ReplaceError::NeedsReflow("actualtext-span-straddles-edit"));
+        }
+    }
     let mut ops_new: Vec<Operation> = Vec::new();
+    let mut cur_block: Option<usize> = None;
     let mut emitted_new_run = false;
     // Segments in content-stream order keep the original paint order.
     let mut ordered: Vec<usize> = line_segs.iter().copied().collect();
@@ -372,6 +392,10 @@ pub(crate) fn replace_run_reflow(
     for si in ordered {
         let s = &segs[si];
         if run_segs.contains(&si) {
+            if cur_block.is_some() {
+                ops_new.push(Operation::new("EMC", vec![]));
+                cur_block = None;
+            }
             if !emitted_new_run {
                 emitted_new_run = true;
                 // Anchor at the run's VISUALLY-leftmost segment, not this
@@ -401,19 +425,26 @@ pub(crate) fn replace_run_reflow(
             None => s.font.clone(),
         };
         // This chunk is re-emitted VERBATIM (original font, original bytes).
-        // If it was wrapped in a marked-content block carrying /ActualText,
-        // that wrapper is its only machine-readable text — Chrome's Type3
-        // glyphs have no usable ToUnicode — so it must travel with it.
-        // (The edited run needs no wrapper: its replacement text is encoded
-        // through a font whose ToUnicode we control.)
-        let wrapper = wrappers.get(&s.op_idx);
-        if let Some(w) = wrapper {
-            ops_new.push(w.clone());
+        // Its /ActualText block is its only machine-readable text (Chrome's
+        // Type3 glyphs have no usable ToUnicode), so the block travels with
+        // it — but /ActualText describes the WHOLE block, so it is opened
+        // once per block, not once per chunk (duplicating it would make the
+        // text extract twice). The edited run needs no wrapper: its
+        // replacement is encoded through a font whose ToUnicode we control.
+        let blk = wrappers.get(&s.op_idx).copied();
+        if blk != cur_block {
+            if cur_block.is_some() {
+                ops_new.push(Operation::new("EMC", vec![]));
+            }
+            if let Some(b) = blk {
+                ops_new.push(content.operations[b].clone());
+            }
+            cur_block = blk;
         }
         emit_text(&mut ops_new, &res, s.font_size, &s.fill_op, &Mat(s.trm), &Mat(s.ctm), dx, s.bytes.clone());
-        if wrapper.is_some() {
-            ops_new.push(Operation::new("EMC", vec![]));
-        }
+    }
+    if cur_block.is_some() {
+        ops_new.push(Operation::new("EMC", vec![]));
     }
     // Restore the text state the FOLLOWING ops inherit. Font, size and color
     // persist across BT/ET (each line here is its own BT/ET with no Tf), so
@@ -705,22 +736,23 @@ fn actualtext_wrappers(
     doc: &Document,
     page_id: ObjectId,
     content: &lopdf::content::Content,
-) -> HashMap<usize, Operation> {
-    let mut stack: Vec<(Operation, bool)> = Vec::new();
+) -> HashMap<usize, usize> {
+    // (BDC index, is-BDC, carries /ActualText)
+    let mut stack: Vec<(usize, bool, bool)> = Vec::new();
     let mut map = HashMap::new();
     for (i, op) in content.operations.iter().enumerate() {
         match op.operator.as_str() {
             "BDC" => {
                 let has = bdc_has_actual_text(doc, page_id, op);
-                stack.push((op.clone(), has));
+                stack.push((i, true, has));
             }
-            "BMC" => stack.push((op.clone(), false)),
+            "BMC" => stack.push((i, false, false)),
             "EMC" => {
                 stack.pop();
             }
             "Tj" | "TJ" | "'" | "\"" => {
-                if let Some((w, _)) = stack.iter().rev().find(|(_, has)| *has) {
-                    map.insert(i, w.clone());
+                if let Some((idx, _, _)) = stack.iter().rev().find(|(_, _, has)| *has) {
+                    map.insert(i, *idx);
                 }
             }
             _ => {}
@@ -921,6 +953,94 @@ BT /F1 12 Tf 1 0 0 1 72 684 Tm (a much longer second line of text here) Tj ET".t
             }
         }
         assert!(depth_ok, "untouched chunk must stay inside its /ActualText block");
+    }
+
+    /// One /ActualText block covering TWO untouched chunks must be opened
+    /// once, not cloned per chunk (crbot #14 round-2: duplicated wrappers
+    /// make the override's text extract twice).
+    #[test]
+    fn one_block_covering_two_chunks_is_opened_once() {
+        let mut doc = Document::with_version("1.7");
+        let font = doc.add_object(dictionary! {
+            "Type" => "Font", "Subtype" => "Type1", "BaseFont" => "Helvetica",
+        });
+        let stream = b"BT /F1 12 Tf 1 0 0 1 72 700 Tm (AA) Tj ET \
+/Span <</ActualText (ZZ)>> BDC BT /F1 12 Tf 1 0 0 1 120 700 Tm (BB) Tj 1 0 0 1 150 700 Tm (CC) Tj ET EMC \
+BT /F1 12 Tf 1 0 0 1 72 684 Tm (a much longer second line of text here) Tj ET".to_vec();
+        let content_id = doc.add_object(Stream::new(dictionary! {}, stream));
+        let pages_id = doc.new_object_id();
+        let page_id = doc.add_object(dictionary! {
+            "Type" => "Page", "Parent" => Object::Reference(pages_id),
+            "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+            "Contents" => Object::Reference(content_id),
+            "Resources" => dictionary! { "Font" => dictionary! { "F1" => Object::Reference(font) } },
+        });
+        doc.set_object(pages_id, dictionary! {
+            "Type" => "Pages", "Kids" => vec![Object::Reference(page_id)], "Count" => 1,
+        });
+        let catalog = doc.add_object(dictionary! { "Type" => "Catalog", "Pages" => Object::Reference(pages_id) });
+        doc.trailer.set("Root", Object::Reference(catalog));
+
+        let (_, segs) = crate::walk::walk_page(&doc, page_id, 1).unwrap();
+        let blocks = crate::model::build_page_model(&segs);
+        let (b, l, r) = (0..blocks.len())
+            .flat_map(|b| (0..blocks[b].lines.len()).map(move |l| (b, l)))
+            .flat_map(|(b, l)| (0..blocks[b].lines[l].runs.len()).map(move |r| (b, l, r)))
+            .find(|&(b, l, r)| blocks[b].lines[l].runs[r].text.starts_with("AA"))
+            .expect("modeled run");
+        replace_run_reflow(&mut doc, 1, b, l, r, "AAA", None).expect("must reflow");
+
+        let data = doc.get_page_content(page_id).unwrap();
+        let out = lopdf::content::Content::decode(&data).unwrap();
+        let opens = out
+            .operations
+            .iter()
+            .filter(|o| {
+                o.operator == "BDC"
+                    && o.operands.iter().any(|x| matches!(x, Object::Dictionary(d) if d.has(b"ActualText")))
+            })
+            .count();
+        assert_eq!(opens, 1, "the shared block must be opened exactly once");
+    }
+
+    /// A block covering BOTH the edited run and kept text can't be
+    /// re-emitted faithfully either way — it must refuse.
+    #[test]
+    fn block_straddling_edited_and_kept_text_refuses() {
+        let mut doc = Document::with_version("1.7");
+        let font = doc.add_object(dictionary! {
+            "Type" => "Font", "Subtype" => "Type1", "BaseFont" => "Helvetica",
+        });
+        // One block wraps both "AA" (to be edited) and "BB" (kept).
+        let stream = b"/Span <</ActualText (ZZ)>> BDC BT /F1 12 Tf 1 0 0 1 72 700 Tm (AA) Tj 1 0 0 1 120 700 Tm (BB) Tj ET EMC \
+BT /F1 12 Tf 1 0 0 1 72 684 Tm (a much longer second line of text here) Tj ET".to_vec();
+        let content_id = doc.add_object(Stream::new(dictionary! {}, stream));
+        let pages_id = doc.new_object_id();
+        let page_id = doc.add_object(dictionary! {
+            "Type" => "Page", "Parent" => Object::Reference(pages_id),
+            "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+            "Contents" => Object::Reference(content_id),
+            "Resources" => dictionary! { "Font" => dictionary! { "F1" => Object::Reference(font) } },
+        });
+        doc.set_object(pages_id, dictionary! {
+            "Type" => "Pages", "Kids" => vec![Object::Reference(page_id)], "Count" => 1,
+        });
+        let catalog = doc.add_object(dictionary! { "Type" => "Catalog", "Pages" => Object::Reference(pages_id) });
+        doc.trailer.set("Root", Object::Reference(catalog));
+
+        let (_, segs) = crate::walk::walk_page(&doc, page_id, 1).unwrap();
+        let blocks = crate::model::build_page_model(&segs);
+        let found = (0..blocks.len())
+            .flat_map(|b| (0..blocks[b].lines.len()).map(move |l| (b, l)))
+            .flat_map(|(b, l)| (0..blocks[b].lines[l].runs.len()).map(move |r| (b, l, r)))
+            .find(|&(b, l, r)| blocks[b].lines[l].runs[r].text.starts_with("AA"));
+        if let Some((b, l, r)) = found {
+            let e = replace_run_reflow(&mut doc, 1, b, l, r, "AAA", None);
+            assert!(
+                matches!(e, Err(ReplaceError::NeedsReflow("actualtext-span-straddles-edit"))),
+                "straddling block must refuse, got {e:?}"
+            );
+        }
     }
 
     /// End-to-end on Chrome/Skia's shape: every line wrapped in BDC…EMC and
