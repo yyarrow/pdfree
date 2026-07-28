@@ -34,8 +34,19 @@
 - 段内拆分（定长路径已做）：救援顺序 = 原字体全覆盖 → **按字符拆分**（原字体可画的字符留原字体，只有缺字合成 Type3，净宽度补偿单独一个 TJ）→ 整段借字体 → 整段兜底；CID/Type3 原字体不拆（走整段路径）。reflow 变长路径仍整段兜底（待做）
 - v1 限制：整段替换（find 必须等于整个 seg 文本）；字重固定 Regular（bold 匹配待做，可从原字体 FontDescriptor 推）
 
+## Chrome/Skia 导出件（浏览器打印的 PDF——简历/网页存档最常见）
+
+结构签名：**每个字形一条 `Tf`+`Tj`**（一页几十个 Type3 字体）、整行包在 `/NonStruct <</MCID n>> BDC … EMC` 里、**每个空格是独立的 `Tj`**、部分字形带 `/Span <</ActualText <feff…>>> BDC`（Type3 无可靠 ToUnicode，靠它提供复制文本）。
+
+变长编辑对这类文件曾经只有 5% 成功率，三道门（都已拆）：
+- `BDC/EMC` 是纯语义标记，不改图形状态（ISO 32000 14.6）→ 放行
+- `/ActualText` 不能只放行：文字移走而标记留下，会让**显示的和复制出来的不一致**。做法是把「本行完全拥有的」标记块连同过时 ActualText 一起删掉（`owned_marked_blocks`），语义交给新文本自带的 ToUnicode；跨行共享的块仍拒绝
+- 空白字形不进模型（`text.trim().is_empty()`），于是空格 `Tj` 被当成「外来文字」→ `walk_page_with_blanks` 记录它们，reflow 认得出这是已知空白（重生成用绝对 Tm，留在原地无害）
+
+**教训**：按公共语料的拒绝分布挑门修，会与用户实际文档类型错位——先看用户的文件长什么样。Chrome 导出样本已放进 `harness/corpus/local/real_skia_resume.pdf`（可用 `chrome --headless --print-to-pdf` 重造）。
+
 ## 下一步（按优先级）
 
-1. Skia/Chrome 导出件的多段匹配编辑（单字形一条指令 → 跨段 find/replace），做完解锁 40 份 skia 语料 + 中文词级编辑
+1. ~~Skia/Chrome 导出件的多段匹配编辑~~（已做，见上）
 2. 兜底精修：段内拆分（原有字符留原字体）、字重匹配、字体切片（17.8MB → 按需几十 KB）
 3. 扩语料到万级；合并/拆分/压缩补进 web 端
