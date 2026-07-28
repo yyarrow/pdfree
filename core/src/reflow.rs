@@ -363,6 +363,7 @@ pub(crate) fn replace_run_reflow(
         }
     }
 
+    let wrappers = actualtext_wrappers(doc, page_id, &content);
     let mut ops_new: Vec<Operation> = Vec::new();
     let mut emitted_new_run = false;
     // Segments in content-stream order keep the original paint order.
@@ -399,7 +400,20 @@ pub(crate) fn replace_run_reflow(
             Some(n) => n.clone(),
             None => s.font.clone(),
         };
+        // This chunk is re-emitted VERBATIM (original font, original bytes).
+        // If it was wrapped in a marked-content block carrying /ActualText,
+        // that wrapper is its only machine-readable text — Chrome's Type3
+        // glyphs have no usable ToUnicode — so it must travel with it.
+        // (The edited run needs no wrapper: its replacement text is encoded
+        // through a font whose ToUnicode we control.)
+        let wrapper = wrappers.get(&s.op_idx);
+        if let Some(w) = wrapper {
+            ops_new.push(w.clone());
+        }
         emit_text(&mut ops_new, &res, s.font_size, &s.fill_op, &Mat(s.trm), &Mat(s.ctm), dx, s.bytes.clone());
+        if wrapper.is_some() {
+            ops_new.push(Operation::new("EMC", vec![]));
+        }
     }
     // Restore the text state the FOLLOWING ops inherit. Font, size and color
     // persist across BT/ET (each line here is its own BT/ET with no Tf), so
@@ -438,7 +452,7 @@ pub(crate) fn replace_run_reflow(
     let mut op_list: Vec<usize> = line_ops
         .iter()
         .copied()
-        .chain(owned_marked_blocks(&content, &line_ops)?)
+        .chain(owned_marked_blocks(doc, page_id, &content, &line_ops)?)
         .collect();
     op_list.sort_unstable();
     op_list.dedup();
@@ -643,6 +657,78 @@ fn last_stream_seg(segs: &[Seg], line_segs: &BTreeSet<usize>) -> usize {
         .expect("line has at least one segment")
 }
 
+/// Whether a BDC operation carries /ActualText. The property list may be an
+/// inline dictionary OR a name resolved through the page's
+/// /Resources/Properties (ISO 32000 14.6.2) — missing the named form would
+/// let a stale extraction override slip past the guards below.
+fn bdc_has_actual_text(doc: &Document, page_id: ObjectId, op: &Operation) -> bool {
+    op.operands.iter().any(|o| match o {
+        Object::Dictionary(d) => d.has(b"ActualText"),
+        Object::Name(name) => (|| {
+            let (res, res_ids) = doc.get_page_resources(page_id).ok()?;
+            let mut dicts: Vec<&lopdf::Dictionary> = res.into_iter().collect();
+            let owned: Vec<&lopdf::Dictionary> = res_ids
+                .iter()
+                .filter_map(|id| doc.get_object(*id).ok()?.as_dict().ok())
+                .collect();
+            dicts.extend(owned);
+            for d in dicts {
+                let props = d
+                    .get(b"Properties")
+                    .ok()
+                    .and_then(|o| doc.dereference(o).ok())
+                    .and_then(|(_, o)| o.as_dict().ok().cloned());
+                if let Some(props) = props {
+                    if let Some(entry) = props.get(name.as_slice()).ok() {
+                        if let Ok((_, v)) = doc.dereference(entry) {
+                            if v.as_dict().map(|d| d.has(b"ActualText")).unwrap_or(false) {
+                                return Some(true);
+                            }
+                        }
+                    }
+                }
+            }
+            None
+        })()
+        .unwrap_or(false),
+        _ => false,
+    })
+}
+
+/// For each show op, the innermost enclosing marked-content block that
+/// carries /ActualText. Chunks the edit does NOT touch are re-emitted
+/// verbatim (original font, original bytes) — for Chrome's Type3 glyphs
+/// that /ActualText IS their only copy-paste text, so their wrapper must
+/// be re-emitted with them or the surrounding text silently changes when
+/// copied.
+fn actualtext_wrappers(
+    doc: &Document,
+    page_id: ObjectId,
+    content: &lopdf::content::Content,
+) -> HashMap<usize, Operation> {
+    let mut stack: Vec<(Operation, bool)> = Vec::new();
+    let mut map = HashMap::new();
+    for (i, op) in content.operations.iter().enumerate() {
+        match op.operator.as_str() {
+            "BDC" => {
+                let has = bdc_has_actual_text(doc, page_id, op);
+                stack.push((op.clone(), has));
+            }
+            "BMC" => stack.push((op.clone(), false)),
+            "EMC" => {
+                stack.pop();
+            }
+            "Tj" | "TJ" | "'" | "\"" => {
+                if let Some((w, _)) = stack.iter().rev().find(|(_, has)| *has) {
+                    map.insert(i, w.clone());
+                }
+            }
+            _ => {}
+        }
+    }
+    map
+}
+
 /// Marked-content blocks (BDC/BMC … EMC) whose shown text belongs ENTIRELY
 /// to the line being regenerated — their operator indices, so the caller can
 /// delete the block along with the text it wrapped.
@@ -658,6 +744,8 @@ fn last_stream_seg(segs: &[Seg], line_segs: &BTreeSet<usize>) -> usize {
 /// a block carries /ActualText over our text, moving the text out would
 /// corrupt what the document reports, so that refuses instead.
 fn owned_marked_blocks(
+    doc: &Document,
+    page_id: ObjectId,
     content: &lopdf::content::Content,
     line_ops: &BTreeSet<usize>,
 ) -> Result<Vec<usize>, ReplaceError> {
@@ -676,10 +764,7 @@ fn owned_marked_blocks(
                     continue; // untouched block
                 }
                 if saw_foreign {
-                    let dictates_text = content.operations[start]
-                        .operands
-                        .iter()
-                        .any(|o| matches!(o, Object::Dictionary(d) if d.has(b"ActualText")));
+                    let dictates_text = bdc_has_actual_text(doc, page_id, &content.operations[start]);
                     if dictates_text {
                         return Err(ReplaceError::NeedsReflow("actualtext-span"));
                     }
@@ -710,6 +795,22 @@ mod skia_tests {
     use lopdf::content::Content;
     use lopdf::{dictionary, Stream, StringFormat};
 
+    /// Minimal doc+page so the property-list resolver has resources.
+    fn empty_page() -> (Document, ObjectId) {
+        let mut doc = Document::with_version("1.7");
+        let pages_id = doc.new_object_id();
+        let page_id = doc.add_object(dictionary! {
+            "Type" => "Page",
+            "Parent" => Object::Reference(pages_id),
+            "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+            "Resources" => dictionary! {},
+        });
+        doc.set_object(pages_id, dictionary! {
+            "Type" => "Pages", "Kids" => vec![Object::Reference(page_id)], "Count" => 1,
+        });
+        (doc, page_id)
+    }
+
     fn bdc(actual_text: bool) -> Operation {
         let mut props = dictionary! { "MCID" => 0 };
         if actual_text {
@@ -723,15 +824,17 @@ mod skia_tests {
 
     #[test]
     fn block_owned_by_the_line_is_deleted_with_its_text() {
+        let (doc, page_id) = empty_page();
         // BDC … Tj … EMC where the Tj is the line's own: the block goes
         // too, so a stale /ActualText can't outlive the text it described.
         let content = Content { operations: vec![bdc(true), tj(b"a"), Operation::new("EMC", vec![])] };
         let line_ops: BTreeSet<usize> = [1].into_iter().collect();
-        assert_eq!(owned_marked_blocks(&content, &line_ops).unwrap(), vec![0, 2]);
+        assert_eq!(owned_marked_blocks(&doc, page_id, &content, &line_ops).unwrap(), vec![0, 2]);
     }
 
     #[test]
     fn block_shared_with_outside_text_refuses_when_it_dictates_actualtext() {
+        let (doc, page_id) = empty_page();
         // The block also wraps text we are NOT regenerating, so it can't be
         // deleted; moving our text out from under its /ActualText would make
         // the document report something it no longer shows.
@@ -740,27 +843,84 @@ mod skia_tests {
         };
         let line_ops: BTreeSet<usize> = [1].into_iter().collect(); // op 2 is foreign
         assert!(matches!(
-            owned_marked_blocks(&content, &line_ops),
+            owned_marked_blocks(&doc, page_id, &content, &line_ops),
             Err(ReplaceError::NeedsReflow("actualtext-span"))
         ));
     }
 
     #[test]
     fn shared_block_without_actualtext_is_left_alone() {
+        let (doc, page_id) = empty_page();
         let content = Content {
             operations: vec![bdc(false), tj(b"a"), tj(b"b"), Operation::new("EMC", vec![])],
         };
         let line_ops: BTreeSet<usize> = [1].into_iter().collect();
-        assert_eq!(owned_marked_blocks(&content, &line_ops).unwrap(), Vec::<usize>::new());
+        assert_eq!(owned_marked_blocks(&doc, page_id, &content, &line_ops).unwrap(), Vec::<usize>::new());
     }
 
     #[test]
     fn untouched_blocks_are_not_deleted() {
+        let (doc, page_id) = empty_page();
         let content = Content {
             operations: vec![bdc(false), tj(b"x"), Operation::new("EMC", vec![])],
         };
         let line_ops: BTreeSet<usize> = BTreeSet::new(); // nothing of ours inside
-        assert_eq!(owned_marked_blocks(&content, &line_ops).unwrap(), Vec::<usize>::new());
+        assert_eq!(owned_marked_blocks(&doc, page_id, &content, &line_ops).unwrap(), Vec::<usize>::new());
+    }
+
+    #[test]
+    fn untouched_chunk_keeps_its_actualtext_wrapper() {
+        // crbot #14 round-1: the line's OTHER chunks are re-emitted verbatim
+        // (original Type3 bytes, no usable ToUnicode), so deleting their
+        // /ActualText wrapper would silently change what copying yields.
+        let mut doc = Document::with_version("1.7");
+        let font = doc.add_object(dictionary! {
+            "Type" => "Font", "Subtype" => "Type1", "BaseFont" => "Helvetica",
+        });
+        // Edited chunk (AA) plain; neighbour (BB) wrapped with /ActualText.
+        let stream = b"BT /F1 12 Tf 1 0 0 1 72 700 Tm (AA) Tj ( ) Tj ET \
+/Span <</ActualText (ZZ)>> BDC BT /F1 12 Tf 1 0 0 1 120 700 Tm (BB) Tj ET EMC \
+BT /F1 12 Tf 1 0 0 1 72 684 Tm (a much longer second line of text here) Tj ET".to_vec();
+        let content_id = doc.add_object(Stream::new(dictionary! {}, stream));
+        let pages_id = doc.new_object_id();
+        let page_id = doc.add_object(dictionary! {
+            "Type" => "Page",
+            "Parent" => Object::Reference(pages_id),
+            "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+            "Contents" => Object::Reference(content_id),
+            "Resources" => dictionary! { "Font" => dictionary! { "F1" => Object::Reference(font) } },
+        });
+        doc.set_object(pages_id, dictionary! {
+            "Type" => "Pages", "Kids" => vec![Object::Reference(page_id)], "Count" => 1,
+        });
+        let catalog = doc.add_object(dictionary! { "Type" => "Catalog", "Pages" => Object::Reference(pages_id) });
+        doc.trailer.set("Root", Object::Reference(catalog));
+
+        let (_, segs) = crate::walk::walk_page(&doc, page_id, 1).unwrap();
+        let blocks = crate::model::build_page_model(&segs);
+        let (b, l, r) = (0..blocks.len())
+            .flat_map(|b| (0..blocks[b].lines.len()).map(move |l| (b, l)))
+            .flat_map(|(b, l)| (0..blocks[b].lines[l].runs.len()).map(move |r| (b, l, r)))
+            .find(|&(b, l, r)| blocks[b].lines[l].runs[r].text.starts_with("AA"))
+            .expect("modeled run");
+        replace_run_reflow(&mut doc, 1, b, l, r, "AAA", None).expect("must reflow");
+
+        let data = doc.get_page_content(page_id).unwrap();
+        let out = lopdf::content::Content::decode(&data).unwrap();
+        // The neighbour's wrapper must still enclose a show op.
+        let mut depth_ok = false;
+        let mut inside = false;
+        for op in &out.operations {
+            match op.operator.as_str() {
+                "BDC" => {
+                    inside = op.operands.iter().any(|o| matches!(o, Object::Dictionary(d) if d.has(b"ActualText")))
+                }
+                "EMC" => inside = false,
+                "Tj" | "TJ" if inside => depth_ok = true,
+                _ => {}
+            }
+        }
+        assert!(depth_ok, "untouched chunk must stay inside its /ActualText block");
     }
 
     /// End-to-end on Chrome/Skia's shape: every line wrapped in BDC…EMC and

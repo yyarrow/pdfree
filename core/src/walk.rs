@@ -1173,10 +1173,17 @@ fn show_string(
     let (x1a, y1a) = trm.apply(width_text_space, asc * gs.font_size);
     let bbox = [x0.min(x1a), y0.min(y1a), x0.max(x1a), y0.max(y1a)];
 
-    if text.trim().is_empty() {
+    if !text.is_empty() && text.trim().is_empty() {
         // Blank shows are dropped from the model (nothing to edit), but
         // reflow must still tell them apart from unmodeled foreign text:
-        // they paint nothing, so leaving them in place is harmless.
+        // decoding SUCCEEDED and yielded only whitespace, so they paint
+        // nothing and leaving them in place is harmless.
+        //
+        // An EMPTY `text` is a different animal: the font was missing or
+        // `decode` couldn't map the bytes, which says nothing about what
+        // those bytes paint. Those stay unclassified so reflow keeps
+        // refusing on them (foreign-show-op) instead of hoisting text past
+        // a show that may well be visible.
         blank_ops.insert(op_idx);
     }
     if !text.trim().is_empty() {
