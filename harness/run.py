@@ -148,6 +148,43 @@ def engine_edits_this_run(runs, run, find):
     return first is run
 
 
+def _paints_ink(ch):
+    """Whether a character is CERTAIN to put marks on the page.
+
+    Unicode categories can't answer this: U+2800 BRAILLE PATTERN BLANK is
+    So and the Hangul fillers are Lo, yet both render blank — and
+    enumerating every blank code point is a losing game. So this is a
+    conservative WHITELIST of ranges known to paint. A character outside
+    it is simply not used as an edit anchor; the cost is skipping some
+    runs (scripts beyond these ranges), never a false "visible" edit that
+    leaves the render identical and makes judge() report a failure the
+    engine never caused.
+
+    Extend the ranges when the corpus grows beyond Latin/CJK.
+    """
+    import unicodedata
+
+    # The ranges still contain non-painting members — U+00AD SOFT HYPHEN
+    # (Cf), U+0488 (Me), U+3099 (Mn), unassigned code points (Cn) — so the
+    # category test runs as a SECOND filter rather than an alternative to
+    # the whitelist. A character must pass both.
+    if unicodedata.category(ch) in {"Cc", "Cf", "Cs", "Co", "Cn", "Mn", "Me", "Zs", "Zl", "Zp"}:
+        return False
+    cp = ord(ch)
+    return (
+        0x21 <= cp <= 0x7E  # printable ASCII, space excluded
+        or 0x00A1 <= cp <= 0x024F  # Latin-1 punctuation/letters + extensions
+        or 0x0370 <= cp <= 0x03FF  # Greek
+        or 0x0400 <= cp <= 0x04FF  # Cyrillic
+        or 0x3001 <= cp <= 0x301F  # CJK punctuation (、。「」…), U+3000 excluded
+        or 0x3040 <= cp <= 0x30FF  # kana
+        or 0x4E00 <= cp <= 0x9FFF  # CJK Unified Ideographs
+        or 0xAC00 <= cp <= 0xD7A3  # Hangul syllables
+        or 0xF900 <= cp <= 0xFAFF  # CJK compatibility ideographs
+        or 0xFF01 <= cp <= 0xFF5E  # fullwidth forms, U+3000 excluded
+    )
+
+
 def pick_model_edits(engine_model_json, rng, n=3):
     """Variable-length candidates from the text model: (block, line, run,
     old_text, new_text). Always changes length — this probes line reflow."""
@@ -157,19 +194,56 @@ def pick_model_edits(engine_model_json, rng, n=3):
         for l, ln in enumerate(blk["lines"]):
             for r, run in enumerate(ln["runs"]):
                 t = run["text"]
-                if len(t) >= 4 and t.isascii() and any(c.isalpha() for c in t) \
-                        and not run["cid"] and not run["type3"]:
+                # CID and Type3 runs used to be excluded, along with
+                # everything non-ASCII. That silently exempted the two most
+                # common real-world shapes — CJK documents (Type0/CID) and
+                # browser-printed PDFs (one Type3 font per glyph) — from
+                # every variable-length test we run. They are supported now,
+                # so they must be measured.
+                editable = len(t) >= 4 and (
+                    (t.isascii() and any(c.isalpha() for c in t)) or not t.isascii()
+                )
+                if editable:
                     cands.append((b, l, r, t))
     rng.shuffle(cands)
     out = []
-    for b, l, r, t in cands[:n]:
-        repl = "".join(
-            chr((ord(ch.lower()) - 97 + 7) % 26 + 97).upper() if ch.isupper()
-            else (chr((ord(ch) - 97 + 7) % 26 + 97) if ch.isalpha() else ch)
-            for ch in t
-        )
-        repl = repl[:-1] if rng.random() < 0.5 and len(repl) > 4 else repl + "x"
-        if repl != t:
+    # Iterate ALL shuffled candidates and stop at n: truncating first would
+    # let three unusable runs (nothing but zero-width or filler characters)
+    # hide a perfectly editable run further down and report
+    # skip_no_candidate.
+    for b, l, r, t in cands:
+        if len(out) >= n:
+            break
+        if t.isascii():
+            repl = "".join(
+                chr((ord(ch.lower()) - 97 + 7) % 26 + 97).upper() if ch.isupper()
+                else (chr((ord(ch) - 97 + 7) % 26 + 97) if ch.isalpha() else ch)
+                for ch in t
+            )
+            repl = repl[:-1] if rng.random() < 0.5 and len(repl) > 4 else repl + "x"
+        else:
+            # CJK and mixed text: a letter shift is meaningless, so change
+            # the LENGTH directly — drop or repeat a character the run
+            # already contains, so every glyph stays drawable by the
+            # original font and reflow is tested in isolation.
+            #
+            # It must be a NON-whitespace character: dropping a trailing
+            # space leaves the page legitimately unchanged, which judge()
+            # can only report as fail_no_visual_change — a failure the
+            # engine didn't cause.
+            visible = [i for i, ch in enumerate(t) if _paints_ink(ch)]
+            if not visible:
+                continue
+            if rng.random() < 0.5 and len(visible) > 1:
+                cut = visible[-1]
+                repl = t[:cut] + t[cut + 1:]
+            else:
+                repl = t[visible[0]] + t
+        # A replacement that only differs in whitespace can't be judged:
+        # judge()'s semantic check is whitespace-insensitive and the render
+        # may be identical.
+        ink = lambda x: "".join(c for c in x if _paints_ink(c))
+        if repl != t and ink(repl) != ink(t):
             out.append((b, l, r, t, repl))
     return out
 
