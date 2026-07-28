@@ -148,6 +148,25 @@ def engine_edits_this_run(runs, run, find):
     return first is run
 
 
+def _paints_ink(ch):
+    """Whether a character is expected to put marks on the page.
+
+    `str.isspace()` is not enough: U+200B ZERO WIDTH SPACE, U+FEFF and the
+    zero-width joiners are not "space" yet paint nothing, so an edit that
+    only adds or removes one leaves the render legitimately identical —
+    which judge() can only report as a failure the engine never caused.
+    Unicode categories Cc/Cf/Cs/Co/Cn (control, format, surrogate, private
+    use, unassigned), Zs/Zl/Zp (separators) and Mn/Me (non-spacing marks,
+    which have no advance of their own) are all excluded.
+    """
+    import unicodedata
+    if ch.isspace():
+        return False
+    return unicodedata.category(ch) not in {
+        "Cc", "Cf", "Cs", "Co", "Cn", "Zs", "Zl", "Zp", "Mn", "Me",
+    }
+
+
 def pick_model_edits(engine_model_json, rng, n=3):
     """Variable-length candidates from the text model: (block, line, run,
     old_text, new_text). Always changes length — this probes line reflow."""
@@ -188,7 +207,7 @@ def pick_model_edits(engine_model_json, rng, n=3):
             # space leaves the page legitimately unchanged, which judge()
             # can only report as fail_no_visual_change — a failure the
             # engine didn't cause.
-            visible = [i for i, ch in enumerate(t) if not ch.isspace()]
+            visible = [i for i, ch in enumerate(t) if _paints_ink(ch)]
             if not visible:
                 continue
             if rng.random() < 0.5 and len(visible) > 1:
@@ -199,7 +218,8 @@ def pick_model_edits(engine_model_json, rng, n=3):
         # A replacement that only differs in whitespace can't be judged:
         # judge()'s semantic check is whitespace-insensitive and the render
         # may be identical.
-        if repl != t and "".join(repl.split()) != "".join(t.split()):
+        ink = lambda x: "".join(c for c in x if _paints_ink(c))
+        if repl != t and ink(repl) != ink(t):
             out.append((b, l, r, t, repl))
     return out
 
