@@ -372,12 +372,18 @@ pub(crate) fn replace_run_reflow(
     // the new text is possible in principle but needs per-glyph semantics
     // we don't model — refuse.
     {
+        // Nested /ActualText spans would have to be re-emitted as nesting,
+        // and their overrides compose in ways we don't model — refuse.
+        if line_segs.iter().any(|&si| wrappers.get(&segs[si].op_idx).is_some_and(|c| c.len() > 1)) {
+            return Err(ReplaceError::NeedsReflow("nested-actualtext"));
+        }
+        let chain = |si: usize| wrappers.get(&segs[si].op_idx).cloned().unwrap_or_default();
         let edited_blocks: std::collections::HashSet<usize> =
-            run_segs.iter().filter_map(|&si| wrappers.get(&segs[si].op_idx).copied()).collect();
+            run_segs.iter().flat_map(|&si| chain(si)).collect();
         let kept_blocks: std::collections::HashSet<usize> = line_segs
             .iter()
             .filter(|si| !run_segs.contains(si))
-            .filter_map(|&si| wrappers.get(&segs[si].op_idx).copied())
+            .flat_map(|&si| chain(si))
             .collect();
         if edited_blocks.intersection(&kept_blocks).next().is_some() {
             return Err(ReplaceError::NeedsReflow("actualtext-span-straddles-edit"));
@@ -431,7 +437,7 @@ pub(crate) fn replace_run_reflow(
         // once per block, not once per chunk (duplicating it would make the
         // text extract twice). The edited run needs no wrapper: its
         // replacement is encoded through a font whose ToUnicode we control.
-        let blk = wrappers.get(&s.op_idx).copied();
+        let blk = wrappers.get(&s.op_idx).and_then(|c| c.first().copied());
         if blk != cur_block {
             if cur_block.is_some() {
                 ops_new.push(Operation::new("EMC", vec![]));
@@ -736,7 +742,7 @@ fn actualtext_wrappers(
     doc: &Document,
     page_id: ObjectId,
     content: &lopdf::content::Content,
-) -> HashMap<usize, usize> {
+) -> HashMap<usize, Vec<usize>> {
     // (BDC index, is-BDC, carries /ActualText)
     let mut stack: Vec<(usize, bool, bool)> = Vec::new();
     let mut map = HashMap::new();
@@ -751,8 +757,13 @@ fn actualtext_wrappers(
                 stack.pop();
             }
             "Tj" | "TJ" | "'" | "\"" => {
-                if let Some((idx, _, _)) = stack.iter().rev().find(|(_, _, has)| *has) {
-                    map.insert(i, *idx);
+                // EVERY enclosing /ActualText block, outermost first: a
+                // nested span means an outer block can cover both edited
+                // and kept text while the innermost blocks differ.
+                let chain: Vec<usize> =
+                    stack.iter().filter(|(_, _, has)| *has).map(|(idx, _, _)| *idx).collect();
+                if !chain.is_empty() {
+                    map.insert(i, chain);
                 }
             }
             _ => {}
@@ -1039,6 +1050,52 @@ BT /F1 12 Tf 1 0 0 1 72 684 Tm (a much longer second line of text here) Tj ET".t
             assert!(
                 matches!(e, Err(ReplaceError::NeedsReflow("actualtext-span-straddles-edit"))),
                 "straddling block must refuse, got {e:?}"
+            );
+        }
+    }
+
+    /// Nested /ActualText spans: the outer block covers both the edited run
+    /// and kept text while the innermost blocks differ, so a chain-unaware
+    /// straddle check would miss it (crbot #14 round-3).
+    #[test]
+    fn nested_actualtext_spans_refuse() {
+        let mut doc = Document::with_version("1.7");
+        let font = doc.add_object(dictionary! {
+            "Type" => "Font", "Subtype" => "Type1", "BaseFont" => "Helvetica",
+        });
+        let stream = b"/Span <</ActualText (OUT)>> BDC \
+/Span <</ActualText (IN)>> BDC BT /F1 12 Tf 1 0 0 1 72 700 Tm (AA) Tj ET EMC \
+BT /F1 12 Tf 1 0 0 1 120 700 Tm (BB) Tj ET EMC \
+BT /F1 12 Tf 1 0 0 1 72 684 Tm (a much longer second line of text here) Tj ET".to_vec();
+        let content_id = doc.add_object(Stream::new(dictionary! {}, stream));
+        let pages_id = doc.new_object_id();
+        let page_id = doc.add_object(dictionary! {
+            "Type" => "Page", "Parent" => Object::Reference(pages_id),
+            "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+            "Contents" => Object::Reference(content_id),
+            "Resources" => dictionary! { "Font" => dictionary! { "F1" => Object::Reference(font) } },
+        });
+        doc.set_object(pages_id, dictionary! {
+            "Type" => "Pages", "Kids" => vec![Object::Reference(page_id)], "Count" => 1,
+        });
+        let catalog = doc.add_object(dictionary! { "Type" => "Catalog", "Pages" => Object::Reference(pages_id) });
+        doc.trailer.set("Root", Object::Reference(catalog));
+
+        let (_, segs) = crate::walk::walk_page(&doc, page_id, 1).unwrap();
+        let blocks = crate::model::build_page_model(&segs);
+        let found = (0..blocks.len())
+            .flat_map(|b| (0..blocks[b].lines.len()).map(move |l| (b, l)))
+            .flat_map(|(b, l)| (0..blocks[b].lines[l].runs.len()).map(move |r| (b, l, r)))
+            .find(|&(b, l, r)| blocks[b].lines[l].runs[r].text.starts_with("AA"));
+        if let Some((b, l, r)) = found {
+            let e = replace_run_reflow(&mut doc, 1, b, l, r, "AAA", None);
+            assert!(
+                matches!(
+                    e,
+                    Err(ReplaceError::NeedsReflow("nested-actualtext"))
+                        | Err(ReplaceError::NeedsReflow("actualtext-span-straddles-edit"))
+                ),
+                "nested/straddling ActualText must refuse, got {e:?}"
             );
         }
     }

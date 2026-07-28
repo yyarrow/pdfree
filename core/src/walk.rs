@@ -1141,6 +1141,14 @@ fn show_string(
             Some(f) => f.decode(doc, code),
             None => String::new(),
         };
+        if g_text.is_empty() {
+            // THIS code unit didn't decode (missing font, unmappable byte),
+            // and an unmappable byte can still paint a glyph. Poison the
+            // whole operator: a sibling code unit decoding to a space must
+            // not let the operator pass as blank — the check has to live
+            // per code unit, since an aggregate " " + "" still trims empty.
+            undecodable_ops.insert(op_idx);
+        }
         let adv_em = match font {
             Some(f) => f.advance(code, g_text.chars().count().max(1)),
             None => 500.0,
@@ -1178,13 +1186,6 @@ fn show_string(
     let (x1a, y1a) = trm.apply(width_text_space, asc * gs.font_size);
     let bbox = [x0.min(x1a), y0.min(y1a), x0.max(x1a), y0.max(y1a)];
 
-    if text.is_empty() {
-        // Decoding produced nothing: the font was missing or the bytes are
-        // unmappable, which says nothing about what they PAINT. Poison the
-        // whole operator — one unmappable string in a TJ must not ride
-        // along on a sibling string that happened to decode to a space.
-        undecodable_ops.insert(op_idx);
-    }
     if !text.is_empty() && text.trim().is_empty() {
         // Blank shows are dropped from the model (nothing to edit), but
         // reflow must still tell them apart from unmodeled foreign text:
