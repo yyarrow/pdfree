@@ -5,7 +5,7 @@
 use crate::matrix::Mat;
 use lopdf::content::Content;
 use lopdf::{Dictionary, Document, Object};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 /// One positioned glyph (one byte code, or a 2-byte code for CID fonts).
 #[derive(Debug, Clone, serde::Serialize)]
@@ -895,12 +895,33 @@ fn op_f32(op: &Object) -> f32 {
 /// Walk one page's content stream and return the decoded content plus all
 /// text segments. `page_no` is the 1-based page number used for labeling.
 pub fn walk_page(doc: &Document, page_id: lopdf::ObjectId, page_no: u32) -> lopdf::Result<(Content, Vec<Seg>)> {
+    walk_page_inner(doc, page_id, page_no).map(|(c, s, _)| (c, s))
+}
+
+/// As `walk_page`, plus the indices of show ops that painted only
+/// whitespace. They produce no segment, so reflow would otherwise see them
+/// as unexplained foreign text (Chrome/Skia exports emit every space as its
+/// own Tj) — see reflow's foreign-show-op guard.
+pub fn walk_page_with_blanks(
+    doc: &Document,
+    page_id: lopdf::ObjectId,
+    page_no: u32,
+) -> lopdf::Result<(Content, Vec<Seg>, BTreeSet<usize>)> {
+    walk_page_inner(doc, page_id, page_no)
+}
+
+fn walk_page_inner(
+    doc: &Document,
+    page_id: lopdf::ObjectId,
+    page_no: u32,
+) -> lopdf::Result<(Content, Vec<Seg>, BTreeSet<usize>)> {
     let data = doc.get_page_content(page_id)?;
     let content = Content::decode(&data)?;
     let fonts = load_fonts(doc, page_id);
     let gs_fonts = load_gs_font_map(doc, page_id);
 
     let mut segs = Vec::new();
+    let mut blank_ops: BTreeSet<usize> = BTreeSet::new();
 
     let mut gs = GfxState::new();
     let mut tm = Mat::identity(); // text matrix
@@ -1048,7 +1069,7 @@ pub fn walk_page(doc: &Document, page_id: lopdf::ObjectId, page_no: u32) -> lopd
                     gs.char_spacing = op_f32(&ops[1]);
                 }
                 if let Some(Object::String(bytes, _)) = s_op {
-                    show_string(doc, &fonts, &gs, &mut tm, bytes, page_no, op_idx, 0, &mut segs);
+                    show_string(doc, &fonts, &gs, &mut tm, bytes, page_no, op_idx, 0, &mut segs, &mut blank_ops);
                 }
             }
             "TJ" if ops.len() == 1 => {
@@ -1057,7 +1078,7 @@ pub fn walk_page(doc: &Document, page_id: lopdf::ObjectId, page_no: u32) -> lopd
                     for el in arr {
                         match el {
                             Object::String(bytes, _) => {
-                                show_string(doc, &fonts, &gs, &mut tm, bytes, page_no, op_idx, str_idx, &mut segs);
+                                show_string(doc, &fonts, &gs, &mut tm, bytes, page_no, op_idx, str_idx, &mut segs, &mut blank_ops);
                                 str_idx += 1;
                             }
                             _ => {
@@ -1078,7 +1099,7 @@ pub fn walk_page(doc: &Document, page_id: lopdf::ObjectId, page_no: u32) -> lopd
         }
     }
 
-    Ok((content, segs))
+    Ok((content, segs, blank_ops))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1092,6 +1113,7 @@ fn show_string(
     op_idx: usize,
     str_idx: usize,
     segs: &mut Vec<Seg>,
+    blank_ops: &mut BTreeSet<usize>,
 ) {
     let font = fonts.get(&gs.font_key);
     let (cid, type3) = font.map(|f| (f.cid, f.type3)).unwrap_or((false, false));
@@ -1151,6 +1173,12 @@ fn show_string(
     let (x1a, y1a) = trm.apply(width_text_space, asc * gs.font_size);
     let bbox = [x0.min(x1a), y0.min(y1a), x0.max(x1a), y0.max(y1a)];
 
+    if text.trim().is_empty() {
+        // Blank shows are dropped from the model (nothing to edit), but
+        // reflow must still tell them apart from unmodeled foreign text:
+        // they paint nothing, so leaving them in place is harmless.
+        blank_ops.insert(op_idx);
+    }
     if !text.trim().is_empty() {
         segs.push(Seg {
             page: page_no,
