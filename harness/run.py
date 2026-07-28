@@ -162,6 +162,14 @@ def _paints_ink(ch):
 
     Extend the ranges when the corpus grows beyond Latin/CJK.
     """
+    import unicodedata
+
+    # The ranges still contain non-painting members — U+00AD SOFT HYPHEN
+    # (Cf), U+0488 (Me), U+3099 (Mn), unassigned code points (Cn) — so the
+    # category test runs as a SECOND filter rather than an alternative to
+    # the whitelist. A character must pass both.
+    if unicodedata.category(ch) in {"Cc", "Cf", "Cs", "Co", "Cn", "Mn", "Me", "Zs", "Zl", "Zp"}:
+        return False
     cp = ord(ch)
     return (
         0x21 <= cp <= 0x7E  # printable ASCII, space excluded
