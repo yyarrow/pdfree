@@ -149,22 +149,32 @@ def engine_edits_this_run(runs, run, find):
 
 
 def _paints_ink(ch):
-    """Whether a character is expected to put marks on the page.
+    """Whether a character is CERTAIN to put marks on the page.
 
-    `str.isspace()` is not enough: U+200B ZERO WIDTH SPACE, U+FEFF and the
-    zero-width joiners are not "space" yet paint nothing, so an edit that
-    only adds or removes one leaves the render legitimately identical —
-    which judge() can only report as a failure the engine never caused.
-    Unicode categories Cc/Cf/Cs/Co/Cn (control, format, surrogate, private
-    use, unassigned), Zs/Zl/Zp (separators) and Mn/Me (non-spacing marks,
-    which have no advance of their own) are all excluded.
+    Unicode categories can't answer this: U+2800 BRAILLE PATTERN BLANK is
+    So and the Hangul fillers are Lo, yet both render blank — and
+    enumerating every blank code point is a losing game. So this is a
+    conservative WHITELIST of ranges known to paint. A character outside
+    it is simply not used as an edit anchor; the cost is skipping some
+    runs (scripts beyond these ranges), never a false "visible" edit that
+    leaves the render identical and makes judge() report a failure the
+    engine never caused.
+
+    Extend the ranges when the corpus grows beyond Latin/CJK.
     """
-    import unicodedata
-    if ch.isspace():
-        return False
-    return unicodedata.category(ch) not in {
-        "Cc", "Cf", "Cs", "Co", "Cn", "Zs", "Zl", "Zp", "Mn", "Me",
-    }
+    cp = ord(ch)
+    return (
+        0x21 <= cp <= 0x7E  # printable ASCII, space excluded
+        or 0x00A1 <= cp <= 0x024F  # Latin-1 punctuation/letters + extensions
+        or 0x0370 <= cp <= 0x03FF  # Greek
+        or 0x0400 <= cp <= 0x04FF  # Cyrillic
+        or 0x3001 <= cp <= 0x301F  # CJK punctuation (、。「」…), U+3000 excluded
+        or 0x3040 <= cp <= 0x30FF  # kana
+        or 0x4E00 <= cp <= 0x9FFF  # CJK Unified Ideographs
+        or 0xAC00 <= cp <= 0xD7A3  # Hangul syllables
+        or 0xF900 <= cp <= 0xFAFF  # CJK compatibility ideographs
+        or 0xFF01 <= cp <= 0xFF5E  # fullwidth forms, U+3000 excluded
+    )
 
 
 def pick_model_edits(engine_model_json, rng, n=3):
@@ -189,7 +199,13 @@ def pick_model_edits(engine_model_json, rng, n=3):
                     cands.append((b, l, r, t))
     rng.shuffle(cands)
     out = []
-    for b, l, r, t in cands[:n]:
+    # Iterate ALL shuffled candidates and stop at n: truncating first would
+    # let three unusable runs (nothing but zero-width or filler characters)
+    # hide a perfectly editable run further down and report
+    # skip_no_candidate.
+    for b, l, r, t in cands:
+        if len(out) >= n:
+            break
         if t.isascii():
             repl = "".join(
                 chr((ord(ch.lower()) - 97 + 7) % 26 + 97).upper() if ch.isupper()
