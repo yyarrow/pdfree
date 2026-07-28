@@ -157,18 +157,33 @@ def pick_model_edits(engine_model_json, rng, n=3):
         for l, ln in enumerate(blk["lines"]):
             for r, run in enumerate(ln["runs"]):
                 t = run["text"]
-                if len(t) >= 4 and t.isascii() and any(c.isalpha() for c in t) \
-                        and not run["cid"] and not run["type3"]:
+                # CID and Type3 runs used to be excluded, along with
+                # everything non-ASCII. That silently exempted the two most
+                # common real-world shapes — CJK documents (Type0/CID) and
+                # browser-printed PDFs (one Type3 font per glyph) — from
+                # every variable-length test we run. They are supported now,
+                # so they must be measured.
+                editable = len(t) >= 4 and (
+                    (t.isascii() and any(c.isalpha() for c in t)) or not t.isascii()
+                )
+                if editable:
                     cands.append((b, l, r, t))
     rng.shuffle(cands)
     out = []
     for b, l, r, t in cands[:n]:
-        repl = "".join(
-            chr((ord(ch.lower()) - 97 + 7) % 26 + 97).upper() if ch.isupper()
-            else (chr((ord(ch) - 97 + 7) % 26 + 97) if ch.isalpha() else ch)
-            for ch in t
-        )
-        repl = repl[:-1] if rng.random() < 0.5 and len(repl) > 4 else repl + "x"
+        if t.isascii():
+            repl = "".join(
+                chr((ord(ch.lower()) - 97 + 7) % 26 + 97).upper() if ch.isupper()
+                else (chr((ord(ch) - 97 + 7) % 26 + 97) if ch.isalpha() else ch)
+                for ch in t
+            )
+            repl = repl[:-1] if rng.random() < 0.5 and len(repl) > 4 else repl + "x"
+        else:
+            # CJK and mixed text: a letter shift is meaningless, so change
+            # the LENGTH directly — drop the last character or repeat the
+            # first. Both keep every character drawable by the original
+            # font, isolating reflow from glyph-availability failures.
+            repl = t[:-1] if rng.random() < 0.5 and len(t) > 2 else t[0] + t
         if repl != t:
             out.append((b, l, r, t, repl))
     return out
