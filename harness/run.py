@@ -180,11 +180,26 @@ def pick_model_edits(engine_model_json, rng, n=3):
             repl = repl[:-1] if rng.random() < 0.5 and len(repl) > 4 else repl + "x"
         else:
             # CJK and mixed text: a letter shift is meaningless, so change
-            # the LENGTH directly — drop the last character or repeat the
-            # first. Both keep every character drawable by the original
-            # font, isolating reflow from glyph-availability failures.
-            repl = t[:-1] if rng.random() < 0.5 and len(t) > 2 else t[0] + t
-        if repl != t:
+            # the LENGTH directly — drop or repeat a character the run
+            # already contains, so every glyph stays drawable by the
+            # original font and reflow is tested in isolation.
+            #
+            # It must be a NON-whitespace character: dropping a trailing
+            # space leaves the page legitimately unchanged, which judge()
+            # can only report as fail_no_visual_change — a failure the
+            # engine didn't cause.
+            visible = [i for i, ch in enumerate(t) if not ch.isspace()]
+            if not visible:
+                continue
+            if rng.random() < 0.5 and len(visible) > 1:
+                cut = visible[-1]
+                repl = t[:cut] + t[cut + 1:]
+            else:
+                repl = t[visible[0]] + t
+        # A replacement that only differs in whitespace can't be judged:
+        # judge()'s semantic check is whitespace-insensitive and the render
+        # may be identical.
+        if repl != t and "".join(repl.split()) != "".join(t.split()):
             out.append((b, l, r, t, repl))
     return out
 
