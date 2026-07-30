@@ -807,7 +807,13 @@ fn parse_cid_metrics(doc: &Document, dict: &Dictionary) -> Option<CidMetrics> {
         .ok()
         .and_then(|o| doc.dereference(o).ok())
         .and_then(|(_, o)| o.as_float().ok())
-        .filter(|w| *w > 0.0)
+        // /DW 0 is legal and meaningful (a font whose unlisted CIDs advance
+        // nothing), so only ABSENT or invalid values fall back to the ISO
+        // 32000 default of 1000. Rejecting zero here would have reported a
+        // width this font does not have while still flagging the metrics as
+        // trusted, and a length-changing edit would shift every following run
+        // by the phantom difference.
+        .filter(|w| w.is_finite() && *w >= 0.0)
         .unwrap_or(1000.0);
 
     let mut ranges: Vec<(u32, u32, f32)> = Vec::new();
@@ -1756,6 +1762,42 @@ mod cid_tests {
         let m = f.cid_metrics.as_ref().expect("Identity-H is an identity mapping");
         assert_eq!(m.width(7), 1000.0);
         assert!(f.cid_widths_trusted());
+    }
+
+    /// Overwrite the descendant CIDFont's /DW in place.
+    fn set_dw(doc: &mut Document, font_id: lopdf::ObjectId, dw: Object) {
+        let desc = doc.get_dictionary(font_id).unwrap().get(b"DescendantFonts").unwrap().clone();
+        let cid_id = desc.as_array().unwrap()[0].as_reference().unwrap();
+        doc.get_object_mut(cid_id).unwrap().as_dict_mut().unwrap().set("DW", dw);
+    }
+
+    #[test]
+    fn zero_dw_is_honoured_rather_than_replaced_by_1000() {
+        // crbot #15 round-1: /DW 0 is legal and meaningful — a font whose
+        // unlisted CIDs advance nothing. Rejecting it as "invalid" and
+        // substituting 1000 while STILL reporting the metrics as trusted made
+        // a length-changing edit compute a width delta the font does not have,
+        // shifting every following run by the phantom difference.
+        let (mut doc, id) = type0_doc("Identity-H", true);
+        set_dw(&mut doc, id, 0.into());
+        let f = info(&doc, id);
+        let m = f.cid_metrics.as_ref().expect("Identity-H must yield metrics");
+        assert_eq!(m.width(1), 500.0, "/W still wins where it lists the CID");
+        assert_eq!(m.width(21), 0.0, "CID omitted from /W takes /DW 0, not 1000");
+        assert_eq!(f.advance(&[0x00, 0x63], 1), 0.0, "no phantom advance");
+        assert!(f.cid_widths_trusted(), "zero /DW is a real metric, still trusted");
+    }
+
+    #[test]
+    fn invalid_dw_still_falls_back_to_the_iso_default() {
+        // A negative advance is meaningless, so it is the one case that keeps
+        // the ISO 32000 default of 1000 — the fallback must survive the fix
+        // that lets zero through.
+        let (mut doc, id) = type0_doc("Identity-H", true);
+        set_dw(&mut doc, id, (-50).into());
+        let f = info(&doc, id);
+        let m = f.cid_metrics.as_ref().expect("Identity-H must yield metrics");
+        assert_eq!(m.width(21), 1000.0, "negative /DW is invalid -> default");
     }
 
     #[test]
