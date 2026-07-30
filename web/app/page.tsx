@@ -544,7 +544,7 @@ export default function Home() {
         pdfree 是 MIT 开源项目 · 引擎与网站均免费 ·{" "}
         <a href="https://github.com/yyarrow/pdfree">GitHub</a>
         <br />
-        暂不支持：扫描件（图片型 PDF）、加密文件、增删字数（等长替换以外）— 都在路上
+        暂不支持：扫描件（图片型 PDF）、加密文件、改完超出原行宽度（自动换行还在开发中）— 都在路上
       </footer>
     </div>
   );

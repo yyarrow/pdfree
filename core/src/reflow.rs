@@ -786,16 +786,21 @@ fn actualtext_wrappers(
     (map, nested)
 }
 
-/// Marked-content blocks (BDC/BMC … EMC) whose shown text belongs ENTIRELY
-/// to the line being regenerated — their operator indices, so the caller can
-/// delete the block along with the text it wrapped.
+/// Marked-content blocks (BDC/BMC … EMC) that must be deleted along with the
+/// line being regenerated — their operator indices.
 ///
-/// Why delete rather than keep: an emptied `/Span <</ActualText …>>` keeps
+/// Only blocks carrying a now-stale `/ActualText` qualify, and only when the
+/// line owns ALL their text. An emptied `/Span <</ActualText …>>` would keep
 /// telling copy-paste and screen readers what text is there after that text
-/// is gone, so the document would say one thing and show another. Removing
-/// the block hands that job back to the regenerated text's own ToUnicode.
-/// The structure tree may end up with an unreferenced MCID, which readers
-/// tolerate (rendering is unaffected).
+/// is gone, so the document would say one thing and show another; deleting it
+/// hands that job back to the regenerated text's own ToUnicode.
+///
+/// Wrappers WITHOUT /ActualText are deliberately kept — deleting them would
+/// change the document while fixing nothing. `/OC … BDC` is the load-bearing
+/// case: it controls visibility, so dropping it lifts the line out of its
+/// optional-content group and the layer toggle stops working. Keeping
+/// `/NonStruct <</MCID n>>` also leaves the structure tree pointing at real
+/// text rather than an unreferenced MCID.
 ///
 /// A block that ALSO wraps text outside the line can't be deleted; if such
 /// a block carries /ActualText over our text, moving the text out would
@@ -827,8 +832,22 @@ fn owned_marked_blocks(
                     }
                     continue; // shared block stays; no stale override on it
                 }
-                owned.push(start);
-                owned.push(i);
+                // Delete ONLY what carries a now-stale /ActualText. Every
+                // other wrapper is kept, because deleting it changes the
+                // document for no gain:
+                //   /OC … BDC controls VISIBILITY — lifting the line out of
+                //   its optional-content group means toggling that layer no
+                //   longer hides the line, and content meant to stay hidden
+                //   can appear.
+                //   /NonStruct <</MCID n>> kept means the structure tree
+                //   still points at real text instead of an unreferenced MCID.
+                // The regenerated text is spliced at the line's first show op,
+                // which sits INSIDE these wrappers, so keeping them re-wraps
+                // the new text exactly as the old text was wrapped.
+                if bdc_has_actual_text(doc, page_id, &content.operations[start]) {
+                    owned.push(start);
+                    owned.push(i);
+                }
             }
             "Tj" | "TJ" | "'" | "\"" => {
                 let mine = line_ops.contains(&i);
@@ -911,6 +930,62 @@ mod skia_tests {
         let content = Content {
             operations: vec![bdc(false), tj(b"a"), tj(b"b"), Operation::new("EMC", vec![])],
         };
+        let line_ops: BTreeSet<usize> = [1].into_iter().collect();
+        assert_eq!(owned_marked_blocks(&doc, page_id, &content, &line_ops).unwrap(), Vec::<usize>::new());
+    }
+
+    /// `/OC` wrapper: the property list is a name resolved through
+    /// /Resources/Properties to an OCG — it carries no /ActualText.
+    fn oc_bdc() -> Operation {
+        Operation::new("BDC", vec![Object::Name(b"OC".to_vec()), Object::Name(b"MC0".to_vec())])
+    }
+
+    #[test]
+    fn optional_content_wrapper_survives_the_edit() {
+        // crbot #15 round-1: /OC … BDC controls VISIBILITY. Deleting it lifted
+        // the regenerated line out of its optional-content group, so toggling
+        // that layer no longer hid the line — and content meant to stay hidden
+        // could become visible. It carries no /ActualText, so there is nothing
+        // stale to clear and no reason to touch it.
+        let (doc, page_id) = empty_page();
+        let content = Content { operations: vec![oc_bdc(), tj(b"a"), Operation::new("EMC", vec![])] };
+        let line_ops: BTreeSet<usize> = [1].into_iter().collect();
+        assert_eq!(
+            owned_marked_blocks(&doc, page_id, &content, &line_ops).unwrap(),
+            Vec::<usize>::new(),
+            "the layer wrapper must stay, so the new text stays on the layer"
+        );
+    }
+
+    #[test]
+    fn actualtext_inside_a_layer_is_cleared_without_dropping_the_layer() {
+        // The two rules have to hold at once: clear the stale /ActualText,
+        // keep the /OC layer that encloses it.
+        let (doc, page_id) = empty_page();
+        let content = Content {
+            operations: vec![
+                oc_bdc(),                      // 0: layer — keep
+                bdc(true),                     // 1: stale /ActualText — delete
+                tj(b"a"),                      // 2: the line's own text
+                Operation::new("EMC", vec![]), // 3: closes the span
+                Operation::new("EMC", vec![]), // 4: closes the layer
+            ],
+        };
+        let line_ops: BTreeSet<usize> = [2].into_iter().collect();
+        assert_eq!(
+            owned_marked_blocks(&doc, page_id, &content, &line_ops).unwrap(),
+            vec![1, 3],
+            "inner /ActualText span goes; the /OC layer around it stays"
+        );
+    }
+
+    #[test]
+    fn owned_wrapper_without_actualtext_is_kept() {
+        // A stale /ActualText is the ONLY thing that justifies deletion.
+        // Keeping /NonStruct <</MCID n>> also leaves the structure tree
+        // pointing at real text instead of an unreferenced MCID.
+        let (doc, page_id) = empty_page();
+        let content = Content { operations: vec![bdc(false), tj(b"a"), Operation::new("EMC", vec![])] };
         let line_ops: BTreeSet<usize> = [1].into_iter().collect();
         assert_eq!(owned_marked_blocks(&doc, page_id, &content, &line_ops).unwrap(), Vec::<usize>::new());
     }
