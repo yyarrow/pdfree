@@ -16,3 +16,6 @@ node_modules/
 /.worktree/
 /harness/corpus/skia/
 /assets/
+
+# TypeScript incremental build cache
+web/tsconfig.tsbuildinfo
